@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quota-router"
+version = "0.1.0"
+description = "Claude Code PreToolUse hook that routes subagent commands (claude -p / codex exec) to the subscription account with the most quota left"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "nikeru8" }]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+qr = "quota_router.cli:main"
+
+[tool.setuptools]
+packages = ["quota_router"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
