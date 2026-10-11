@@ -61,7 +61,15 @@ codex-2：訂閱額度用完，會改扣加購點數；點數餘額 40
 pip install git+https://github.com/nikeru8/quota-router
 ```
 
-pip 不肯裝進系統 Python 的話，裝在虛擬環境裡（或用 pipx）。`qr` 不必在 Claude Code 的 `PATH` 上：hook 安裝時寫的是 Python 的絕對路徑。
+Python 不准直接裝套件時（macOS 的 Homebrew、Debian 與多數發行版的 Python 都是，錯誤訊息寫 "externally-managed-environment"），或是根本沒有 `pip` 這個指令時，改裝進虛擬環境：
+
+```sh
+python3 -m venv ~/.qr-venv
+~/.qr-venv/bin/pip install git+https://github.com/nikeru8/quota-router
+~/.qr-venv/bin/qr --help
+```
+
+之後用 `~/.qr-venv/bin/qr` 這個路徑呼叫，或把 `~/.qr-venv/bin` 加進 `PATH`（有 pipx 的話 `pipx install git+https://github.com/nikeru8/quota-router` 一步做完）。`qr` 不必在 Claude Code 的 `PATH` 上：hook 安裝時寫的是 Python 的絕對路徑。
 
 1. **建立設定檔。**
 

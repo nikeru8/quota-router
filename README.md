@@ -61,7 +61,15 @@ Until it is on PyPI, install from GitHub:
 pip install git+https://github.com/nikeru8/quota-router
 ```
 
-If pip refuses to touch the system Python, install into a virtual environment (or with pipx). `qr` does not have to be on Claude Code's `PATH`: the hook is installed with the absolute path of the Python it runs on.
+On a Python that refuses to install packages directly (Homebrew's on macOS, Debian's, most distro Pythons; the error says "externally-managed-environment"), or when there is no `pip` command, install into a virtual environment instead:
+
+```sh
+python3 -m venv ~/.qr-venv
+~/.qr-venv/bin/pip install git+https://github.com/nikeru8/quota-router
+~/.qr-venv/bin/qr --help
+```
+
+Then either call `~/.qr-venv/bin/qr` by that path or add `~/.qr-venv/bin` to your `PATH` (`pipx install git+https://github.com/nikeru8/quota-router` does the same in one step if you have pipx). `qr` does not have to be on Claude Code's `PATH`: the hook is installed with the absolute path of the Python it runs on.
 
 1. **Create the config file.**
 
