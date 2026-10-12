@@ -54,6 +54,8 @@ HOOKED = ("installed", "outdated", "manual", "foreign")   # installed_state() va
 LAUNCHES = "launched.json"
 LAUNCHES_KEPT_SEC = 30 * 86400
 LAUNCHES_KEPT = 500
+LAUNCH_SLACK_SEC = 5                   # a conversation file may be stamped this much before its launch record
+NAMED_RECORD_SEC = 1                   # most time spent recording a start with CLAUDE_CONFIG_DIR written out
 
 
 # ---- the real claude ------------------------------------------------------------
@@ -203,8 +205,9 @@ def dispatched(path):
 def continue_account(cwd):
     """The account `claude --continue` should open in this directory.
 
-    1. The most recent launch here whose account has a conversation of this directory: that is the session the
-       user last started here; a dispatch the hook sent elsewhere in the meantime is not.
+    1. The most recent launch here whose account has a conversation of this directory written by that session: a
+       file that is not a dispatch (see dispatched()) and was changed at or after the launch. A launch the user
+       quit without typing anything leaves no such file, and an older dispatch transcript does not count for it.
     2. Otherwise the newest conversation file of this directory across the accounts, leaving out files written by
        one-shot runs or subagents (when the file says so) and files newer than a launch here on another account
        (most likely dispatches of that session). None when nothing is found."""
@@ -215,8 +218,15 @@ def continue_account(cwd):
     files = {key: hook.bounded_files(os.path.join(directory, "projects", hook.slug(cwd)), "*.jsonl")
              for key, directory in hook.account_dirs("claude").items()}
     for launch in launches:
-        if files.get(launch["key"]):
-            return launch["key"]
+        for path in files.get(launch["key"], []):
+            if qr.remaining() <= 0:
+                return None
+            try:
+                stamp = os.path.getmtime(path)
+            except OSError:
+                continue
+            if stamp >= launch["at"] - LAUNCH_SLACK_SEC and not dispatched(path):
+                return launch["key"]
     best = None
     for key, paths in files.items():
         others = [x["at"] for x in launches if x["key"] != key]
@@ -280,9 +290,10 @@ def default_row(raw, model):
     return qr.find_row(qr.score_rows("claude", raw, model), key) if key else None
 
 
-def to_default(cwd, text, mode_text, model, cmd):
+def to_default(cwd, text, mode_text, model, cmd, remember=True):
     record("launch-default", text=mode_text, model=model, cmd=cmd, account=qr.DEFAULT_KEY["claude"])
-    qr.quiet_call(remember_launch, cwd, qr.DEFAULT_KEY["claude"])
+    if remember:
+        qr.quiet_call(remember_launch, cwd, qr.DEFAULT_KEY["claude"])
     return None, text
 
 
@@ -293,7 +304,7 @@ def resumed(parsed, cwd, cmd):
     else:
         key = continue_account(cwd)
     if key is None:
-        return to_default(cwd, t("launch.resume_unknown"), "conversation location unknown", model, cmd)
+        return to_default(cwd, t("launch.resume_unknown"), "conversation location unknown", model, cmd, remember=False)
     raw = add_sessions(qr.read_family("claude", lead_key=NO_LEAD))
     # like the hook: the shared quota decides whether the account can go on; the model (the scarce one when
     # none is written) decides whether it would be billed.
@@ -304,7 +315,10 @@ def resumed(parsed, cwd, cmd):
     text = line(t("launch.resume", reason=qr.reason(row)),
                 t("launch.out_of_quota", who=qr.who(row), reason=gone) if gone else "", overage(paying))
     record("launch-resume", row, "kept the original account", cmd=cmd)
-    qr.quiet_call(remember_launch, cwd, key)
+    if parsed["resume"].get("id"):
+        # only a conversation actually found there is a fact; an account --continue inferred is not recorded,
+        # or a wrong guess would be taken as the answer the next time.
+        qr.quiet_call(remember_launch, cwd, key)
     # the conversation is in this directory, whichever directory represents the account in the rows.
     return next(a["dir"] for a in qr.CLAUDE_ACCOUNTS if a["key"] == key), text
 
@@ -355,11 +369,13 @@ def decide(parsed, cfg, cwd, cmd, deadline):
 
 
 def remember_named(cwd):
-    """A session started with CLAUDE_CONFIG_DIR written out is not routed, but it is recorded for --continue."""
+    """A session started with CLAUDE_CONFIG_DIR written out is not routed, but it is recorded for --continue.
+    Best effort: lock waits stop at NAMED_RECORD_SEC, and choose() does not wait longer than that either."""
     cfg = config.load()
     if cfg.family("claude"):
         qr.configure(cfg)
-        remember_launch(cwd, qr.dir_key(os.environ["CLAUDE_CONFIG_DIR"]))
+        with qr.budget(time.monotonic() + NAMED_RECORD_SEC):
+            remember_launch(cwd, qr.dir_key(os.environ["CLAUDE_CONFIG_DIR"]))
 
 
 def choose(args, cwd=None):
@@ -373,7 +389,10 @@ def choose(args, cwd=None):
     cwd = cwd or os.getcwd()
     if "CLAUDE_CONFIG_DIR" in os.environ:
         if not parsed["print"]:
-            qr.quiet_call(remember_named, cwd)
+            # a file system that stops answering must not hold up a start that needs no decision.
+            worker = threading.Thread(target=qr.quiet_call, args=(remember_named, cwd), name="qr-record", daemon=True)
+            worker.start()
+            worker.join(NAMED_RECORD_SEC)
         return KEEP, None
     try:
         cfg = config.load()

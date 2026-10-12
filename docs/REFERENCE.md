@@ -244,9 +244,11 @@ Each account directory carries its own settings: `settings.json` (with the hook,
 
 Claude Code chooses the session id after it starts, so the launcher cannot record which conversation a session will write. It records, in `launched.json` in the state directory, every session it starts (and every session started with `CLAUDE_CONFIG_DIR` written out): a 16-hex-digit hash of the working directory, the account key and the time; 30 days, at most 500 entries. `--continue` (and `--resume` without an id, `--from-pr`) then goes to:
 
-1. the account of the most recent launch in this directory that has at least one conversation file of this directory (`<dir>/projects/<slug>/*.jsonl`);
+1. the account of the most recent launch in this directory that wrote a conversation there: a conversation file of this directory (`<dir>/projects/<slug>/*.jsonl`) on that account that is not a one-shot or subagent transcript (below) and was changed no earlier than five seconds before the launch. A launch the user quit without typing anything therefore does not count, however many older dispatch transcripts that account holds;
 2. otherwise the account with the newest such file, leaving out files whose first records say they come from a one-shot or SDK run (`"entrypoint": "sdk-…"`) or a subagent (`"isSidechain": true`), and files newer than the latest launch here on another account (most likely that session's dispatches);
 3. otherwise the default account, with a line saying the conversation was not found.
+
+Only facts are recorded: a new session (routed, or on the default account as fallback), a session started with `CLAUDE_CONFIG_DIR` written out, and `--resume <id>` when the id was found on that account. The account `--continue`, a bare `--resume` or `--from-pr` inferred is not recorded, so a wrong guess is not taken as the answer the next time. Recording a start with `CLAUDE_CONFIG_DIR` written out waits at most one second, lock included, and never delays that start longer.
 
 It cannot know about sessions started without the launcher and without `CLAUDE_CONFIG_DIR` (for example with an alias to an absolute path, or before the launcher was installed): a launch record wins over a newer conversation that such a session wrote on another account. It does not read the conversations beyond their first lines, and the `entrypoint` / `isSidechain` fields are what Claude Code writes today, not a documented format; a file without them counts as interactive. The hook's own `claude -p … -c` is not affected by any of this.
 
