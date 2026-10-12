@@ -341,9 +341,61 @@ def test_continue_without_launch_records_takes_the_newest_conversation_here(rout
         os.utime(router.home / ".claude" / "projects" / router.hook.slug(str(work)) / "old.jsonl", (3_000_000, 3_000_000))
         assert launch.continue_account(str(work)) == "claude-main"
     assert launch.choose(["--continue"], cwd=str(work))[0] is None
-    # that start is recorded: the next --continue here goes to the same account without looking at files.
-    assert json.loads((router.home / "state" / "launched.json").read_text())[-1]["key"] == "claude-main"
-    assert str(work) not in (router.home / "state" / "launched.json").read_text()      # the directory only as a hash
+    # a new session here is recorded, with the directory only as a hash.
+    launch.choose(["fix it"], cwd=str(work))
+    assert json.loads((router.home / "state" / "launched.json").read_text())[-1]["key"] == "claude-b"
+    assert str(work) not in (router.home / "state" / "launched.json").read_text()
+
+
+def test_finding4_continue_ignores_a_launch_that_left_no_conversation(router):
+    """Day 1: a real conversation on claude-main and hook dispatches on claude-b, same directory. Day 2: `claude`
+    goes to claude-b and the user quits without typing. `claude -c` must reopen the day-1 conversation on
+    claude-main, not a dispatch transcript on claude-b, and must not make that mistake stick."""
+    from quota_router import launch
+    work, now, day = router.home / "work", router.core.now(), 86400
+    human = conversation(router.home, ".claude", work, "human")
+    human.write_text('{"type": "user", "entrypoint": "cli"}\n')
+    os.utime(human, (now - day, now - day))
+    for number in range(3):
+        dispatch = conversation(router.home, ".claude-b", work, f"dispatch-{number}")
+        dispatch.write_text('{"type": "user", "entrypoint": "sdk-cli"}\n')
+        os.utime(dispatch, (now - day + 600, now - day + 600))
+    directory, _ = launch.choose(["fix it"], cwd=str(work))            # day 2: routed to claude-b, nothing typed
+    assert directory == str(router.home / ".claude-b")
+    for _ in range(2):
+        assert launch.choose(["-c"], cwd=str(work))[0] is None         # claude-main, the default location
+    # a launch on claude-b does count once that session has written its own conversation.
+    session = conversation(router.home, ".claude-b", work, "day-2")
+    session.write_text('{"type": "user", "entrypoint": "cli"}\n')
+    assert launch.choose(["-c"], cwd=str(work))[0] == str(router.home / ".claude-b")
+
+
+def test_finding4_continue_does_not_record_a_guessed_account(router):
+    from quota_router import launch
+    work = router.home / "work"
+    conversation(router.home, ".claude-b", work, "abc")
+    for args in (["-c"], ["--resume"], ["--from-pr", "12"]):
+        assert launch.choose(args, cwd=str(work))[0] == str(router.home / ".claude-b")
+        assert not (router.home / "state" / "launched.json").exists(), args
+    assert launch.choose(["--resume", "nowhere"], cwd=str(work))[0] is None      # not found: nothing recorded either
+    assert not (router.home / "state" / "launched.json").exists()
+    launch.choose(["--resume", "abc"], cwd=str(work))                             # found: that is a fact
+    assert [x["key"] for x in json.loads((router.home / "state" / "launched.json").read_text())] == ["claude-b"]
+
+
+def test_a_named_start_is_not_held_up_by_recording_it(router, monkeypatch):
+    import time
+    from quota_router import launch
+    release = threading.Event()
+    monkeypatch.setattr(launch, "remember_named", lambda cwd: release.wait(10))   # a file system that hangs
+    monkeypatch.setattr(launch, "NAMED_RECORD_SEC", 0.2)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(router.home / ".claude-b"))
+    started = time.monotonic()
+    try:
+        assert launch.choose(["fix it"]) == (launch.KEEP, None)
+        assert time.monotonic() - started < 2
+    finally:
+        release.set()
 
 
 def test_finding4_continue_prefers_the_session_launched_here_over_a_dispatch(router):
