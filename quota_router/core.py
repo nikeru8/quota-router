@@ -24,7 +24,10 @@ LEASE_BUSY_SEC = 300           # and only counts as busy for its first five minu
 HOOK_BUDGET_SEC = 8
 DEADLINE = ContextVar("quota_deadline", default=None)
 FIVE_HOUR_FLOOR = 10           # skip an account whose five-hour window is under 10%
-LEAD_FLOOR = 20                # the lead's account takes no subagents under 20%
+LEAD_FLOOR = 20                # the lead's account takes no subagents under 20% weekly
+LEAD_FH_FLOOR = 50             # ...nor when its five-hour window (after running jobs) is under 50%
+LEAD_LAST_RESORT = False       # true: the lead's account is picked only when no other account can take the job
+INFLIGHT_FH_COST = 3           # each running job is assumed to still take this many % of the five-hour window
 CODEX_STALE_H = 2              # non-live Codex numbers older than 2 hours: unknown, ranked in the middle, flagged "may have reset"
 CODEX_PROBE_H = 2              # live Codex query failed and the local log is over 2 hours old → one background no-op probe to refresh it
 TIGHT_WARN = 15                # warn when the best account has under 15% weekly left
@@ -66,6 +69,9 @@ def configure(cfg):
         HOOK_BUDGET_SEC=cfg["timing.hook_budget_seconds"],
         FIVE_HOUR_FLOOR=cfg["limits.five_hour_floor"],
         LEAD_FLOOR=cfg["general.protect_threshold"],
+        LEAD_FH_FLOOR=cfg["general.protect_five_hour"],
+        LEAD_LAST_RESORT=cfg["general.lead_last_resort"],
+        INFLIGHT_FH_COST=cfg["limits.inflight_five_hour_cost"],
         CODEX_STALE_H=cfg["timing.codex_stale_hours"],
         CODEX_PROBE_H=cfg["timing.codex_probe_hours"],
         TIGHT_WARN=cfg["limits.tight_warning"],
@@ -1117,6 +1123,39 @@ def evaluate(family, force=False, lead_key=None, model=None, allow_credits=None,
     return score_rows(family, raw, model, allow_credits)
 
 
+def five_hour_projection(row):
+    """The five-hour window after the jobs already running on the account: each is assumed to still take
+    INFLIGHT_FH_COST % of it. A burst of dispatches cannot read the same roomy number six times and empty the window."""
+    if row.get("fh_left") is None:
+        return None
+    return max(0.0, row["fh_left"] - row.get("busy", 0) * INFLIGHT_FH_COST)
+
+
+def five_hour_block(row):
+    """The five-hour rule for one row (None when it does not block): the general floor, and the lead's own, higher one.
+    The message is kept in row["fh_block"] so refresh_busy() can recompute it when the busy count changes."""
+    proj = five_hour_projection(row)
+    row["fh_proj"] = proj
+    msg = None
+    if proj is not None:
+        floor = LEAD_FH_FLOOR if row.get("is_lead") else FIVE_HOUR_FLOOR
+        if proj < floor:
+            if row.get("is_lead"):
+                msg = t("blocked.lead_five_hour", left=proj)
+            elif proj < row["fh_left"]:
+                msg = t("blocked.five_hour_projected", left=proj, raw=row["fh_left"], jobs=row.get("busy", 0))
+            else:
+                msg = t("blocked.five_hour", left=proj)
+    if row.get("fh_note") in row["notes"]:
+        row["notes"].remove(row["fh_note"])
+    row["fh_note"] = None
+    if msg is None and proj is not None and proj < row["fh_left"]:
+        row["fh_note"] = t("note.inflight_projection", raw=row["fh_left"], jobs=row.get("busy", 0), left=proj)
+        row["notes"].append(row["fh_note"])
+    row["fh_block"] = msg
+    return msg
+
+
 def score_rows(family, raw, model=None, allow_credits=None):
     rows = copy.deepcopy(raw)
     category = model_class(model, family)
@@ -1182,15 +1221,12 @@ def score_rows(family, raw, model=None, allow_credits=None):
                 row["rate"] = 0.01
                 row["notes"].append(spend_note(family))
         # hard exclusions
-        row["blocked"] = None
-        if row["fh_left"] is not None and row["fh_left"] < FIVE_HOUR_FLOOR:
-            row["blocked"] = t("blocked.five_hour", left=row["fh_left"])
+        row["blocked"] = five_hour_block(row)
         if row.get("is_lead"):
-            tight = min(x for x in (row["wk_left"], row["fh_left"], 100) if x is not None)
             if row["wk_left"] is None:
                 row["blocked"] = t("blocked.lead_unknown")
-            elif tight < LEAD_FLOOR:
-                row["blocked"] = t("blocked.lead_low", left=tight)
+            elif row["wk_left"] < LEAD_FLOOR:
+                row["blocked"] = t("blocked.lead_low", left=row["wk_left"])
         if row["wk_left"] is not None and row["wk_left"] <= 0 and not (row["paid"] and allow_credits):
             row["blocked"] = t("blocked.scarce_out", model=SCARCE_LABEL) if row["wk_source"] != "shared" else t("blocked.weekly_out")
         elif (not row.get("is_lead") and row["wk_left"] is not None and 0 < row["wk_left"] < SUB_FLOOR
@@ -1220,6 +1256,9 @@ def score_rows(family, raw, model=None, allow_credits=None):
         if unknown and wk and (row["blocked"] or row["rate"] is not None):
             row["notes"].remove(t("note.unknown"))
             row["notes"].append(t("note.old_nearly_out_hold"))
+    for row in rows:
+        # what blocked the row apart from the five-hour rule; refresh_busy() redoes only that rule when the busy count changes.
+        row["blocked_other"] = None if row["blocked"] and row["blocked"] == row.get("fh_block") else row["blocked"]
     refresh_busy(rows, leases)
     return rows
 
@@ -1231,12 +1270,15 @@ def refresh_busy(rows, leases, pending=()):
         added = sum(1 for l in pending if l["key"] in row["keys"])
         row["busy"] = max(row["jobs"], row["n_lease"] - added) + added
         row["busy_detail"] = t("busy.detail", jobs=row["jobs"], leases=row["n_lease"])
+        if "fh_block" in row and not row.get("blocked_other"):
+            row["blocked"] = five_hour_block(row)
     known = [r["rate"] for r in rows if r["rate"] is not None]
     mid = statistics.median(known) if known else 1.0
     for r in rows:
         base = r["rate"] if r["rate"] is not None else mid
-        if r["fh_left"] is not None and r["fh_left"] < 30:
-            base *= r["fh_left"] / 30
+        fh = r.get("fh_proj", r["fh_left"])
+        if fh is not None and fh < 30:
+            base *= fh / 30
         r["score"] = base / (1 + r["busy"])
     return rows
 
@@ -1346,7 +1388,7 @@ def reset_options(rows):
     Windows that are not blocking (a roomy five-hour window, say) are left out."""
     items = []
     for r in rows:
-        floor_fh = LEAD_FLOOR if r.get("is_lead") else FIVE_HOUR_FLOOR
+        floor_fh = LEAD_FH_FLOOR if r.get("is_lead") else FIVE_HOUR_FLOOR
         floor_wk = LEAD_FLOOR if r.get("is_lead") else SUB_FLOOR
         fh_block = r.get("fh_left") is not None and r["fh_left"] < floor_fh
         wk_block = r.get("wk_left") is not None and r["wk_left"] < floor_wk
@@ -1437,7 +1479,7 @@ def choose(family, rows=None, force=False):
         raw = read_family(family, force)
         rows = score_rows(family, retry_blocked(family, raw))
     # sorted() and min() are stable and the rows are in config-file order, so equal scores keep that order.
-    order = lambda r: (bool(r.get("will_spend")), -r["score"])
+    order = lambda r: (bool(r.get("will_spend")), bool(LEAD_LAST_RESORT and r.get("is_lead")), -r["score"])
     ok = sorted([r for r in rows if not r["blocked"]], key=order)
     if ok:
         best = ok[0]
@@ -1626,7 +1668,7 @@ def status(force=False, bars=False):
             lr = find_row(rows, lead_key)
             ld = next((a["dir"] for a in CLAUDE_ACCOUNTS if a["key"] == lead_key), None)
             print(t("status.lead", who=who(lr) if lr else lead_key or "?", dir=dir_label(ld),
-                    assumed=t("status.assumed") if assumed else "", floor=LEAD_FLOOR))
+                    assumed=t("status.assumed") if assumed else "", floor=LEAD_FLOOR, floor_fh=LEAD_FH_FLOOR))
         col = lambda name: t("status.col." + name)
         if not bars:
             print(f"{col('account'):<16}{col('dir'):<24}{col('weekly'):>6}{col('weekly_reset'):>14}{col('five_hour'):>9}"

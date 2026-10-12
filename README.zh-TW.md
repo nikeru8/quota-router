@@ -92,7 +92,8 @@ Homebrew、Debian 和多數發行版的 Python 會回 "externally-managed-enviro
 - **只在同一家裡挑。** 用 Claude 還是 Codex 由你決定，hook 只決定用哪個帳號。另一家的額度只當建議附上。
 - **分數。** 週剩餘 % 除以距離週重置的小時數，所以快作廢的額度先用。五小時窗低於 30% 時分數往下修。手上有工作的帳號再除以「1＋工作數」（正在跑的派工，或最近五分鐘內派出去的）。同分時用設定檔裡排前面的帳號。
 - **會被跳過的帳號。** 五小時窗低於 `five_hour_floor`；週額度用完；主 session 以外的帳號週額度低於 `weekly_floor`；沒有人登入。查不到額度的帳號不會被跳過，會拿到查得到的那些帳號的中位數分數。
-- **保護主 session。** 主 session 的帳號最緊的那個窗低於 `protect_threshold`、或額度讀不到時，自動挑選就不會挑它。
+- **保護主 session。** 主 session 的帳號週剩低於 `protect_threshold`、五小時窗（扣掉它身上進行中的任務後）低於 `protect_five_hour`、或額度讀不到時，自動挑選就不會挑它。`lead_last_resort = true` 再加一層：只有同一家別的帳號都派不出時才派給主管帳號，所以長批次會先把別的帳號用掉，主管對話自己的窗留著。
+- **進行中的任務先扣掉。** 帳號上每個正在跑（或剛派出去）的任務，預估還會吃掉五小時窗的 `inflight_five_hour_cost` %；門檻與分數都用扣完的數字。幾分鐘內連派六批，不會每批都看到同一個寬裕的讀數。
 - **整家都接不下：擋下。** 整條 Bash 指令不執行，列出每個帳號的原因和最早的預定重置時間。
 - **預設不花錢。** 讀數顯示會扣 Codex 加購點數或產生 Claude 付費超額的派工，一律擋下：自動分流、你寫明的帳號、接續的對話、`qr pick` 和 `qr check` 都一樣。要讓某一條放行，把 `QR_ALLOW_CREDITS=1` 寫成那一條指令的前綴（`QR_ALLOW_CREDITS=1 codex exec …`；`export` 不算）。`general.allow_credits = true` 則是全部放行。
 - **接續對話留在原帳號。** `claude -p … --resume <id>` 和 `codex exec resume <id>` 會派到存放那段對話的帳號。

@@ -4,6 +4,9 @@
 
 ### Added
 
+- **The lead keeps its five-hour window.** `protect_five_hour` (default 50) is a separate, higher threshold for the lead's five-hour window; `protect_threshold` now covers the weekly window only. `lead_last_resort` (default false) picks the lead's account only when no other account of the family can take the job. `qr status` shows both thresholds.
+- **Running jobs are charged against the five-hour window.** `inflight_five_hour_cost` (default 3 %) per job running on, or just dispatched to, an account is subtracted from its five-hour reading before the floors and the score are applied, and recomputed when reservations change. A note shows the projected number; a block says how many jobs were counted. Motivation: on 2026-10-13 three dispatchers reading the same cached numbers emptied all three Claude accounts, the lead's included.
+
 - **macOS: the second login in `~/.claude`.** Claude Code keeps one keychain item per `CLAUDE_CONFIG_DIR` spelling, so a plain `claude` and `CLAUDE_CONFIG_DIR=~/.claude claude` can be two accounts in the same directory. On macOS `dir = "~/.claude"` written out is now a separate Claude account (dispatched to with the variable set) next to `dir = ""` (the variable unset); a value naming that directory in a command, in `CLAUDE_CONFIG_DIR` of the session or in the process list maps to the explicit account first. `qr doctor` warns when that second item holds a login the config does not list. Two accounts with the same directory are now a config error on every platform.
 - **`qr status --bars`** prints a bar per quota window under each account (`▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱  43/100%`: weekly, five-hour and the scarce model's bucket for Claude; weekly for Codex). `--watch` shows the bars too.
 - **`qr watch [N]`**, `qr status watch [N]` and `qr status bars`: the same as `--watch` / `--bars` without the dashes.

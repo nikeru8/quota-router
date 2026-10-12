@@ -10,6 +10,8 @@ FULL = """\
 [general]
 language = "zh-TW"
 protect_threshold = 35
+protect_five_hour = 60
+lead_last_resort = true
 allow_credits = true
 
 [hints]
@@ -20,6 +22,7 @@ home_busy = 5
 
 [limits]
 five_hour_floor = 12
+inflight_five_hour_cost = 4
 weekly_floor = 8
 tight_warning = 18
 
@@ -56,6 +59,8 @@ def test_full_file_overrides_every_default(write_config):
     assert cfg["general.language"] == "zh-TW"
     assert cfg["general.protect_threshold"] == 35
     assert cfg["general.allow_credits"] is True
+    assert cfg["general.protect_five_hour"] == 60 and cfg["general.lead_last_resort"] is True
+    assert cfg["limits.inflight_five_hour_cost"] == 4
     assert cfg["hints.home_busy"] == 5
     assert cfg["timing.codex_stale_hours"] == 1.5
     assert cfg["events.reset_drop_points"] == 5
