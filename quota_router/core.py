@@ -2322,6 +2322,10 @@ def main(argv):
         pick(argv[1], peek="--peek" in argv, env_only="--env" in argv, force=force, model=model)
     elif argv[0] == "check" and len(argv) > 2 and argv[1] in ("claude", "codex"):
         check_account(argv[1], argv[2], model=model, peek="--peek" in argv, force=force)
+    elif argv[0] == "watch" or argv[0] == "status" and len(argv) > 1 and argv[1] in ("watch", "bars"):
+        # `qr watch [N]`, `qr status watch [N]` and `qr status bars`: the same as --watch / --bars, without the dashes
+        main([argv[0] if argv[0] == "status" else "status", "--" + (argv[1] if argv[0] == "status" else "watch"),
+              *(argv[2:] if argv[0] == "status" else argv[1:])])
     elif argv[0] == "status":
         if "--watch" in argv:
             i = argv.index("--watch") + 1

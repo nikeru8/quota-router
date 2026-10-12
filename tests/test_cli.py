@@ -149,3 +149,16 @@ def test_status_bars(router, capsys):
     assert all(line.startswith("  ") and line.count("/100%") == 1 for line in bars)   # one bar per line
     assert sum("resets " in line for line in bars) == len([l for l in lines if l.startswith("  week")])
     assert any(line.startswith("  5h") for line in bars) and any(line.startswith("  state") for line in lines)
+
+
+def test_watch_and_bars_without_dashes(router, monkeypatch, capsys):
+    from quota_router import core
+    seen = []
+    monkeypatch.setattr(core, "watch_status", lambda force, interval, bars=True: seen.append((force, interval)))
+    for argv in (["watch"], ["status", "watch"], ["watch", "4"], ["status", "watch", "4", "--refresh"]):
+        assert run(argv, capsys)[0] == 0
+    assert seen == [(False, 10), (False, 10), (False, 4), (True, 4)]
+    code, out, _ = run(["status", "bars"], capsys)
+    assert code == 0 and "/100%" in out
+    code, out, err = run(["watch", "x"], capsys)
+    assert (code, out) == (2, "") and "--watch" in err

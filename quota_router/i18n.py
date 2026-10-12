@@ -38,6 +38,7 @@ quota-router: ask "which account should this subagent use right now?"
   qr status                 table of every account
   qr status --bars          the table with a bar per quota window under each account
   qr status --watch [N]     the table with bars, redrawn every N seconds (default 10) until Ctrl-C
+  qr watch [N]              the same, shorter (also: qr status watch, qr status bars)
   qr report [--days N]      reset events, current pace and dispatch statistics (default 7 days)
   qr leases --clear         drop all reservations
   qr decisions [N]          the last N routing decisions (default 30)
@@ -459,6 +460,7 @@ quota-router：派子代理前問「現在該用哪個帳號」。
   qr status                 所有帳號完整表格
   qr status --bars          表格每個帳號下面加各額度窗的長條
   qr status --watch [N]     含長條的表格每 N 秒重畫（預設 10），Ctrl-C 離開
+  qr watch [N]              同上的短寫法（也可寫 qr status watch、qr status bars）
   qr report [--days N]      重置事件、目前步調與派工統計（預設 7 天）
   qr leases --clear         清掉所有預約
   qr decisions [N]          最近 N 筆分流決定（預設 30）
