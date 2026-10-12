@@ -177,11 +177,21 @@ def test_install_and_first_dispatch_on_a_fresh_machine(tmp_path, vendors):
     (stand_ins / "claude").write_text('#!/bin/sh\necho "dir=${CLAUDE_CONFIG_DIR-unset} args=$*"\n')
     (stand_ins / "claude").chmod(0o755)
     terminal = dict(env, PATH=f"{launcher.parent}{os.pathsep}{env['PATH']}")
-    started = subprocess.run(["claude", "--model", "opus", "fix it"], env=terminal, cwd=str(home), capture_output=True,
-                             text=True, encoding="utf-8", timeout=120)
+
+    def claude(*args):
+        return subprocess.run(["claude", *args], env=terminal, cwd=str(home), capture_output=True, text=True,
+                              encoding="utf-8", timeout=120)
+
+    # ~/.claude-b has no hook yet, so no session lands there: main is the only account set up for sessions.
+    started = claude("--model", "opus", "fix it")
+    assert started.returncode == 0 and started.stdout == "dir=unset args=--model opus fix it\n", started.stderr
+    second = run(qr, "install", "--config-dir", str(home / ".claude-b"))
+    assert second.returncode == 0 and "claude launcher" not in second.stdout, second.stderr
+    started = claude("--model", "opus", "fix it")
     assert started.returncode == 0 and started.stdout == f"dir={home / '.claude-b'} args=--model opus fix it\n", started.stderr
-    assert started.stderr.startswith("[quota-router] session on b: weekly 90% left") and started.stderr.count("\n") == 1
+    assert started.stderr == ""                                             # not a terminal: no extra line
     assert "| qr launch | lead=- | sess=- | claude | launch | pick=claude-b |" in (state / "decisions.log").read_text()
+    assert run(qr, "uninstall", "--config-dir", str(home / ".claude-b")).returncode == 0 and launcher.exists()
 
     # And it comes out again without leaving anything behind in settings.json.
     removed = run(qr, "uninstall")

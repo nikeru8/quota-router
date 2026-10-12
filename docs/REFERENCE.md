@@ -12,7 +12,7 @@ Location: `$QR_CONFIG`, else `~/.config/quota-router/config.toml` (Windows: `%AP
 |---|---|
 | Unknown top-level section, unknown setting, unknown field in an `[[accounts]]` table, unknown table under `[families]` | Warning; the value is ignored. Warnings are printed by `qr config` (stderr) and `qr doctor` only. The hook and the other commands load the file silently. |
 | Wrong type (number where a string is expected and so on), negative number, `inf` or `nan` | Error. |
-| `launch` in an `[[accounts]]` table that is not `true` / `false` | Error. |
+| `launch` in an `[[accounts]]` table, or `launch.route_print`, that is not `true` / `false` | Error. |
 | `launch` on a Codex account | Warning; it only applies to Claude accounts and is ignored. |
 | `general.language` other than `en` / `zh-TW` | Error. |
 | `endpoints.*` not starting with `http://` or `https://` | Error. |
@@ -66,6 +66,21 @@ The check passes, with a note, when the payment state is not known: an account d
 
 `qr pick` and `qr check` apply the same rules; they read `QR_ALLOW_CREDITS=1` from their environment. `qr pick --env` exits with status 3 and prints nothing on stdout when no account can take the dispatch. `--strict` is accepted for compatibility and has no effect.
 
+### Using `qr pick` in scripts
+
+The hook only sees the text of a Bash command, so a dispatch made inside a script asks for its account itself:
+
+```sh
+account=$(qr pick codex --env) || exit 3
+eval "env $account codex exec \"\$prompt\""
+```
+
+`--env` prints only the prefix: `CODEX_HOME=<dir>`, `CLAUDE_CONFIG_DIR=<dir>`, or `env -u CLAUDE_CONFIG_DIR` for the Claude account at the default location. The directory is shell-quoted when it contains a space or another special character, hence the `eval`. The account is reserved as a dispatch of the hook would be. Run outside Claude Code with the `claude` launcher first on `PATH`, `env -u CLAUDE_CONFIG_DIR claude -p …` passes through the launcher unchanged (unless `[launch] route_print = true`), so the account `qr pick` chose is kept.
+
+### Where a Claude login is read
+
+macOS: the login keychain, through `security find-generic-password … -w`, read-only. One service name (`Claude Code-credentials`, or `Claude Code-credentials-<8 hex digits of the SHA-256 of the directory>` for other directories) can hold more than one item: one filed under the account name `unknown` with only MCP logins, one filed under the macOS user name with `claudeAiOauth`. `security -s <service>` alone returns whichever it finds first, so the item filed under the user name (`-a <user>`) is asked for first; then any item of the service; then `<dir>/.credentials.json`. The first one with `claudeAiOauth` is used; when none has it, whatever the keychain returned. A query that does not answer within its time is not repeated. Linux and Windows: `<dir>/.credentials.json` only.
+
 ### What the hook recognises as a dispatch
 
 A `claude` with `-p` / `--print`, or a `codex` with `exec` / `e`, that stands where the shell would look for a command: at the start of a simple command, after variable assignments, after a shell keyword (`if`, `then`, `do`, `while`, `!`, `{` …), or after one of these launchers and their options: `env`, `nohup`, `time`, `timeout`, `gtimeout`, `noglob`, `command`, `exec`, `sudo`, `nice`, `caffeinate`, `stdbuf`, `setsid`, `xargs`, `parallel`, and `find … -exec` / `-execdir`. A `--` ends the options of those launchers.
@@ -109,7 +124,7 @@ One line per decision, nine fields separated by ` | `:
 | family | `claude`, `codex` or `?` |
 | kind | `auto` (routed), `explicit` (account named in the command), `explicit-unknown` (named directory not in the config), `resume`, `resume-unknown`, `deny`, `fail`, `pick`, `check`, `probe`; for `qr launch`: `launch` (a new session routed), `launch-resume` (a resumed conversation kept on its account), `launch-default` (started on the default account; `pick=` is the key of the account at the default location, or `-`), `fail`. A pass-through (`--help`, a subcommand, `CLAUDE_CONFIG_DIR` already set, inside a session) is not logged. |
 | `pick=` | account key; `-` when there is none |
-| detail | `; `-separated: a fixed phrase, the numbers behind the choice (`weekly N% left`, `five-hour N% left`, `N running, N reserved`), `model <class>`, `credits allowed`. The phrases `qr launch` adds: `launched with a warning`, `on paid overage`, `no account can take it`, `no account could be read`, `no account has launch enabled`, and `conversation location unknown` / `kept the original account` as for the hook. For `deny` only the category: `blocked: credits`, `paid overage`, `lead protection`, `five-hour window`, `weekly quota`, `wrong account for resume`, `no account available`, `other`. For `fail` the exception class name. |
+| detail | `; `-separated: a fixed phrase, the numbers behind the choice (`weekly N% left`, `five-hour N% left`, `N running, N reserved`), `model <class>`, `credits allowed`. The phrases `qr launch` adds: `launched with a warning`, `on paid overage`, `no account can take it`, `no account could be read`, `no account is set up for sessions`, and `conversation location unknown` / `kept the original account` as for the hook. For `deny` only the category: `blocked: credits`, `paid overage`, `lead protection`, `five-hour window`, `weekly quota`, `wrong account for resume`, `no account available`, `other`. For `fail` the exception class name. |
 | `cmd#` | first 12 hex digits of the SHA-256 of the command; `-` when there is no command. For `qr launch` the command is `claude` followed by its arguments, shell-quoted. |
 
 Never written: the command or prompt, an email address, a directory, a note in the display language, an exception message. An account key, lead key, model class or session id that contains anything but letters, digits, `_`, `.` and `-` is written as `#` plus 12 hex digits of its hash. When several dispatches share one Bash command and one of them is denied, only the denial is logged.
@@ -135,6 +150,7 @@ No exception message and no traceback is written here, because both can quote re
 | `cache.json` | Last reading per account: usage windows, when fetched, account email, a short hash of the token (never the token), error text, back-off state |
 | `leases.json` | Reservations of the last `lease_seconds`: account key, time, full session id |
 | `installs.json` | What `qr install` put into each `settings.json`, and the launcher file it wrote (below) |
+| `launched.json` | Sessions started through the launcher or with `CLAUDE_CONFIG_DIR` written out, for `--continue`: a hash of the working directory (never the path), the account key, the time; 30 days, at most 500 |
 | `failure-index.json` | Offsets into the two logs for counting recent failures |
 | history, observation and notice files | Usage readings over time, detected reset events, which session has been told about which reset |
 | `probe-<key>.log`, `probe-<key>.lock` | Output of the background Codex probe, and its once-per-interval marker |
@@ -177,16 +193,17 @@ A matcher covers Bash when it is missing, empty, `*`, `Bash`, or a pattern that 
 
 ### The launcher file
 
-`qr install` (unless `--no-launcher`) writes `<data dir>/quota-router/bin/claude`, where the data directory is `$XDG_DATA_HOME` or `~/.local/share`; on Windows `%LOCALAPPDATA%\quota-router\bin\claude.cmd`. On macOS and Linux it is, with mode 755:
+`qr install` without `--config-dir` (and unless `--no-launcher`) writes `<data dir>/quota-router/bin/claude`, where the data directory is `$XDG_DATA_HOME` or `~/.local/share`; on Windows `%LOCALAPPDATA%\quota-router\bin\claude.cmd`. `qr install --config-dir` and `qr uninstall --config-dir` never touch it: one launcher serves every account. On macOS and Linux it is an `sh` script, mode 755, that
 
-```sh
-#!/bin/sh
-# quota-router launcher: starts claude on the account with the most quota left (`qr launch`).
-# Written by `qr install`; `qr uninstall` removes it.
-exec <absolute path of python> -I -X utf8 <package dir>/__main__.py launch -- "$@"
-```
+1. checks that the recorded interpreter is executable and the entry file exists, then runs `<python> -I -X utf8 <package dir>/__main__.py launch --resolve -- "$@"`;
+2. reads its answer, four lines: `quota-router-launch 1`, `keep` / `unset` / `set`, the directory, the real claude; sets or removes `CLAUDE_CONFIG_DIR` accordingly and `exec`s that claude, so claude takes over the process, its terminal and its signals;
+3. if any of that fails (interpreter or entry file gone, an older package without `qr launch`, which prints its usage and exits with status 2, an import error, any other non-zero exit, an answer it does not recognise), looks through `PATH` itself and `exec`s the first `claude` that is not in its own directory and does not carry the marker `quota-router launcher` in its first 512 bytes, with the arguments unchanged; when there is none, one line on stderr and exit status 127.
 
-The interpreter and entry file are the ones the hook entry uses, for the same reason: `-I` keeps the environment and working directory from changing what is imported, and naming the file (not `-m quota_router`) still works where `-I` hides a `pip install --user` or a source checkout. The Windows file is the batch equivalent (`"<python>" -I -X utf8 "<entry>" launch -- %*`, then `exit /b %ERRORLEVEL%`). `qr install` never edits a shell startup file. When the directory is not on `PATH` ahead of the real claude, it prints `export PATH="$HOME/.local/share/quota-router/bin:$PATH"` (the directory quoted when it is not under the home directory or holds unusual characters; on Windows the directory itself).
+So the launcher is never the reason `claude` does not start. The interpreter and entry file are the ones the hook entry uses, for the same reason: `-I` keeps the environment and working directory from changing what is imported, and naming the file (not `-m quota_router`) still works where `-I` hides a `pip install --user` or a source checkout.
+
+The Windows file is a batch file: when the interpreter, the entry file and `launch.py` next to it exist, it runs `"<python>" -I -X utf8 "<entry>" launch -- %*` and returns its exit status (Python then starts claude as a child); otherwise it runs the first `claude` that `where claude` lists outside its own directory. It does not fall back when Python starts but fails. Untested on a real machine.
+
+`qr install` never edits a shell startup file. When the directory is not on `PATH` ahead of the real claude, it prints `export PATH="$HOME/.local/share/quota-router/bin:$PATH"` (the directory quoted when it is not under the home directory or holds unusual characters; on Windows the directory itself).
 
 **Which file counts as ours.** `installs.json` records, under the launcher's path, the interpreter, the entry file and the SHA-256 of the exact bytes written.
 
@@ -201,46 +218,61 @@ The directory itself is never removed: it may be on `PATH`.
 
 ### Which claude is started
 
-The first file named `claude` (on Windows: `claude` plus each `PATHEXT` suffix, in that order) on `PATH` that is executable, is not in the launcher's directory, and does not carry the marker `quota-router launcher` in its first 512 bytes (a launcher written for another interpreter or data directory). Empty and relative `PATH` entries are skipped, so a `claude` in the working directory is never started. It is looked up at every start. None found: one line on stderr, exit status 127.
+The first file named `claude` (on Windows: `claude` plus each `PATHEXT` suffix, in that order) on `PATH` that is executable, is not in the launcher's directory, and does not carry the marker `quota-router launcher` in its first 512 bytes (a launcher written for another interpreter or data directory). Empty and relative `PATH` entries are skipped, so a `claude` in the working directory is never started. It is looked up at every start. None found: `qr launch` prints one line and exits with status 127 (with `--resolve` it exits with status 1 and the launcher reports it).
 
 ### Arguments
 
-The words before `--` are read; after `--` everything is the prompt.
+The words before `--` are read; after `--` everything is the prompt. The list of options that take a value was taken from `claude --help` of claude 2.1.296 and lives in one place, `VALUE_FLAGS` in `quota_router/launch.py`; an option claude adds later and that takes a value may make its value look like a subcommand, and that session then starts unrouted.
 
 | Words | Effect |
 |---|---|
-| `--help`, `-h`, `--version`, `-v` | pass through |
+| `--help`, `-h`, `--version`, `-v`, `--bg` | pass through (background sessions are kept per config directory, and `claude agents` / `attach` / `logs` / `stop` look in the default one) |
+| `-p`, `--print`, or short options written together that contain `p` (`-pc`) | pass through, unless `[launch] route_print = true` |
 | first word that is not an option and not an option's value, before any `-p` / `--print`: a known subcommand (`mcp`, `config`, `doctor`, `update`, `install`, `auth`, `plugin`, `setup-token`, `migrate-installer`, `daemon`, `agents`) or any word made of lower-case letters, digits and `-` starting with a letter | pass through (an unknown subcommand is never taken for a prompt; a one-word lower-case prompt is passed through as well) |
 | `--resume ID`, `-r ID`, `--resume=ID` | resume `ID` |
-| `--resume` / `-r` not followed by a word, `--resume=`, `--continue`, `-c` | resume the most recent conversation of the working directory |
+| `--resume` / `-r` not followed by a word, `--resume=`, `--continue`, `-c`, short options written together that contain `c`, `--from-pr N` | resume as `--continue` (below) |
 | `--model NAME`, `--model=NAME` | score for that model; without it, the scarce model is assumed, as for a dispatch |
-| options that take a value (`--settings`, `--add-dir`, `--agent`, `--permission-mode`, `--system-prompt`, `--allowedTools`, …) | their value is skipped |
+| options that take a value (`--add-dir`, `--agent(s)`, `--allowedTools` / `--allowed-tools`, `--append-system-prompt(-file)`, `--autocompact`, `--betas`, `--debug-file`, `--disallowedTools` / `--disallowed-tools`, `--effort`, `--fallback-model`, `--file`, `--input-format`, `--json-schema`, `--max-budget-usd`, `--max-turns`, `--mcp-config`, `-n` / `--name`, `--output-format`, `--permission-mode`, `--permission-prompt-tool`, `--permission-prompts`, `--plugin-dir`, `--plugin-url`, `--session-id`, `--setting-sources`, `--settings`, `--system-prompt(-file)`, `--tools`, `-w` / `--worktree`) | their value is skipped |
 
-Before the arguments are read: `CLAUDE_CONFIG_DIR` present in the environment (even empty), or `CLAUDECODE` set (a command inside a Claude Code session, where the hook decides; the hook writes the default account as `env -u CLAUDE_CONFIG_DIR`, which a terminal cannot be told apart from otherwise), passes through. A config file without Claude accounts passes through as well: that family is not managed.
+Before the arguments are read: `CLAUDECODE` set (a command inside a Claude Code session, where the hook decides) passes through. After them: `CLAUDE_CONFIG_DIR` present in the environment (even empty) passes through; when that start is a session, it is recorded for `--continue` (below). A config file without Claude accounts passes through as well: that family is not managed.
 
-A conversation is found as by the hook: `<dir>/projects/*/<id>.jsonl` for an id, and the newest `*.jsonl` under `<dir>/projects/<slug of the working directory>/` across the accounts for `--continue`.
+### Which accounts are set up for sessions
+
+Each account directory carries its own settings: `settings.json` (with the hook, permissions, MCP servers, model, output style), `CLAUDE.md`, plugins and skills. quota-router does not copy or synchronise any of it. A new session therefore only lands on a Claude account whose `launch` is not `false` **and** whose `settings.json` has a quota-router hook that Bash reaches (`installed_state` is `installed`, `outdated`, `manual` or `foreign`; not `absent`, `misplaced` or `unreadable`). A directory without the hook would also leave the session's own dispatches unrouted. `qr config` marks such an account `(launch: hook missing)`, `qr status` lists them under the Claude table, and `qr doctor` warns with the `qr install --config-dir …` to run. A resumed conversation and the default-account fallback ignore this: the conversation exists only where it is, and the default account is what `claude` would have used anyway.
+
+### `--continue`: what it can and cannot know
+
+Claude Code chooses the session id after it starts, so the launcher cannot record which conversation a session will write. It records, in `launched.json` in the state directory, every session it starts (and every session started with `CLAUDE_CONFIG_DIR` written out): a 16-hex-digit hash of the working directory, the account key and the time; 30 days, at most 500 entries. `--continue` (and `--resume` without an id, `--from-pr`) then goes to:
+
+1. the account of the most recent launch in this directory that has at least one conversation file of this directory (`<dir>/projects/<slug>/*.jsonl`);
+2. otherwise the account with the newest such file, leaving out files whose first records say they come from a one-shot or SDK run (`"entrypoint": "sdk-…"`) or a subagent (`"isSidechain": true`), and files newer than the latest launch here on another account (most likely that session's dispatches);
+3. otherwise the default account, with a line saying the conversation was not found.
+
+It cannot know about sessions started without the launcher and without `CLAUDE_CONFIG_DIR` (for example with an alias to an absolute path, or before the launcher was installed): a launch record wins over a newer conversation that such a session wrote on another account. It does not read the conversations beyond their first lines, and the `entrypoint` / `isSidechain` fields are what Claude Code writes today, not a documented format; a file without them counts as interactive. The hook's own `claude -p … -c` is not affected by any of this.
 
 ### Choice and fallback
 
-New session: rows are read for every Claude account with no lead (`read_family(lead_key="")`), merged by email as usual; rows with no directory that has `launch = true` are dropped, and a merged row is represented by its first directory with `launch = true`. Then the hook's `retry_blocked`, `score_rows` and `choose` run unchanged, under the lease lock, and the account is reserved with an empty session id. Credits follow `QR_ALLOW_CREDITS=1` in the environment and `general.allow_credits`.
+New session: rows are read for every Claude account with no lead (`read_family(lead_key="")`), merged by email as usual; interactive `claude` sessions running on an account (from the process list and each process's `CLAUDE_CONFIG_DIR`, as for `claude -p` jobs) are added to its jobs; rows with no directory that is set up for sessions are dropped, and a merged row is represented by its first directory that is. Then the hook's `retry_blocked` and `score_rows` run unchanged. Before `choose`, accounts whose quota cannot be read are set aside as long as an account that can be read is not blocked: for a dispatch the hook gives an unreadable account the middle score, which can win a tie by config order; a session runs for hours and goes to a known account. The choice is made under the lease lock and reserved with an empty session id. Credits follow `QR_ALLOW_CREDITS=1` in the environment and `general.allow_credits`. The hook does not count interactive sessions; only `qr launch` does.
 
 | Situation | Session starts on | Line |
 |---|---|---|
 | an account was chosen | that account | `session on <account>: <numbers and notes>`, plus the hook's `⚠` warnings (all low, old numbers) and `⚠ PAID OVERAGE` when it would bill |
-| a conversation was found | its account, whatever its quota or `launch` | `Resuming on …`, plus `⚠ <account>: <reason>` when its quota is used up and `⚠ PAID OVERAGE` when it would bill |
+| a conversation was found | its account, whatever its quota or set-up | `Resuming on …`, plus `⚠ <account>: <reason>` when its quota is used up and `⚠ PAID OVERAGE` when it would bill |
 | conversation not found | default account | says so |
 | every candidate blocked | default account | each account's reason; `⚠ PAID OVERAGE` when the default account would bill |
 | no candidate has a reading | default account (nothing reserved) | says so |
-| no account with `launch = true` | default account | says so |
+| no account set up for sessions | default account | each account's reason (`launch = false`, no hook) |
 | config missing or broken | default account | the path and the problem |
 | an exception | default account | the exception class; recorded in `hook-errors.log` (`launch`) and `decisions.log` (`fail`) |
 | not decided within `hook_budget_seconds` + 2 s | default account | says so; the choosing thread is abandoned |
 
-"Default account" means `CLAUDE_CONFIG_DIR` removed from the environment, whatever account is logged in at `~/.claude`. Its `launch` setting is not consulted for a fallback.
+"Default account" means `CLAUDE_CONFIG_DIR` removed from the environment, whatever account is logged in at `~/.claude`. Its set-up is not consulted for a fallback.
+
+The line is printed only when stderr is a terminal, so `claude … 2>&1` in a script gets nothing extra; `decisions.log` has every decision either way.
 
 ### Starting
 
-macOS and Linux: `os.execve` with the chosen environment, so claude takes over the process, its terminal and its signals; the stderr line is flushed first. Windows: claude runs as a child with the chosen environment, Ctrl+C is left to it, and its exit status is returned. Ctrl+C while the account is being chosen ends `qr launch` with status 130 without starting claude.
+Through the sh launcher: `qr launch --resolve` prints the answer and the launcher `exec`s claude (above). `qr launch` run directly, and the Windows launcher: macOS and Linux `os.execve` with the chosen environment; Windows runs claude as a child with the chosen environment, leaves Ctrl+C to it and returns its exit status. Ctrl+C while the account is being chosen ends `qr launch` with status 130 without starting claude.
 
 ## `qr doctor`
 
@@ -257,10 +289,10 @@ One line per check, starting with `OK` or `WARN`. It only looks: credential file
 9. Per account: the directory exists; a login file exists (`.credentials.json` for Claude, `auth.json` for Codex). On macOS a Claude account without the file is reported as "login is normally in the keychain", which is an `OK` line and does not prove a login.
 10. Per Claude account directory, and for the default one: the state of the hook entry in its `settings.json` (`installed`, `outdated`, `misplaced`, `manual`, `foreign`, `absent`, `unreadable`). `installed` and `manual` are `OK`.
 11. For every entry found: the listed command is run once with the test event. `WARN` when it cannot be started, times out after 20 seconds or does not answer, with up to three lines of its stderr. A shell-form entry is run through `/bin/sh -c` (Windows: `bash` from `PATH`).
-12. The launcher: present (`WARN` when absent; the rest of the launcher checks are then skipped), written by this installation, executable.
+12. The launcher: present (`WARN` when absent; the rest of the launcher checks are then skipped), written by this installation, executable; and it is run once as `claude --version` (which passes straight through to the real claude), `WARN` when that exits non-zero, prints nothing or takes more than 20 seconds, with up to three lines of its stderr.
 13. Its directory comes before the real claude on `PATH`; otherwise `WARN` with the line to add.
 14. Every alias or function named `claude` in `~/.zshrc`, `~/.zprofile`, `~/.zshenv` (under `$ZDOTDIR` when set), `~/.bashrc`, `~/.bash_profile`, `~/.bash_aliases` and `~/.profile`, with file and line number. `OK` for an alias whose command is `claude` (optionally after `command`, `env` or variable assignments), since the shell then finds the launcher on `PATH`; `WARN` for an alias that runs anything else (an absolute path, `npx`, …), one that sets `CLAUDE_CONFIG_DIR`, and for a function. The line is shown with credential-looking text masked and cut at 200 characters. No alias or function: one `OK` line.
-15. With a usable config that has Claude accounts: at least one has `launch = true` (`WARN` otherwise), and at least one of those has a reading in `cache.json` (`WARN`: run `qr status`).
+15. With a usable config that has Claude accounts: one `WARN` per account with `launch` not `false` but no hook in its `settings.json`, with the `qr install --config-dir …` to run; at least one account set up for sessions (`WARN` otherwise); and at least one of those has a reading in `cache.json` (`WARN`: run `qr status`).
 
 ## Windows
 
@@ -304,7 +336,7 @@ See [research-windows.md](research-windows.md) for the sources these choices are
 | Windows | Nine cases in `tests/test_review_fixes.py` | Run the generated command through `/bin/sh` |
 | Windows | `tests/test_fresh_machine.py` | The virtual-environment layout and the fake `security` / `ps` programs are POSIX. The same steps are covered piecewise by `test_install.py` and `test_hook.py`. |
 | Windows | One test in `tests/test_install.py` | Runs a hand-written shell-form entry through `/bin/sh` |
-| Windows | Five tests (ten cases) in `tests/test_launch.py` | Run the launcher through `/bin/sh`, use XDG directories, or check the POSIX `export PATH=` line, file modes and shell aliases |
+| Windows | Seven tests (fifteen cases) in `tests/test_launch.py` | Run the launcher through `/bin/sh`, use XDG directories, or check the POSIX `export PATH=` line, file modes and shell aliases |
 | macOS, Linux | One test in `tests/test_final_review.py` | Needs Windows path rules (a drive path is absolute only there) |
 | Anywhere without a cached `setuptools` and `uv` | `tests/test_fresh_machine.py` | It installs into a new virtual environment without the network. Set `QR_E2E_ONLINE=1` to let it download instead; CI does. |
 

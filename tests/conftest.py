@@ -139,6 +139,7 @@ def router(home, write_config, monkeypatch):
     monkeypatch.setattr(core, "codex_reading", reading)
     real_running_jobs = core.running_jobs
     monkeypatch.setattr(core, "running_jobs", lambda: {})
+    monkeypatch.setattr(core, "running_sessions", lambda: {})
     monkeypatch.setattr(core.subprocess, "run", blocked)
     monkeypatch.setattr(core, "open_url", blocked)
     monkeypatch.setattr(core.urllib.request, "urlopen", blocked)

@@ -356,17 +356,69 @@ def launcher_path():
 
 
 def launcher_text(python=None, entry=None, platform=None):
+    """The launcher file. It must never be the reason `claude` does not start: when the interpreter or the package
+    is gone, the package is an older one without `qr launch`, or quota-router fails, it starts the first other
+    `claude` on PATH unchanged.
+
+    POSIX: `qr launch --resolve` only answers which claude to start and with which CLAUDE_CONFIG_DIR; the sh
+    script starts it with `exec`, so claude takes over the process, its terminal and its signals."""
     python, entry = python or sys.executable, entry or ENTRY_FILE
     if (platform or platform_compat.system()) == "windows":
-        return ("@echo off\r\n"
-                f"rem {launch.MARKER}: starts claude on the account with the most quota left (qr launch).\r\n"
-                "rem Written by `qr install`; `qr uninstall` removes it.\r\n"
-                f'"{python}" {" ".join(INTERPRETER_FLAGS)} "{entry}" launch -- %*\r\n'
-                "exit /b %ERRORLEVEL%\r\n")
-    return ("#!/bin/sh\n"
-            f"# {launch.MARKER}: starts claude on the account with the most quota left (`qr launch`).\n"
-            "# Written by `qr install`; `qr uninstall` removes it.\n"
-            f"exec {shlex.join([python, *INTERPRETER_FLAGS, entry])} launch -- \"$@\"\n")
+        import ntpath
+        package = ntpath.join(ntpath.dirname(entry), "launch.py")
+        return "\r\n".join([
+            "@echo off",
+            f"rem {launch.MARKER}: starts claude on the account with the most quota left (qr launch).",
+            "rem Written by `qr install`; `qr uninstall` removes it. Without a working quota-router it starts claude as it is.",
+            "setlocal",
+            f'if exist "{python}" if exist "{entry}" if exist "{package}" goto quota_router',
+            "goto plain",
+            ":quota_router",
+            f'"{python}" {" ".join(INTERPRETER_FLAGS)} "{entry}" launch -- %*',
+            "exit /b %ERRORLEVEL%",
+            ":plain",
+            "for /f \"delims=\" %%C in ('where claude 2^>nul') do if /i not \"%%~dpC\"==\"%~dp0\" (set \"QR_CLAUDE=%%C\" & goto found)",
+            "echo quota-router: no claude executable found on PATH apart from the launcher 1>&2",
+            "exit /b 127",
+            ":found",
+            '"%QR_CLAUDE%" %*',
+            "exit /b %ERRORLEVEL%", ""])
+    return "\n".join([
+        "#!/bin/sh",
+        f"# {launch.MARKER}: starts claude on the account with the most quota left (`qr launch`).",
+        "# Written by `qr install`; `qr uninstall` removes it. Without a working quota-router it starts claude as it is.",
+        f"qr_python={shlex.quote(python)}",
+        f"qr_entry={shlex.quote(entry)}",
+        'qr_self=${0%/*}',
+        'if [ -x "$qr_python" ] && [ -f "$qr_entry" ] &&',
+        f'   qr_answer=$("$qr_python" {" ".join(INTERPRETER_FLAGS)} "$qr_entry" launch --resolve -- "$@"); then',
+        '  { IFS= read -r qr_tag; IFS= read -r qr_action; IFS= read -r qr_dir; IFS= read -r qr_program; } <<QR_END',
+        "$qr_answer",
+        "QR_END",
+        f'  if [ "$qr_tag" = "{launch.RESOLVED}" ] && [ -x "$qr_program" ]; then',
+        "    case $qr_action in",
+        "      set) CLAUDE_CONFIG_DIR=$qr_dir; export CLAUDE_CONFIG_DIR ;;",
+        "      unset) unset CLAUDE_CONFIG_DIR ;;",
+        "    esac",
+        '    exec "$qr_program" "$@"',
+        "  fi",
+        "fi",
+        "# quota-router did not answer: the first other claude on PATH, as it is.",
+        "set -f",
+        "qr_ifs=$IFS",
+        "IFS=:",
+        "for qr_dir in $PATH; do",
+        '  case $qr_dir in /*) ;; *) continue ;; esac',
+        '  [ "$qr_dir" = "$qr_self" ] && continue',
+        '  if [ -f "$qr_dir/claude" ] && [ -x "$qr_dir/claude" ] &&',
+        f"     ! dd if=\"$qr_dir/claude\" bs=512 count=1 2>/dev/null | grep -q '{launch.MARKER}'; then",
+        "    IFS=$qr_ifs",
+        "    set +f",
+        '    exec "$qr_dir/claude" "$@"',
+        "  fi",
+        "done",
+        'echo "quota-router: no claude executable found on PATH apart from the launcher" >&2',
+        "exit 127", ""])
 
 
 def text_hash(data):
@@ -593,7 +645,8 @@ def run(action, argv):
                 print("WARN    " + t("doctor.run.stderr", text=text), file=sys.stderr)
             # settings.json is written, but a hook that does not answer routes nothing: scripts must be able to tell.
             raise SystemExit(1)
-    if "--no-launcher" not in argv:
+    if "--no-launcher" not in argv and config_dir is None:
+        # one launcher serves every account: `--config-dir` is about one settings.json and leaves it alone.
         run_launcher(action is install)
     if status in ("added", "updated"):
         print(t("install.next"))
@@ -731,9 +784,18 @@ def doctor_launcher(line, cfg):
     for file, number, text, verdict, program in overrides:
         values = {"file": file, "number": number, "text": core.redact(text.strip())[:200], "program": program}
         line(verdict == "through", t("doctor.alias." + verdict, **values))
-    accounts = [a["key"] for a in cfg.family("claude") if a["launch"]] if cfg else []
+    ok, detail, stderr = try_launcher(path)
+    line(ok, t("doctor.launcher.runs", output=detail) if ok else t("doctor.launcher.does_not_run", path=path, detail=detail))
+    for text in ([] if ok else stderr):
+        line(False, "  " + t("doctor.run.stderr", text=text))
     if cfg is None or not cfg.family("claude"):
         return
+    ready = launch.readiness(cfg)
+    for account in cfg.family("claude"):
+        if ready[account["key"]] == "no-hook":
+            hint = "qr install" + ("" if account["dir"] is None else " --config-dir " + platform_compat.shell_quote(account["dir"]))
+            line(False, t("doctor.launch.no_hook", account=account["key"], command=hint))
+    accounts = [key for key, why in ready.items() if why is None]
     if not accounts:
         line(False, t("doctor.launch.none"))
         return
@@ -747,6 +809,22 @@ def doctor_launcher(line, cfg):
         line(True, t("doctor.launch.ok", keys=", ".join(accounts), read=", ".join(read)))
     else:
         line(False, t("doctor.launch.no_reading", keys=", ".join(accounts)))
+
+
+def try_launcher(path):
+    """Run the launcher once with `--version`, as a terminal would: (ok, first line of its output or why not,
+    first lines of stderr). `--version` passes straight through to the real claude."""
+    try:
+        result = subprocess.run([path, "--version"], stdin=subprocess.DEVNULL, capture_output=True, timeout=SELF_TEST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, t("doctor.run.timeout", seconds=SELF_TEST_TIMEOUT), []
+    except OSError as error:
+        return False, t("doctor.run.not_started", detail=error.strerror or type(error).__name__), []
+    stderr = [text.strip()[:200] for text in result.stderr.decode("utf-8", "replace").splitlines() if text.strip()][:3]
+    output = next((text.strip()[:100] for text in result.stdout.decode("utf-8", "replace").splitlines() if text.strip()), "")
+    if result.returncode == 0 and output:
+        return True, output, stderr
+    return False, t("doctor.launcher.exit", code=result.returncode), stderr
 
 
 def check_lock(state):

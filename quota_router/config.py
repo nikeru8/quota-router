@@ -38,6 +38,7 @@ SETTINGS = [
     ("timing", "notice_ttl_hours", 6),
     ("events", "reset_drop_points", 3),
     ("families.claude", "scarce_model", "fable"),
+    ("launch", "route_print", False),
     ("endpoints", "claude_usage", "https://api.anthropic.com/api/oauth/usage"),
     ("endpoints", "claude_profile", "https://api.anthropic.com/api/oauth/profile"),
     ("endpoints", "codex_usage", "https://chatgpt.com/backend-api/wham/usage"),

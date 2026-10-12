@@ -147,19 +147,43 @@ def test_list_processes_and_environment_parse_ps_output(monkeypatch):
 def test_claude_credentials_from_the_macos_keychain(home, monkeypatch):
     monkeypatch.setattr(pc, "system", lambda: "darwin")
     run = fake_runner({"security find-generic-password": (0, '{"claudeAiOauth": {}}')})
+    monkeypatch.setattr(pc, "login_names", lambda: ["me"])
     assert pc.claude_credentials(None, run) == '{"claudeAiOauth": {}}'
-    assert run.calls[-1] == ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"]
+    assert run.calls[-1] == ["security", "find-generic-password", "-a", "me", "-s", "Claude Code-credentials", "-w"]
     pc.claude_credentials("/home/someone/.claude-b", run)
-    service = run.calls[-1][3]
+    service = run.calls[-1][5]
     assert service.startswith("Claude Code-credentials-") and len(service) == len("Claude Code-credentials-") + 8
     assert service == pc.keychain_service("/home/someone/.claude-b") != pc.keychain_service("/home/someone/.claude-c")
     assert pc.claude_credentials(None, fake_runner({"security find-generic-password": (44, "")})) is None
     assert pc.claude_credentials(None, fake_runner({})) is None
 
 
+def test_the_users_keychain_item_beats_an_mcp_only_item(home, monkeypatch):
+    """Review finding 8: two items share the service name; `security -s` alone returned the one with acct "unknown"
+    that holds only MCP logins, so the default account read as not logged in."""
+    monkeypatch.setattr(pc, "system", lambda: "darwin")
+    monkeypatch.setattr(pc, "login_names", lambda: ["me"])
+    mcp_only, login = '{"mcpOAuth": {"x": {}}}', '{"claudeAiOauth": {"accessToken": "real"}}'
+    calls = []
+
+    def run(argv):
+        calls.append(argv)
+        stdout = login if "-a" in argv and argv[argv.index("-a") + 1] == "me" else mcp_only
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+    assert pc.claude_credentials(None, run) == login
+    assert calls == [["security", "find-generic-password", "-a", "me", "-s", "Claude Code-credentials", "-w"]]
+    # an older keychain without the user's item: the service-only query still finds the login.
+    calls.clear()
+    assert pc.claude_credentials("/x/.claude-b", lambda argv: calls.append(argv) or (
+        subprocess.CompletedProcess(argv, 44, stdout="", stderr="") if "-a" in argv else
+        subprocess.CompletedProcess(argv, 0, stdout=login, stderr=""))) == login
+    assert [("-a" in argv) for argv in calls] == [True, False]
+
+
 def test_macos_falls_back_to_the_credentials_file(home, monkeypatch):
     """Claude Code writes the file itself when the keychain refuses (locked, SSH session)."""
     monkeypatch.setattr(pc, "system", lambda: "darwin")
+    monkeypatch.setattr(pc, "login_names", lambda: ["me"])
     (home / ".claude").mkdir()
     (home / ".claude" / ".credentials.json").write_text('{"claudeAiOauth": {"accessToken": "from-file"}}')
     (home / "b").mkdir()
@@ -168,7 +192,11 @@ def test_macos_falls_back_to_the_credentials_file(home, monkeypatch):
                    fake_runner({"security find-generic-password": (0, "\n")})):
         assert "from-file" in pc.claude_credentials(None, runner)
         assert "b-file" in pc.claude_credentials(str(home / "b"), runner)
-    # the keychain still wins when it has an entry.
+    # the keychain still wins when it has a login; an item without one does not beat the file.
+    assert pc.claude_credentials(None, fake_runner({"security find-generic-password": (0, '{"claudeAiOauth": {"accessToken": "kc"}}')})) \
+        == '{"claudeAiOauth": {"accessToken": "kc"}}'
+    assert "from-file" in pc.claude_credentials(None, fake_runner({"security find-generic-password": (0, '{"k": 1}')}))
+    (home / ".claude" / ".credentials.json").unlink()
     assert pc.claude_credentials(None, fake_runner({"security find-generic-password": (0, '{"k": 1}')})) == '{"k": 1}'
     (home / "b" / ".credentials.json").write_bytes(b"\xff\xfe")
     assert pc.claude_credentials(str(home / "b"), fake_runner({})) is None

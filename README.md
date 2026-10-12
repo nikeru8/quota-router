@@ -97,7 +97,7 @@ Then either call `~/.qr-venv/bin/qr` by that path or add `~/.qr-venv/bin` to you
 
    This adds one `PreToolUse` entry for `Bash` and leaves the rest of the file as it was. The previous file is saved next to it as `settings.json.bak-<time>`. Running it again changes nothing. It then runs the installed command once with a harmless test event and exits with status 1 if that command does not answer. A successful install means the hook starts; it does not mean routing is configured, since the hook also answers the test without a config file.
 
-   It also writes the `claude` launcher to `~/.local/share/quota-router/bin/claude` (see [Launching sessions](#launching-sessions)) and, when that directory is not yet ahead of the real `claude` on your `PATH`, prints the line to add to `~/.zshrc` or `~/.bashrc`. It never edits those files itself. `--no-launcher` installs the hook only.
+   Without `--config-dir` it also writes the `claude` launcher to `~/.local/share/quota-router/bin/claude` (see [Launching sessions](#launching-sessions)) and, when that directory is not yet ahead of the real `claude` on your `PATH`, prints the line to add to `~/.zshrc` or `~/.bashrc`. It never edits those files itself. `--no-launcher` installs the hook only; `--config-dir` never touches the launcher. New sessions only land on account directories that have the hook, so run the `--config-dir` form for every account you want sessions on.
 
 4. **Check the setup.**
 
@@ -155,7 +155,7 @@ dir = "~/.codex-b"
 | `family` | required | `claude` or `codex`. |
 | `key` | required | A unique name of your choosing (letters, digits, `-`, `_`, `.`). It appears in messages and logs. |
 | `dir` | `""` | The directory you would pass as `CLAUDE_CONFIG_DIR` / `CODEX_HOME`. `~` and `$HOME` are expanded. Empty, or equal to `~/.claude` / `~/.codex`, means the CLI's default location; one account per family may use it. |
-| `launch` | `true` | Claude accounts only. `false`: [`qr launch`](#launching-sessions) never starts a new session here. Dispatches from the hook still go to it, and a conversation that lives there is still resumed there. |
+| `launch` | `true` | Claude accounts only. `false`: [`qr launch`](#launching-sessions) never starts a new session here. Even with `true`, a session only starts here once the hook is in this directory's `settings.json`. Dispatches from the hook still go to the account either way, and a conversation that lives there is still resumed there. |
 
 The order of the accounts matters in three cases: when two accounts score exactly the same, the one listed first is used; when two Claude directories are the same account, the first one that is not the lead's represents it; and when the time budget cannot cover every account, accounts with equally old readings are queried in this order.
 
@@ -187,6 +187,7 @@ A family with no accounts listed is not managed at all. Its dispatches are neith
 | `timing.notice_ttl_hours` | `6` | A reset notice is shown for this long. |
 | `events.reset_drop_points` | `3` | Usage must drop by this many points to count as a reset or refill. |
 | `families.claude.scarce_model` | `"fable"` | The Claude model that has its own weekly bucket. `""` turns the per-model check off. |
+| `launch.route_print` | `false` | `true`: the [launcher](#launching-sessions) also chooses the account for `claude -p …` started outside Claude Code. By default those run as written. |
 | `endpoints.claude_usage` | `"https://api.anthropic.com/api/oauth/usage"` | Where Claude usage is queried. |
 | `endpoints.claude_profile` | `"https://api.anthropic.com/api/oauth/profile"` | Where a Claude account's email is queried. |
 | `endpoints.codex_usage` | `"https://chatgpt.com/backend-api/wham/usage"` | Where Codex usage is queried. |
@@ -263,19 +264,21 @@ The hook only sees the `claude -p` / `codex exec` commands a session runs throug
 export PATH="$HOME/.local/share/quota-router/bin:$PATH"
 ```
 
-From then on `claude` in a terminal runs `qr launch`, which picks the account and replaces itself with the real `claude`, started with that account's `CLAUDE_CONFIG_DIR` (or with it unset, for the account at the default location). The real `claude` is looked up on `PATH` at every start, past the launcher's directory, so updating or moving it needs nothing. One line on stderr says where the session went:
+From then on `claude` in a terminal asks `qr launch` which account to use, then starts the real `claude` with that account's `CLAUDE_CONFIG_DIR` (or with it unset, for the account at the default location). The real `claude` is looked up on `PATH` at every start, past the launcher's directory, so updating or moving it needs nothing. When stderr is a terminal, one line says where the session went:
 
 ```
 [quota-router] session on bob: weekly 88% left (resets in 4.0 d)
 ```
 
+**Which accounts can take a session.** An account is used for new sessions only when it is *set up* for them: `launch` is not `false`, and `qr install` has put the hook into that directory's `settings.json` (`qr install --config-dir ~/.claude-b`). Each account directory carries its own settings: the hook, permissions, MCP servers, model, output style and `CLAUDE.md`. quota-router does not copy them from one directory to another, so a session lands only where you have set things up. `qr status`, `qr config` and `qr doctor` name the accounts that are passed over because the hook is missing.
+
 How it chooses:
 
-- **A new session** goes to the best Claude account by the hook's rules: the same score (weekly % left per hour to the reset, scaled for a tight five-hour window and for jobs running), the same skips (five-hour floor, weekly floor, weekly quota used up, not logged in, paid overage unless allowed), and a reservation as with `qr pick`. There is no lead yet, so no account is held back as the lead's. Accounts with `launch = false` are never chosen. Without `--model`, the scarce model's bucket counts too, as for a dispatch.
-- **A resumed conversation** (`--resume <id>`, `-r <id>`, `--resume=<id>`, `--continue`, `-c`) starts on the account that holds it. `--continue`, and `--resume` without an id (the picker), go to the account with the most recent conversation of the current directory. This also holds for an account with `launch = false` or no quota left, with a `⚠` in the line. When the account cannot be found, the session starts on the default account.
-- **Left alone, nothing printed:** `CLAUDE_CONFIG_DIR` already set (you, or the hook, chose); a command run inside a Claude Code session (`CLAUDECODE` set: the hook handles those, including `env -u CLAUDE_CONFIG_DIR claude -p …`, its spelling of the default account); `--help`, `-h`, `--version`, `-v`; a subcommand: `mcp`, `config`, `doctor`, `update`, `install`, `auth`, `plugin`, `setup-token`, `migrate-installer`, and any other bare lower-case word in first position. So `claude hello` starts unrouted, `claude "hello there"` is routed.
+- **A new session** goes to the best account that is set up, by the hook's rules: the same score (weekly % left per hour to the reset, scaled for a tight five-hour window and for jobs running), the same skips (five-hour floor, weekly floor, weekly quota used up, not logged in, paid overage unless allowed), and a reservation as with `qr pick`. Three differences from a dispatch: there is no lead yet, so no account is held back as the lead's; interactive sessions already running on an account count as jobs there; and an account whose quota can be read comes before one whose quota cannot. Without `--model`, the scarce model's bucket counts too, as for a dispatch.
+- **A resumed conversation** (`--resume <id>`, `-r <id>`, `--resume=<id>`) starts on the account that holds it. `--continue` / `-c`, `--resume` without an id (the picker) and `--from-pr` go to the account of the last session started through the launcher in this directory; without one, to the newest conversation of this directory that is not a `claude -p` run. This also holds for an account that is not set up for sessions or has no quota left, with a `⚠` in the line. When the account cannot be found, the session starts on the default account.
+- **Left alone, nothing printed:** `CLAUDE_CONFIG_DIR` already set (you, or the hook, chose); a command run inside a Claude Code session (`CLAUDECODE` set: the hook handles those); `claude -p …` (scripts and `qr pick` write the default account as `env -u CLAUDE_CONFIG_DIR claude -p …`; set `[launch] route_print = true` to route one-shot runs started outside Claude Code as well); `--help`, `-h`, `--version`, `-v`, `--bg`; a subcommand: `mcp`, `config`, `doctor`, `update`, `install`, `auth`, `plugin`, `setup-token`, `migrate-installer`, and any other bare lower-case word in first position. So `claude hello` starts unrouted, `claude "hello there"` is routed.
 - **It never refuses.** When every account is blocked, no account's quota can be read, the config file is missing or broken, quota-router fails, or choosing takes more than `hook_budget_seconds` plus two seconds, the session starts on the default account and the line says why. An account that would bill paid overage is never chosen automatically. When a session lands on one anyway (a resumed conversation, the default account as fallback, or with `QR_ALLOW_CREDITS=1` / `allow_credits = true`), the line says `⚠ PAID OVERAGE`.
-- **One-shot runs too.** A `claude -p …` typed in a terminal, or run by a script or scheduled job whose `PATH` has the launcher first, is routed the same way and is not blocked either.
+- **It never stands in the way.** When quota-router itself cannot run (the Python it was installed with is gone, the package was removed or is an older version without `qr launch`, or it fails), the launcher starts the first other `claude` on `PATH` unchanged. `qr doctor` runs `claude --version` through the launcher to check that it starts claude.
 
 What it does not do:
 
@@ -417,10 +420,10 @@ The test suite runs on all three in CI. Day-to-day use so far has been on macOS;
 
 **What it reads**, all read-only:
 
-- The Claude Code OAuth token: on macOS from the login keychain through `security find-generic-password`, otherwise from `<dir>/.credentials.json`.
+- The Claude Code OAuth token: on macOS from the login keychain through `security find-generic-password`, otherwise from `<dir>/.credentials.json`. One keychain service can hold more than one item (one with only MCP logins, one with the Claude login), so the item filed under your user name is asked for first, then any item of that service, then the file.
 - The Codex token in `<dir>/auth.json`.
 - As fallbacks when a query fails: the usage Claude Code cached in `.claude.json`, and the last `rate_limits` record in Codex's `<dir>/sessions/**.jsonl`. To find that record up to 20 of the most recent session files are read line by line; only the record is kept.
-- The names and modification times of conversation files in the account directories, to find which account holds a resumed conversation.
+- The names and modification times of conversation files in the account directories, to find which account holds a resumed conversation. For `claude --continue` through the launcher, also the first lines of those files in the current directory's project folder, only to tell a `claude -p` run or a subagent from an interactive session.
 - The process list, to count running `claude` / `codex` jobs per account. That means the command lines of running processes, which can contain prompt text, and on macOS and Linux the environment of the `claude` / `codex` ones. Only the program name and `CLAUDE_CONFIG_DIR` / `CODEX_HOME` are used; none of it is stored.
 - `qr doctor` only: your shell startup files (`~/.zshrc`, `~/.bashrc` and a few more), to find a `claude` alias or function. Only those lines are shown, with anything that looks like a credential masked; nothing is stored.
 
@@ -436,7 +439,7 @@ quota-router itself sends no telemetry and makes no other request, unless you ch
 
 **What it writes**, all in the state directory:
 
-- State files: a usage cache, reservations, usage and reset history, and a record of what `qr install` installed. These hold account emails, short hashes of tokens (never the tokens) and the session ids of recent reservations.
+- State files: a usage cache, reservations, usage and reset history, a record of what `qr install` installed, and for `--continue` the sessions started through the launcher (a hash of the working directory, the account key and the time; never the path). These hold account emails, short hashes of tokens (never the tokens) and the session ids of recent reservations.
 - `decisions.log`: one line per decision with the time, the lead's account key, the first 8 characters of the session id (or a hash of it), the chosen account key, family, kind of decision, quota numbers, model class and a 12-character hash of the command. No command text, no prompt, no email, no directory.
 - `hook-errors.log`: one line per error with the time, operation name, exception class, code location and the account key or state file concerned. No exception message and no traceback, because those can quote headers and response bodies.
 - `probe-<account>.log`: whatever the `codex` CLI printed during a background probe.
@@ -463,7 +466,7 @@ qr uninstall                              # and once per --config-dir you instal
 pip uninstall quota-router
 ```
 
-`qr uninstall` removes the entry `qr install` wrote, recognised by its exact command and argument list, and nothing else; entries written by hand, by another copy, or that merely mention this package are left alone. It also removes the `claude` launcher when the file is exactly what `qr install` wrote (`--no-launcher` keeps it). The rules are in [docs/REFERENCE.md](docs/REFERENCE.md). The config file, the state directory, the launcher's empty directory and the `PATH` line in your shell startup file stay behind for you to delete.
+`qr uninstall` removes the entry `qr install` wrote, recognised by its exact command and argument list, and nothing else; entries written by hand, by another copy, or that merely mention this package are left alone. Without `--config-dir` it also removes the `claude` launcher when the file is exactly what `qr install` wrote (`--no-launcher` keeps it; `--config-dir` never touches it). The rules are in [docs/REFERENCE.md](docs/REFERENCE.md). The config file, the state directory, the launcher's empty directory and the `PATH` line in your shell startup file stay behind for you to delete.
 
 ## FAQ
 

@@ -16,6 +16,18 @@ LAUNCH_FALSE_B = CONFIG.replace('key = "claude-b"\n', 'key = "claude-b"\nlaunch 
 CLAUDE_ONLY = CONFIG.split("[[accounts]]\nfamily = \"codex\"")[0]
 
 
+@pytest.fixture(autouse=True)
+def accounts_set_up(request):
+    """New sessions only land on account directories that carry the hook (review finding 2): with the router,
+    both Claude directories of the fake home get it, as `qr install` and `qr install --config-dir` would write it."""
+    if "router" not in request.fixturenames:
+        return
+    from quota_router import install
+    home = request.getfixturevalue("router").home
+    install.install(None)
+    install.install(str(home / ".claude-b"))
+
+
 def decisions(home):
     path = home / "state" / "decisions.log"
     return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
@@ -82,25 +94,47 @@ def test_what_passes_through_untouched(args):
     assert launch.parse(args) is None
 
 
-@pytest.mark.parametrize("args, expected", [
-    ([], {"resume": None, "model": None}),
-    (["fix the failing test"], {"resume": None, "model": None}),
-    (["--model", "opus", "Fix it"], {"resume": None, "model": "opus"}),
-    (["--model=sonnet"], {"resume": None, "model": "sonnet"}),
-    (["-p", "hello"], {"resume": None, "model": None}),            # after -p a word is the prompt
-    (["--dangerously-skip-permissions"], {"resume": None, "model": None}),
-    (["--", "--help"], {"resume": None, "model": None}),           # after -- everything is the prompt
-    (["--resume", "abc-123"], {"resume": {"id": "abc-123"}, "model": None}),
-    (["-r", "abc-123", "--model", "opus"], {"resume": {"id": "abc-123"}, "model": "opus"}),
-    (["--resume=abc-123"], {"resume": {"id": "abc-123"}, "model": None}),
-    (["--continue"], {"resume": {"continue": True}, "model": None}),
-    (["-c"], {"resume": {"continue": True}, "model": None}),
-    (["--resume"], {"resume": {"continue": True}, "model": None}),       # the picker: where the latest conversation is
-    (["-r", "--model", "opus"], {"resume": {"continue": True}, "model": "opus"}),
+CONTINUE = {"continue": True}
+
+
+@pytest.mark.parametrize("args, resume, model, printing", [
+    ([], None, None, False),
+    (["fix the failing test"], None, None, False),
+    (["--model", "opus", "Fix it"], None, "opus", False),
+    (["--model=sonnet"], None, "sonnet", False),
+    (["-p", "hello"], None, None, True),                             # after -p a word is the prompt
+    (["--dangerously-skip-permissions"], None, None, False),
+    (["--", "--help"], None, None, False),                           # after -- everything is the prompt
+    (["--resume", "abc-123"], {"id": "abc-123"}, None, False),
+    (["-r", "abc-123", "--model", "opus"], {"id": "abc-123"}, "opus", False),
+    (["--resume=abc-123"], {"id": "abc-123"}, None, False),
+    (["--continue"], CONTINUE, None, False),
+    (["-c"], CONTINUE, None, False),
+    (["--resume"], CONTINUE, None, False),                           # the picker: where the latest conversation is
+    (["-r", "--model", "opus"], CONTINUE, "opus", False),
+    # review finding 6: flags of claude 2.1.296
+    (["--effort", "high"], None, None, False),
+    (["-n", "refactor", "--worktree", "feature"], None, None, False),
+    (["--from-pr", "123"], CONTINUE, None, False),
+    (["--from-pr=123"], CONTINUE, None, False),
+    (["-pc"], CONTINUE, None, True),
+    (["-cp", "summarize"], CONTINUE, None, True),
 ])
-def test_sessions_are_recognised(args, expected):
+def test_sessions_are_recognised(args, resume, model, printing):
     from quota_router import launch
-    assert launch.parse(args) == expected
+    assert launch.parse(args) == {"resume": resume, "model": model, "print": printing}
+
+
+def test_finding6_every_value_flag_takes_its_value():
+    """`claude --effort high` used to pass through unrouted: `high` was read as a subcommand."""
+    from quota_router import launch
+    assert {"--effort", "-n", "--name", "-w", "--worktree", "--debug-file", "--autocompact", "--file",
+            "--permission-prompts", "--plugin-url", "--system-prompt-file", "--append-system-prompt-file",
+            "--allowed-tools", "--disallowed-tools"} <= launch.VALUE_FLAGS
+    for flag in sorted(launch.VALUE_FLAGS):
+        assert launch.parse([flag, "value", "fix it"]) == {"resume": None, "model": None, "print": False}, flag
+        assert launch.parse([flag, "mcp"]) is not None, flag          # the value is never the subcommand
+    assert launch.parse(["--bg", "fix it"]) is None                    # background sessions: left to the default dir
 
 
 def test_an_account_already_chosen_is_left_alone(router, monkeypatch):
@@ -113,10 +147,23 @@ def test_an_account_already_chosen_is_left_alone(router, monkeypatch):
     # inside a Claude Code session the hook decides; its default account is `env -u CLAUDE_CONFIG_DIR claude -p …`.
     monkeypatch.setenv("CLAUDECODE", "1")
     assert launch.choose(["-p", "hi"]) == (launch.KEEP, None)
+    assert launch.choose(["fix it"]) == (launch.KEEP, None)
     monkeypatch.delenv("CLAUDECODE")
     assert launch.choose(["--version"]) == (launch.KEEP, None)
     assert launch.choose(["mcp", "list"]) == (launch.KEEP, None)
     assert decisions(router.home) == [] and leases(router.home) == []
+
+
+def test_finding3_print_mode_is_left_alone_unless_configured(router, write_config, monkeypatch):
+    """`env -u CLAUDE_CONFIG_DIR claude -p …` is how `qr pick` and the hook write the default account; outside
+    Claude Code it used to be routed again, reserved twice and given an extra stderr line."""
+    from quota_router import launch
+    for args in (["-p", "hi"], ["--print", "hi"], ["-pc"], ["--model", "opus", "-p", "hi"]):
+        assert launch.choose(args) == (launch.KEEP, None), args
+    assert decisions(router.home) == [] and leases(router.home) == []
+    write_config("[launch]\nroute_print = true\n" + CONFIG)
+    directory, text = launch.choose(["-p", "hi", "--model", "opus"])
+    assert directory == str(router.home / ".claude-b") and text.startswith("[quota-router] session on claude-b")
 
 
 def test_without_claude_accounts_nothing_is_managed(router, write_config):
@@ -165,8 +212,9 @@ def test_accounts_with_launch_false_never_get_a_session(router, write_config):
     assert directory is None and "claude-main" in text and "claude-b" not in text
     write_config(LAUNCH_FALSE_B.replace('key = "claude-main"\n', 'key = "claude-main"\nlaunch = false\n'))
     directory, text = launch.choose(["fix it"])
-    assert (directory, text) == (None, "[quota-router] No Claude account in the config has launch enabled; starting on the default account.")
-    assert "| launch-default | pick=claude-main | no account has launch enabled; model fable |" in decisions(router.home)[-1]
+    assert (directory, text) == (None, "[quota-router] No Claude account is set up for new sessions (claude-main: launch = false; "
+                                 "claude-b: launch = false); starting on the default account.")
+    assert "| launch-default | pick=claude-main | no account is set up for sessions; model fable |" in decisions(router.home)[-1]
 
 
 def test_one_login_in_two_directories_starts_where_launch_is_allowed(router, write_config):
@@ -282,15 +330,51 @@ def test_a_resumed_conversation_goes_where_it_lives(router, write_config, args):
     assert "| launch-resume | pick=claude-b | kept the original account; weekly 5% left; model other |" in decisions(router.home)[-1]
 
 
-def test_continue_goes_to_the_latest_conversation_in_this_directory(router):
+def test_continue_without_launch_records_takes_the_newest_conversation_here(router):
     from quota_router import launch
     work = router.home / "work"
     conversation(router.home, ".claude", work, "old", mtime=1_000_000)
     conversation(router.home, ".claude-b", work, "new", mtime=2_000_000)
     conversation(router.home, ".claude", router.home / "elsewhere", "newest")
-    assert launch.choose(["-c"], cwd=str(work))[0] == str(router.home / ".claude-b")
-    os.utime(router.home / ".claude" / "projects" / router.hook.slug(str(work)) / "old.jsonl", (3_000_000, 3_000_000))
+    with router.core.budget(None):
+        assert launch.continue_account(str(work)) == "claude-b"
+        os.utime(router.home / ".claude" / "projects" / router.hook.slug(str(work)) / "old.jsonl", (3_000_000, 3_000_000))
+        assert launch.continue_account(str(work)) == "claude-main"
     assert launch.choose(["--continue"], cwd=str(work))[0] is None
+    # that start is recorded: the next --continue here goes to the same account without looking at files.
+    assert json.loads((router.home / "state" / "launched.json").read_text())[-1]["key"] == "claude-main"
+    assert str(work) not in (router.home / "state" / "launched.json").read_text()      # the directory only as a hash
+
+
+def test_finding4_continue_prefers_the_session_launched_here_over_a_dispatch(router):
+    """An interactive session on claude-main ten minutes ago, then a `claude -p` the hook sent to claude-b in the
+    same directory two minutes ago: --continue must reopen the session, not the dispatch."""
+    from quota_router import launch
+    work, now = router.home / "work", router.core.now()
+    with router.core.budget(None):
+        launch.remember_launch(str(work), "claude-main")
+    launched = json.loads((router.home / "state" / "launched.json").read_text())
+    launched[-1]["at"] = now - 600
+    (router.home / "state" / "launched.json").write_text(json.dumps(launched))
+    conversation(router.home, ".claude", work, "session", mtime=now - 590)
+    conversation(router.home, ".claude-b", work, "dispatch", mtime=now - 120)
+    assert launch.choose(["-c"], cwd=str(work))[0] is None                     # claude-main is the default location
+    assert launch.choose(["--resume"], cwd=str(work))[0] is None
+    # no launch record whose account has a conversation here: a file newer than a launch on another account is
+    # passed over, and so is a file that says it was written by `claude -p` or a subagent.
+    (router.home / "state" / "launched.json").write_text(json.dumps([dict(launched[-1], key="claude-c", at=now - 300)]))
+    with router.core.budget(None):
+        assert launch.continue_account(str(work)) == "claude-main"
+    (router.home / "state" / "launched.json").unlink()
+    path = conversation(router.home, ".claude-b", work, "dispatch", mtime=now - 120)
+    path.write_text('{"type": "user", "entrypoint": "sdk-cli", "isSidechain": false}\n')
+    os.utime(path, (now - 120, now - 120))
+    with router.core.budget(None):
+        assert launch.continue_account(str(work)) == "claude-main"
+        path.write_text('{"type": "user", "entrypoint": "cli"}\n')
+        assert launch.continue_account(str(work)) == "claude-b"
+        path.write_text('{"type": "user", "isSidechain": true}\n')
+        assert launch.continue_account(str(work)) == "claude-main"
 
 
 def test_a_conversation_out_of_quota_still_resumes_with_a_warning(router):
@@ -340,11 +424,12 @@ def exec_spy(monkeypatch):
 
 
 def test_main_execs_the_real_claude_with_the_account(router, exec_spy, monkeypatch, capsys):
-    from quota_router import cli, platform_compat
+    from quota_router import cli, launch, platform_compat
     monkeypatch.setattr(platform_compat, "system", lambda: "linux")
     real = fake_claude(router.home / "npm-bin")
     monkeypatch.setenv("PATH", os.pathsep.join([platform_compat.default_launcher_dir(), str(real.parent)]))
     monkeypatch.setenv("KEEP_ME", "1")
+    monkeypatch.setattr(launch, "stderr_is_terminal", lambda: True)
     with pytest.raises(Started):
         cli.main(["launch", "--", "--model", "opus", "fix it"])
     ((program, argv, env),) = exec_spy
@@ -352,6 +437,12 @@ def test_main_execs_the_real_claude_with_the_account(router, exec_spy, monkeypat
     assert env["CLAUDE_CONFIG_DIR"] == str(router.home / ".claude-b") and env["KEEP_ME"] == "1"
     err = capsys.readouterr().err
     assert err.count("\n") == 1 and err.startswith("[quota-router] session on claude-b")
+    # finding 3: the line is for a person; with stderr going to a file or a pipe nothing is added.
+    monkeypatch.setattr(launch, "stderr_is_terminal", lambda: False)
+    exec_spy.clear()
+    with pytest.raises(Started):
+        cli.main(["launch", "--", "--model", "opus", "fix it"])
+    assert capsys.readouterr().err == "" and exec_spy
     exec_spy.clear()
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/chosen/by/you")
     with pytest.raises(Started):
@@ -418,8 +509,9 @@ def test_the_installed_launcher_end_to_end(home, tmp_path, monkeypatch):
     assert session.stdout == "dir= args=fix it\n" and session.stderr == ""            # an account was named: left alone
     session = run("--model", "opus", "fix it")
     assert session.returncode == 7 and session.stdout == "dir=unset args=--model opus fix it\n"
-    assert session.stderr.count("\n") == 1 and session.stderr.startswith("[quota-router] No account can take a new session (")
-    assert "not logged in" in session.stderr and session.stderr.endswith("starting on the default account.\n")
+    assert session.stderr == ""                          # not a terminal: the line is left out (finding 3)
+    printed = run("-p", "hi", CLAUDE_CONFIG_DIR="/kept")
+    assert (printed.stdout, printed.stderr) == ("dir=/kept args=-p hi\n", "")
     log = (tmp_path / "state" / "decisions.log").read_text()
     assert "| qr launch | lead=- | sess=- | claude | launch-default | pick=claude-main | no account can take it; model other |" in log
     assert "fix it" not in log
@@ -444,7 +536,9 @@ def test_install_writes_the_launcher_once(home, capsys):
     if not WINDOWS:
         assert path == str(home / ".local" / "share" / "quota-router" / "bin" / "claude")
         assert os.stat(path).st_mode & stat.S_IXUSR
-        assert open(path).read().splitlines()[-1] == f"exec {shlex.join([sys.executable, '-I', '-X', 'utf8', install.ENTRY_FILE])} launch -- \"$@\""
+        lines = open(path).read().splitlines()
+        assert f"qr_python={shlex.quote(sys.executable)}" in lines and f"qr_entry={shlex.quote(install.ENTRY_FILE)}" in lines
+        assert '   qr_answer=$("$qr_python" -I -X utf8 "$qr_entry" launch --resolve -- "$@"); then' in lines
     out = capsys.readouterr().out
     assert f"Wrote the claude launcher {path}" in out
     assert "comes first on PATH" in out and (platform_compat.default_launcher_dir() in out or "$HOME/.local/share/quota-router/bin" in out)
@@ -480,6 +574,17 @@ def test_no_launcher_installs_the_hook_only(home, capsys):
     qr("install", "--no-launcher")
     assert not os.path.exists(launcher_file(home)) and "claude launcher" not in capsys.readouterr().out
     assert (home / ".claude" / "settings.json").exists()
+
+
+def test_finding5_config_dir_never_touches_the_shared_launcher(home, capsys):
+    qr("install", "--config-dir", str(home / ".claude-b"))
+    assert not os.path.exists(launcher_file(home)) and "claude launcher" not in capsys.readouterr().out
+    qr("install")
+    qr("install", "--config-dir", str(home / ".claude-b"))
+    qr("uninstall", "--config-dir", str(home / ".claude-b"))
+    assert os.path.exists(launcher_file(home)) and "Removed the claude launcher" not in capsys.readouterr().out
+    qr("uninstall")
+    assert not os.path.exists(launcher_file(home))
 
 
 def test_uninstall_removes_the_launcher_it_wrote_and_nothing_else(home, capsys):
@@ -533,11 +638,12 @@ def test_a_launcher_recorded_for_another_interpreter_is_updated(home, capsys):
 def test_the_windows_launcher_is_a_batch_file(monkeypatch):
     from quota_router import install
     text = install.launcher_text(python="C:\\Py\\python.exe", entry="C:\\site\\quota_router\\__main__.py", platform="windows")
-    assert text.splitlines() == [
-        "@echo off", "rem quota-router launcher: starts claude on the account with the most quota left (qr launch).",
-        "rem Written by `qr install`; `qr uninstall` removes it.",
-        '"C:\\Py\\python.exe" -I -X utf8 "C:\\site\\quota_router\\__main__.py" launch -- %*', "exit /b %ERRORLEVEL%"]
-    assert "\r\n" in text
+    lines = text.split("\r\n")
+    assert lines[:2] == ["@echo off", "rem quota-router launcher: starts claude on the account with the most quota left (qr launch)."]
+    # finding 1: the interpreter, the entry file and the launch module are checked first; otherwise claude as it is.
+    assert 'if exist "C:\\Py\\python.exe" if exist "C:\\site\\quota_router\\__main__.py" if exist "C:\\site\\quota_router\\launch.py" goto quota_router' in lines
+    assert '"C:\\Py\\python.exe" -I -X utf8 "C:\\site\\quota_router\\__main__.py" launch -- %*' in lines
+    assert lines.index(":plain") < lines.index('"%QR_CLAUDE%" %*') and "exit /b 127" in lines
 
 
 # ---- doctor -------------------------------------------------------------------------
@@ -549,8 +655,8 @@ def machine(home, write_config, monkeypatch):
     monkeypatch.setattr(install, "check_lock", lambda state: (True, ""))
     monkeypatch.setattr(platform_compat, "list_processes", lambda run: {1: (0, "init")})
     monkeypatch.setenv("QR_STATE", str(home / "state"))
-    real = fake_claude(home / "npm-bin")
-    monkeypatch.setenv("PATH", os.pathsep.join([platform_compat.default_launcher_dir(), str(real.parent)]))
+    real = fake_claude(home / "npm-bin", text='#!/bin/sh\necho "fake claude 1.0"\n')
+    monkeypatch.setenv("PATH", os.pathsep.join([platform_compat.default_launcher_dir(), str(real.parent), "/usr/bin", "/bin"]))
     write_config()
     qr("install")
     return real
@@ -574,7 +680,10 @@ def test_doctor_checks_the_launcher(home, machine, monkeypatch, capsys):
     assert f"OK    claude launcher at {path}" in lines
     assert f"OK    {mine} comes before the real claude ({machine}) on PATH" in lines
     assert any(line.startswith("OK    no shell alias or function named claude in ") for line in lines)
-    assert "WARN  no reading on file yet for the Claude accounts for new sessions (claude-main, claude-b); run `qr status`" in lines
+    assert "OK    claude launcher starts claude (fake claude 1.0)" in lines
+    assert "WARN  account claude-b is listed but has no hook; run `qr install --config-dir " + str(home / ".claude-b") + "`" in lines
+    assert "WARN  no reading on file yet for the Claude accounts for new sessions (claude-main); run `qr status`" in lines
+    qr("install", "--config-dir", str(home / ".claude-b"))
     (home / "state" / "cache.json").write_text(json.dumps({"claude-b": {"usage": {"seven_day": {"used": 1}}}}))
     assert "OK    Claude accounts for new sessions: claude-main, claude-b; a reading is on file for claude-b" in doctor(capsys)
     os.chmod(path, 0o644)
@@ -618,7 +727,7 @@ def test_doctor_without_the_launcher_or_launch_accounts(home, machine, write_con
     assert not any("PATH" in line and "comes" in line for line in lines)
     qr("install")
     write_config(LAUNCH_FALSE_B.replace('key = "claude-main"\n', 'key = "claude-main"\nlaunch = false\n'))
-    assert "WARN  no Claude account has launch enabled, so new sessions always start on the default account" in doctor(capsys)
+    assert "WARN  no Claude account is set up for new sessions (launch = false, or no hook), so new sessions always start on the default account" in doctor(capsys)
 
 
 # ---- config ---------------------------------------------------------------------------
@@ -650,3 +759,98 @@ def test_help_lists_launch(home, capsys):
     cli.main(["--help"])
     out = capsys.readouterr().out
     assert "qr launch [--] [ARGS…]" in out and "--no-launcher" in out
+
+
+# ---- round-1 review findings ------------------------------------------------------------
+@posix_only
+@pytest.mark.parametrize("case", ["no python", "no entry file", "older package without launch", "package that fails"])
+def test_finding1_the_launcher_starts_claude_without_a_working_quota_router(home, tmp_path, case):
+    """The launcher must never be why `claude` does not start: interpreter gone (Python upgrade, venv deleted),
+    entry file gone, an older quota-router without `qr launch`, or one that breaks. claude then starts unchanged,
+    found on PATH past the launcher's own directory and past any other launcher."""
+    from quota_router import install
+    package = tmp_path / "package" / "quota_router"
+    package.mkdir(parents=True)
+    python, entry = sys.executable, package / "__main__.py"
+    if case == "no python":
+        python, entry = str(tmp_path / "removed-venv" / "bin" / "python3"), install.ENTRY_FILE
+    elif case == "older package without launch":
+        entry.write_text("import sys\nprint('usage: qr <command>')\nsys.exit(2)\n")
+    elif case == "package that fails":
+        entry.write_text("import quota_router_module_that_does_not_exist\n")
+    launcher = fake_claude(tmp_path / "launcher-bin", text=install.launcher_text(python=python, entry=str(entry)))
+    other = fake_claude(tmp_path / "other-launcher", text=install.launcher_text())        # another copy: skipped too
+    real = fake_claude(tmp_path / "real-bin", text='#!/bin/sh\necho "args=$*"\nexit 5\n')
+    env = child_env(home, PATH=os.pathsep.join([str(launcher.parent), str(other.parent), str(real.parent), "/usr/bin", "/bin"]))
+    started = subprocess.run([str(launcher), "--model", "opus", "fix it"], env=env, capture_output=True, text=True,
+                             timeout=60, cwd=str(home))
+    assert (started.returncode, started.stdout) == (5, "args=--model opus fix it\n"), started.stderr
+    lost = subprocess.run([str(launcher), "x"], env=dict(env, PATH=os.pathsep.join([str(launcher.parent), "/usr/bin", "/bin"])),
+                          capture_output=True, text=True, timeout=60)
+    assert lost.returncode == 127 and "no claude executable found on PATH apart from the launcher" in lost.stderr
+
+
+@posix_only
+def test_finding1_doctor_runs_the_launcher(home, machine, monkeypatch, capsys):
+    from quota_router import platform_compat
+    path = launcher_file(home)
+    assert "OK    claude launcher starts claude (fake claude 1.0)" in doctor(capsys)
+    monkeypatch.setenv("PATH", os.pathsep.join([platform_compat.default_launcher_dir(), "/usr/bin", "/bin"]))
+    lines = doctor(capsys)
+    assert f"WARN  claude launcher {path} does not start claude: `claude --version` through it exited with status 127 and printed nothing" in lines
+    assert "WARN    stderr: quota-router: no claude executable found on PATH apart from the launcher" in lines
+
+
+def test_finding2_an_account_without_the_hook_never_gets_a_session(router, write_config, capsys):
+    """A session on a directory without our hook runs without that directory's set-up and routes nothing."""
+    from quota_router import cli, install, launch
+    install.uninstall(str(router.home / ".claude-b"))
+    directory, text = launch.choose(["fix it"])
+    assert directory is None and text.startswith("[quota-router] session on claude-main")    # claude-b is roomier
+    install.uninstall(None)
+    assert launch.choose(["fix it"]) == (None, (
+        "[quota-router] No Claude account is set up for new sessions (claude-main: no quota-router hook in its "
+        "settings.json; claude-b: no quota-router hook in its settings.json); starting on the default account."))
+    router.core.status()
+    assert ("launch: hook missing for claude-main, claude-b; new sessions do not start there until "
+            "`qr install --config-dir <dir>` adds it") in capsys.readouterr().out.splitlines()
+    write_config(LAUNCH_FALSE_B)
+    cli.main(["config"])
+    out = capsys.readouterr().out.splitlines()
+    assert any(line.startswith("claude  claude-main     CLAUDE_CONFIG_DIR unset (default location)  (launch: hook missing)") for line in out)
+    assert any("(launch = false: no new sessions)" in line and "hook missing" not in line for line in out)
+    install.install(None)
+    router.core.status()
+    assert "hook missing" not in capsys.readouterr().out                 # claude-b has launch = false: not listed
+
+
+def test_finding7_running_sessions_count_as_busy_for_a_new_session(router, monkeypatch):
+    from quota_router import launch, platform_compat
+    procs = {10: (1, "/usr/local/bin/claude --model opus"), 11: (1, "claude -p hi"), 12: (1, "claude mcp list"),
+             13: (1, "node /x/node_modules/@anthropic-ai/claude-code/cli.js --resume abc"),
+             14: (1, "claude --chrome-native-host"), 15: (1, "/bin/sh /home/me/.local/share/quota-router/bin/claude")}
+    directory = str(router.home / ".claude-b")
+    monkeypatch.setattr(platform_compat, "list_processes", lambda run: procs)
+    monkeypatch.setattr(platform_compat, "process_environment", lambda pid, cmd, run: f" CLAUDE_CONFIG_DIR={directory} PATH=/bin")
+    assert router.core.count_processes(router.core.classify_session) == {"claude-b": 2}
+    assert router.core.count_processes(router.core.classify_proc) == {"claude-b": 1}     # the hook's count is unchanged
+    monkeypatch.setattr(router.core, "running_sessions", lambda: {"claude-b": 2})
+    chosen, text = launch.choose(["fix it"])                  # claude-b is a little roomier, but two sessions run there
+    assert chosen is None and text.startswith("[quota-router] session on claude-main")
+    with router.core.budget(None):
+        rows = launch.add_sessions(router.core.read_family("claude", lead_key=launch.NO_LEAD))
+    assert router.core.find_row(rows, "claude-b")["jobs"] == 2
+
+
+def test_finding9_a_readable_account_beats_one_whose_quota_is_unknown(router):
+    from quota_router import launch
+    router.usage["claude-main"] = {"email": "claude-main@example.test", "error": "token expired", "fetched": 0}
+    router.usage["claude-b"]["usage"]["seven_day"]["used"] = 44
+    core = router.core
+    rows = core.score_rows("claude", core.read_family("claude", lead_key=launch.NO_LEAD))
+    assert core.choose("claude", rows)[0]["key"] == "claude-main"     # the hook's rule: middle score, listed first
+    directory, text = launch.choose(["fix it"])
+    assert directory == str(router.home / ".claude-b") and text.startswith("[quota-router] session on claude-b: weekly 56% left")
+    router.usage["claude-b"]["usage"]["seven_day"]["used"] = 100     # the readable one is used up: unknown is still better than nothing
+    directory, text = launch.choose(["fix it"])
+    assert directory is None and text.startswith("[quota-router] session on claude-main")

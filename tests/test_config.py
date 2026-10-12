@@ -39,6 +39,9 @@ reset_drop_points = 5
 [families.claude]
 scarce_model = "Opus"
 
+[launch]
+route_print = true
+
 [endpoints]
 claude_usage = "http://127.0.0.1:1/usage"
 claude_profile = "http://127.0.0.1:1/profile"
@@ -57,6 +60,7 @@ def test_full_file_overrides_every_default(write_config):
     assert cfg["timing.codex_stale_hours"] == 1.5
     assert cfg["events.reset_drop_points"] == 5
     assert cfg["families.claude.scarce_model"] == "opus"   # compared case-insensitively
+    assert cfg["launch.route_print"] is True
     assert [a["key"] for a in cfg.accounts] == ["claude-main", "claude-b", "codex-1", "codex-2"]
     assert cfg.warnings == []
 

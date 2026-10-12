@@ -16,6 +16,7 @@ STATE = config.state_dir()[0]
 CLAUDE_ACCOUNTS = []           # {"key", "dir"}; dir=None is the default location (CLAUDE_CONFIG_DIR unset)
 CODEX_ACCOUNTS = []
 DEFAULT_KEY = {"claude": None, "codex": None}   # the account of each family that uses the default location
+LAUNCH_OFF = set()             # Claude account keys with `launch = false` (no new sessions from `qr launch`)
 USAGE_CACHE_SEC = 180          # a usage reading is cached for 3 minutes
 PROFILE_CACHE_SEC = 86400      # the identity (email) is cached for a day; a changed token re-queries at once
 LEASE_SEC = 30 * 60            # a reservation expires after 30 minutes
@@ -55,6 +56,7 @@ def configure(cfg):
     globals().update(
         CLAUDE_ACCOUNTS=[{"key": a["key"], "dir": a["dir"]} for a in cfg.family("claude")],
         CODEX_ACCOUNTS=[{"key": a["key"], "dir": a["dir"]} for a in cfg.family("codex")],
+        LAUNCH_OFF={a["key"] for a in cfg.family("claude") if not a["launch"]},
         DEFAULT_KEY={family: next((a["key"] for a in cfg.family(family) if a["default"]), None)
                      for family in config.FAMILIES},
         USAGE_CACHE_SEC=cfg["timing.usage_cache_seconds"],
@@ -912,15 +914,44 @@ def classify_proc(cmd):
     return None
 
 
+def classify_session(cmd):
+    """One process command line → 'claude' when it is an interactive claude session (not -p, not a subcommand,
+    not a resident helper), else None. `qr launch` counts these as busy; the hook does not."""
+    argv = split_command_line(cmd)
+    if not argv or any(x in argv[0] for x in NOT_SUBAGENT[:3]):
+        return None
+    exe = program_name(argv[0])
+    if exe in SCRIPT_HOSTS:
+        script = next((i for i, word in enumerate(argv[1:], 1) if not word.startswith("-")), None)
+        exe = script_cli(argv[script]) if script else None
+        argv = argv[script:] if script else argv
+    if exe != "claude" or any(a in ("-p", "--print") or a.startswith("--print=") for a in argv[1:]):
+        return None
+    if any(x in NOT_SUBAGENT[3:] or x in ("daemon",) for x in argv[1:4]):
+        return None
+    if len(argv) > 1 and re.fullmatch(r"[a-z][a-z0-9-]*", argv[1]):
+        return None                      # `claude mcp …`, `claude update`: a subcommand, not a session
+    return "claude"
+
+
 def running_jobs():
     """{account key: number of one-shot jobs running}. Only claude -p / codex exec count (see classify_proc).
     Which account a job belongs to comes from its environment. On Windows that is not readable, so only a
     directory written on the command line (of the job or of the wrapper that started it) counts there;
     a job whose account cannot be told is left out."""
+    return count_processes(classify_proc)
+
+
+def running_sessions():
+    """{Claude account key: number of interactive claude sessions running}, attributed like running_jobs()."""
+    return count_processes(classify_session)
+
+
+def count_processes(classify):
     procs = platform_compat.list_processes(run_local)
     hits = {}
     for pid, (ppid, cmd) in procs.items():
-        fam = classify_proc(cmd)
+        fam = classify(cmd)
         if fam:
             hits[pid] = (fam, ppid)
     counts = {}
@@ -1209,7 +1240,8 @@ def refresh_busy(rows, leases, pending=()):
 
 
 def prefix(family, row):
-    """Shell text that selects an account; the directory is quoted, so use it with `eval` or paste it, see the README."""
+    """Shell text that selects an account; the directory is quoted, so use it with `eval` or paste it, see
+    "Using `qr pick` in scripts" in docs/REFERENCE.md."""
     if family == "claude":
         return ("env -u CLAUDE_CONFIG_DIR" if row["dir"] is None
                 else "CLAUDE_CONFIG_DIR=" + platform_compat.shell_quote(row["dir"]))
@@ -1261,7 +1293,7 @@ LOG_DETAILS = re.compile("|".join((
     r"local log not updated for \d+\.\d h; probing once in the background",
     # qr launch
     "launched with a warning", "on paid overage", "no account can take it", "no account could be read",
-    "no account has launch enabled")))
+    "no account is set up for sessions")))
 
 
 def log_decision(source, family, mode, row=None, text="", cmd="", lead=None, session="", model=None, account=None):
@@ -1596,6 +1628,10 @@ def status(force=False):
             name = who(r) + (t("status.lead_tag") if r.get("is_lead") else "")
             print(f"{name:<16}{dirs:<24}{wk:>6}{fmt_clock(r['wk_reset']):>14}{fh:>9}{rate:>10}{r['busy_detail']:>10}  {st}"
                   + (t("paren", text=extra) if extra else ""))
+        if fam == "claude":
+            missing = quiet_call(hookless_accounts, default=[])
+            if missing:
+                print(t("status.launch_hook_missing", keys=t("sep.list").join(missing)))
         if fam == "codex":
             upd = [(r["fetched"], r.get("live")) for r in rows if r["fetched"]]
             if upd:
@@ -1604,6 +1640,14 @@ def status(force=False):
                         source=t("status.codex_live") if live else t("status.codex_local", hours=CODEX_STALE_H)))
 
     quiet_call(print_status_events)
+
+
+def hookless_accounts():
+    """Claude accounts that may take new sessions (`launch` not false) but have no quota-router hook in their
+    settings.json, so `qr launch` passes them over."""
+    from . import install, launch
+    return [a["key"] for a in CLAUDE_ACCOUNTS if a["key"] not in LAUNCH_OFF
+            and install.installed_state(a["dir"])[0] not in launch.HOOKED]
 
 
 # ---- side records (history, reset events, notices): every failure here is swallowed and never affects scoring ----
