@@ -113,7 +113,8 @@ def test_network_json_is_bounded_by_the_budget(router, monkeypatch):
     with core.budget(time.monotonic() + 1.2):
         with pytest.raises(core.BudgetTimeout):
             core.network_json("request")
-    assert time.monotonic() - started < 2 and seen and seen[0] <= 1.2
+    # the timeout handed to open_url is the remaining budget: a float that can land a few ulp above 1.2 on Windows
+    assert time.monotonic() - started < 2 and seen and seen[0] <= 1.2 + 1e-6
     monkeypatch.setattr(core, "open_url", lambda request, timeout: io.BytesIO(b'{"ok": true}'))
     with core.budget(time.monotonic() + 5):
         assert core.network_json("request") == {"ok": True}
