@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Sessions start on the roomiest account.** `qr install` also writes a `claude` launcher (`~/.local/share/quota-router/bin/claude`, or under `$XDG_DATA_HOME`; Windows `claude.cmd` under `%LOCALAPPDATA%`, untested). With its directory first on `PATH`, `claude` typed in a terminal runs `qr launch`, which picks the Claude account by the hook's scoring and starts the real claude there. There is no lead to protect at that point, so every account with `launch = true` is a candidate. A resumed conversation starts on the account that holds it. One line on stderr says where the session went and why.
+- **`qr launch [--] <claude arguments>`**, the command behind the launcher. It never refuses to start a session: when nothing fits, nothing can be read, the config is broken, it fails or it takes too long, claude starts on the default account with a line saying why, and `⚠ PAID OVERAGE` when that account would bill. `--help`, `--version`, subcommands (`claude mcp …`), a `CLAUDE_CONFIG_DIR` already set and commands inside a Claude Code session pass through untouched.
+- `launch = false` in an `[[accounts]]` table keeps new sessions off that account.
+- `qr install --no-launcher` installs the hook only; `qr uninstall` removes the launcher when it is exactly the file `qr install` wrote (`--no-launcher` keeps it). Neither edits a shell startup file; `qr install` prints the `PATH` line to add.
+- `qr doctor` checks the launcher, its place on `PATH`, `claude` aliases and functions in the shell startup files that would bypass it, and that some account can take new sessions.
+- `decisions.log` source `qr launch`, with kinds `launch`, `launch-resume` and `launch-default`.
+
+### Not changed
+
+- The hook routes dispatches exactly as before. A session still runs on one account from start to end: subagents from the Agent tool and workflows are not moved mid-session.
+
 ## 0.1.0
 
 First public version. It is a port of a tool that has been routing subagents on one macOS machine, with everything specific to that machine moved into a config file.

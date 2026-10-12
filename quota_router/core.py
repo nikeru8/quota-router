@@ -146,7 +146,8 @@ SECRET_PATTERNS = (
 
 
 def redact(text):
-    """Blank out what looks like a credential. Best effort, pattern-based; only used for the QR_DEBUG file."""
+    """Blank out what looks like a credential. Best effort, pattern-based; used for the QR_DEBUG file and for the
+    shell startup lines `qr doctor` quotes."""
     text = str(text)
     for pattern, replacement in SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
@@ -1253,11 +1254,14 @@ def log_reason(row):
     return ", ".join(bits)
 
 
-LOG_SOURCES = ("hook", "qr pick", "qr check", "probe")
+LOG_SOURCES = ("hook", "qr pick", "qr check", "probe", "qr launch")
 LOG_DETAILS = re.compile("|".join((
     "kept the original account", "conversation location unknown", "named a directory that is not in the pool",
     "as specified", "as specified, although it is blocked", "dispatched with a warning",
-    r"local log not updated for \d+\.\d h; probing once in the background")))
+    r"local log not updated for \d+\.\d h; probing once in the background",
+    # qr launch
+    "launched with a warning", "on paid overage", "no account can take it", "no account could be read",
+    "no account has launch enabled")))
 
 
 def log_decision(source, family, mode, row=None, text="", cmd="", lead=None, session="", model=None, account=None):

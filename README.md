@@ -38,6 +38,8 @@ Only the user can authorize spending credits for this task. Ask first; do not en
 
 `alice`, `bob` and the account keys are made up. In messages an account is shown by the part of its login email before the `@`, or by its config key where the email is not known or a list of accounts is given.
 
+The session itself, and everything it runs in its own process (the built-in Agent tool, workflows), stays on the account it was started on. For that, `qr install` also writes a `claude` launcher: put it first on `PATH`, and `claude` typed in a terminal starts on the Claude account with the most quota left. See [Launching sessions](#launching-sessions).
+
 ## Why
 
 - **Several accounts, one session.** A subagent runs on whichever account its environment points at. Left alone, they all pile onto the account the lead session uses.
@@ -95,6 +97,8 @@ Then either call `~/.qr-venv/bin/qr` by that path or add `~/.qr-venv/bin` to you
 
    This adds one `PreToolUse` entry for `Bash` and leaves the rest of the file as it was. The previous file is saved next to it as `settings.json.bak-<time>`. Running it again changes nothing. It then runs the installed command once with a harmless test event and exits with status 1 if that command does not answer. A successful install means the hook starts; it does not mean routing is configured, since the hook also answers the test without a config file.
 
+   It also writes the `claude` launcher to `~/.local/share/quota-router/bin/claude` (see [Launching sessions](#launching-sessions)) and, when that directory is not yet ahead of the real `claude` on your `PATH`, prints the line to add to `~/.zshrc` or `~/.bashrc`. It never edits those files itself. `--no-launcher` installs the hook only.
+
 4. **Check the setup.**
 
    ```sh
@@ -110,6 +114,8 @@ Then either call `~/.qr-venv/bin/qr` by that path or add `~/.qr-venv/bin` to you
    ```
 
    The tool result should carry a line starting with `[quota-router] Automatically routed to`. `qr decisions` lists what was decided and why.
+
+   With the launcher's directory on `PATH`, open a new terminal and run `claude`: before the session starts, it prints one line starting with `[quota-router] session on`.
 
 To run from a checkout without installing: `git clone`, then `bin/qr <command>` (`python bin\qr <command>` on Windows).
 
@@ -149,6 +155,7 @@ dir = "~/.codex-b"
 | `family` | required | `claude` or `codex`. |
 | `key` | required | A unique name of your choosing (letters, digits, `-`, `_`, `.`). It appears in messages and logs. |
 | `dir` | `""` | The directory you would pass as `CLAUDE_CONFIG_DIR` / `CODEX_HOME`. `~` and `$HOME` are expanded. Empty, or equal to `~/.claude` / `~/.codex`, means the CLI's default location; one account per family may use it. |
+| `launch` | `true` | Claude accounts only. `false`: [`qr launch`](#launching-sessions) never starts a new session here. Dispatches from the hook still go to it, and a conversation that lives there is still resumed there. |
 
 The order of the accounts matters in three cases: when two accounts score exactly the same, the one listed first is used; when two Claude directories are the same account, the first one that is not the lead's represents it; and when the time budget cannot cover every account, accounts with equally old readings are queried in this order.
 
@@ -204,8 +211,11 @@ Unknown sections, settings and account fields are ignored with a warning, which 
 ```
 qr init [--force]                    write an example config
 qr config                            print the resolved settings and their sources
-qr install [--config-dir DIR]        add the hook to settings.json (default ~/.claude)
-qr uninstall [--config-dir DIR]      remove the hook that `qr install` added
+qr install [--config-dir DIR] [--no-launcher]
+                                     add the hook to settings.json (default ~/.claude) and write the claude launcher
+qr uninstall [--config-dir DIR] [--no-launcher]
+                                     remove the hook and the launcher that `qr install` added
+qr launch [--] [claude arguments]    start claude on the Claude account with the most quota left (what the launcher runs)
 qr doctor                            one OK/WARN line per check of the setup
 qr status                            table of every account
 qr pick <family>                     print the best account as an env prefix and reserve it
@@ -242,6 +252,38 @@ The `eval` is there because the directory is shell-quoted when it contains a spa
 - **One model can have its own bucket.** With `scarce_model` set, a Claude dispatch that names that model, or names none, is also checked against that model's weekly bucket. A resumed conversation without `--model` keeps its account as long as the shared quota has room, but is checked against that bucket for paid overage. If the usage endpoint does not report the bucket, there is nothing to check.
 - **Resets are read, not assumed.** When a live reading shows usage dropping by at least `reset_drop_points`, it is recorded as a reset or refill and the lead is told once per session. An ordinary five-hour rollover on schedule is not announced, and a reset date that merely moved is recorded for `qr report` without a notice.
 - **Fail open.** If quota-router itself breaks, the command runs as written. The hook aims to answer within `hook_budget_seconds`; two seconds after that a watchdog ends it without a decision. The time Python takes to start is on top.
+
+## Launching sessions
+
+The hook only sees the `claude -p` / `codex exec` commands a session runs through its Bash tool. Everything a session does in its own process (the built-in Agent tool, workflows) runs on the account the session was started on. The launcher chooses that account when the session starts.
+
+`qr install` writes a small script named `claude` into `~/.local/share/quota-router/bin/` (`$XDG_DATA_HOME/quota-router/bin/` when that is set; Windows: `%LOCALAPPDATA%\quota-router\bin\claude.cmd`). Put that directory first on `PATH`, in `~/.zshrc` or `~/.bashrc`:
+
+```sh
+export PATH="$HOME/.local/share/quota-router/bin:$PATH"
+```
+
+From then on `claude` in a terminal runs `qr launch`, which picks the account and replaces itself with the real `claude`, started with that account's `CLAUDE_CONFIG_DIR` (or with it unset, for the account at the default location). The real `claude` is looked up on `PATH` at every start, past the launcher's directory, so updating or moving it needs nothing. One line on stderr says where the session went:
+
+```
+[quota-router] session on bob: weekly 88% left (resets in 4.0 d)
+```
+
+How it chooses:
+
+- **A new session** goes to the best Claude account by the hook's rules: the same score (weekly % left per hour to the reset, scaled for a tight five-hour window and for jobs running), the same skips (five-hour floor, weekly floor, weekly quota used up, not logged in, paid overage unless allowed), and a reservation as with `qr pick`. There is no lead yet, so no account is held back as the lead's. Accounts with `launch = false` are never chosen. Without `--model`, the scarce model's bucket counts too, as for a dispatch.
+- **A resumed conversation** (`--resume <id>`, `-r <id>`, `--resume=<id>`, `--continue`, `-c`) starts on the account that holds it. `--continue`, and `--resume` without an id (the picker), go to the account with the most recent conversation of the current directory. This also holds for an account with `launch = false` or no quota left, with a `⚠` in the line. When the account cannot be found, the session starts on the default account.
+- **Left alone, nothing printed:** `CLAUDE_CONFIG_DIR` already set (you, or the hook, chose); a command run inside a Claude Code session (`CLAUDECODE` set: the hook handles those, including `env -u CLAUDE_CONFIG_DIR claude -p …`, its spelling of the default account); `--help`, `-h`, `--version`, `-v`; a subcommand: `mcp`, `config`, `doctor`, `update`, `install`, `auth`, `plugin`, `setup-token`, `migrate-installer`, and any other bare lower-case word in first position. So `claude hello` starts unrouted, `claude "hello there"` is routed.
+- **It never refuses.** When every account is blocked, no account's quota can be read, the config file is missing or broken, quota-router fails, or choosing takes more than `hook_budget_seconds` plus two seconds, the session starts on the default account and the line says why. An account that would bill paid overage is never chosen automatically. When a session lands on one anyway (a resumed conversation, the default account as fallback, or with `QR_ALLOW_CREDITS=1` / `allow_credits = true`), the line says `⚠ PAID OVERAGE`.
+- **One-shot runs too.** A `claude -p …` typed in a terminal, or run by a script or scheduled job whose `PATH` has the launcher first, is routed the same way and is not blocked either.
+
+What it does not do:
+
+- **It does not move a running session. One session = one account.** Subagents from the Agent tool and workflows stay on the session's account however low it gets; start a new session to use another one.
+- It does not edit `~/.zshrc` or any other startup file. `qr doctor` points out a `claude` alias or function that gets in the way. An alias that runs `claude` itself (`alias claude='claude --dangerously-skip-permissions'`) still goes through the launcher, because the shell looks the `claude` inside an alias up on `PATH`. An alias that runs an absolute path, or that sets `CLAUDE_CONFIG_DIR`, bypasses it.
+- It is not free: every `claude` started this way first starts Python (about a tenth of a second), and reading quota that is not fresh can take up to `hook_budget_seconds`. Dispatches inside a session also pass through the launcher when it is first on that session's `PATH`; it steps aside at once.
+
+`qr launch [--] <claude arguments>` does the same without the launcher. Its decisions are in `decisions.log` with the source `qr launch`.
 
 ## Messages you will see
 
@@ -340,7 +382,7 @@ The rule behind all of these: **what the hook cannot see, it does not route, and
 
 Also:
 
-- Only Claude Code's Bash tool is hooked. Subagents started with the built-in Agent/Task tool or a workflow run on the lead's own account. A dispatch made inside a script is not in the command text, so it is neither routed nor checked (use `qr pick` in the script).
+- Only Claude Code's Bash tool is hooked. Subagents started with the built-in Agent/Task tool or a workflow run on the lead's own account; the [launcher](#launching-sessions) chooses that account when the session starts, and nothing changes it afterwards. A dispatch made inside a script is not in the command text, so it is neither routed nor checked (use `qr pick` in the script).
 - Text that is only data is left alone: quoted strings, comments and heredoc bodies, whatever the delimiter. A dispatch written inside a heredoc that is fed to a shell (`bash <<EOF … EOF`) is therefore not seen either.
 - A Bash command is allowed or blocked as a whole. In `codex exec a; claude -p b`, a blocked Claude dispatch stops the Codex part too.
 - Only the weekly window, the five-hour window and one per-model weekly bucket are modelled.
@@ -359,6 +401,7 @@ Also:
 | Codex login read from | `<dir>/auth.json` | same | same |
 | Running jobs counted from | `ps`, including each job's environment | same | PowerShell `Get-CimInstance Win32_Process`, command lines only |
 | Shell the command runs in | `sh` / `zsh` | `sh` / `bash` | Git Bash |
+| `claude` launcher | `~/.local/share/quota-router/bin/claude` (or under `$XDG_DATA_HOME`) | same | `%LOCALAPPDATA%\quota-router\bin\claude.cmd`, untested |
 
 The test suite runs on all three in CI. Day-to-day use so far has been on macOS; treat Windows as the least proven.
 
@@ -368,6 +411,7 @@ The test suite runs on all three in CI. Day-to-day use so far has been on macOS;
 - **Windows: listing processes starts PowerShell**, which takes roughly 0.5–2 s of the hook's budget. Past 2 s nobody is counted as busy.
 - **Windows: paths** are written into commands with forward slashes (`C:/Users/me/.claude-b`). In your own commands and in the config file, `C:\…`, `C:/…`, `~/…` and the Git Bash spelling `/c/…` are all understood; the config loader converts `/c/…` to a drive path on Windows.
 - **Windows: logins kept elsewhere are not read.** That includes a Console sign-in under `%APPDATA%\Anthropic` and a Codex login kept in the system credential store.
+- **Windows: the launcher is untested.** `qr install` writes a batch file, `claude.cmd`, which runs `qr launch`; there `claude` runs as a child process instead of replacing it. The logic is covered by the test suite, but the file has not been run on a real Windows machine.
 
 ## Privacy and security
 
@@ -378,6 +422,7 @@ The test suite runs on all three in CI. Day-to-day use so far has been on macOS;
 - As fallbacks when a query fails: the usage Claude Code cached in `.claude.json`, and the last `rate_limits` record in Codex's `<dir>/sessions/**.jsonl`. To find that record up to 20 of the most recent session files are read line by line; only the record is kept.
 - The names and modification times of conversation files in the account directories, to find which account holds a resumed conversation.
 - The process list, to count running `claude` / `codex` jobs per account. That means the command lines of running processes, which can contain prompt text, and on macOS and Linux the environment of the `claude` / `codex` ones. Only the program name and `CLAUDE_CONFIG_DIR` / `CODEX_HOME` are used; none of it is stored.
+- `qr doctor` only: your shell startup files (`~/.zshrc`, `~/.bashrc` and a few more), to find a `claude` alias or function. Only those lines are shown, with anything that looks like a credential masked; nothing is stored.
 
 quota-router itself never refreshes, rewrites or copies a token.
 
@@ -396,6 +441,8 @@ quota-router itself sends no telemetry and makes no other request, unless you ch
 - `hook-errors.log`: one line per error with the time, operation name, exception class, code location and the account key or state file concerned. No exception message and no traceback, because those can quote headers and response bodies.
 - `probe-<account>.log`: whatever the `codex` CLI printed during a background probe.
 - `*.lock` files and, briefly, `*.tmp` files.
+
+Outside the state directory it writes only what `qr install` adds: the hook entry in each `settings.json` you install into, and the `claude` launcher file.
 - `debug.log`, **only with `QR_DEBUG=1`**: full tracebacks. A pattern-based scrub is applied, but it is best effort; this file can contain tokens, headers, response bodies and config values. Treat it as sensitive and delete it when you are done.
 
 The field-by-field format of both logs is in [docs/REFERENCE.md](docs/REFERENCE.md).
@@ -416,7 +463,7 @@ qr uninstall                              # and once per --config-dir you instal
 pip uninstall quota-router
 ```
 
-`qr uninstall` removes the entry `qr install` wrote, recognised by its exact command and argument list, and nothing else; entries written by hand, by another copy, or that merely mention this package are left alone. The rules are in [docs/REFERENCE.md](docs/REFERENCE.md). The config file and the state directory stay behind for you to delete.
+`qr uninstall` removes the entry `qr install` wrote, recognised by its exact command and argument list, and nothing else; entries written by hand, by another copy, or that merely mention this package are left alone. It also removes the `claude` launcher when the file is exactly what `qr install` wrote (`--no-launcher` keeps it). The rules are in [docs/REFERENCE.md](docs/REFERENCE.md). The config file, the state directory, the launcher's empty directory and the `PATH` line in your shell startup file stay behind for you to delete.
 
 ## FAQ
 

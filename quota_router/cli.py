@@ -68,6 +68,8 @@ def show_config(argv):
         variable = config.ENV_DIR[account["family"]]
         where = (t("cli.unset", variable=variable) if account["dir"] is None
                  else f"{variable}={account['dir']}" + (t("cli.is_default") if account["default"] else ""))
+        if account["family"] == "claude" and not account["launch"]:
+            where += t("cli.no_launch")
         print(f"{account['family']:<8}{account['key']:<16}{where}  [{sources['config file']}]")
     for warning in cfg.warnings:
         print(t("cli.warning", text=warning), file=sys.stderr)
@@ -79,6 +81,9 @@ def main(argv=None):
     if command == "hook":
         return hook.main()
     platform_compat.stdio_utf8()
+    if command == "launch":
+        from . import launch
+        return launch.main(argv[1:])
     if command == "init":
         return init(argv[1:])
     if command == "config":

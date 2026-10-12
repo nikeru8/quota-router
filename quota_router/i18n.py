@@ -19,8 +19,13 @@ quota-router: ask "which account should this subagent use right now?"
 
   qr init [--force]         write an example config (pre-filled from ~/.claude* and ~/.codex*)
   qr config                 print the resolved settings and where each value came from
-  qr install [--config-dir DIR]    add the hook to Claude Code's settings.json (default ~/.claude), with a backup
-  qr uninstall [--config-dir DIR]  remove the hook that `qr install` added
+  qr install [--config-dir DIR] [--no-launcher]
+                            add the hook to Claude Code's settings.json (default ~/.claude), with a backup,
+                            and write the `claude` launcher (--no-launcher: hook only)
+  qr uninstall [--config-dir DIR] [--no-launcher]
+                            remove the hook and the launcher that `qr install` added
+  qr launch [--] [ARGS…]    start claude ARGS on the Claude account with the most quota left
+                            (what the `claude` launcher runs; it never refuses to start a session)
   qr doctor                 check Python, the config file, account directories, the hook and platform support
   qr pick claude            one line: account prefix  # reason (and reserve that account)
   qr pick codex             same, for a Codex account
@@ -53,6 +58,7 @@ endpoints; they are never refreshed or written back.""",
     "cli.unset": "{variable} unset (default location)",
     "cli.is_default": " (default location)",
     "cli.warning": "warning: {text}",
+    "cli.no_launch": "  (launch = false: no new sessions)",
     "init.header": """\
 # quota-router config. Every value in [general], [hints], [limits], [timing],
 # [events] and [families.*] is optional; what you see here are the defaults.
@@ -293,7 +299,7 @@ endpoints; they are never refreshed or written back.""",
     "report.disclaimer": "Scheduled times can move earlier; treat these as estimates.",
     "report.stats": "Dispatch statistics",
     # ---- qr install / uninstall / doctor ----
-    "usage.install": "usage: qr install|uninstall [--config-dir DIR]",
+    "usage.install": "usage: qr install|uninstall [--config-dir DIR] [--no-launcher]",
     "install.added": "Added the quota-router hook to {path}",
     "install.updated": "Updated the quota-router hook in {path}",
     "install.unchanged": "The quota-router hook is already in {path}; nothing changed",
@@ -344,6 +350,49 @@ endpoints; they are never refreshed or written back.""",
     "doctor.run.not_started": "it could not be started ({detail})",
     "doctor.run.no_shell": "no bash on PATH to run a shell-form entry with",
     "doctor.run.stderr": "stderr: {text}",
+    # ---- install / doctor: the claude launcher ----
+    "install.launcher.added": "Wrote the claude launcher {path}",
+    "install.launcher.updated": "Updated the claude launcher {path}",
+    "install.launcher.unchanged": "The claude launcher {path} is already in place; nothing changed",
+    "install.launcher.foreign": "{path} already exists and was not written by this installation; left alone. Remove it and run `qr install` again, or use --no-launcher.",
+    "install.launcher.removed": "Removed the claude launcher {path}",
+    "install.launcher.absent": "No claude launcher written by `qr install` at {path}; nothing removed",
+    "install.launcher.kept": "{path} was not written by this installation, or was changed since; left alone",
+    "install.launcher.failed": "quota-router: cannot write the claude launcher {path}: {detail}",
+    "install.path_hint": "`claude` only goes through the launcher when its directory comes first on PATH. Add this line to ~/.zshrc or ~/.bashrc yourself, then open a new terminal:\n  {line}",
+    "install.path_hint_windows": "`claude` only goes through the launcher when its directory comes first on PATH. Put {line} at the front of your user PATH, then open a new terminal.",
+    "doctor.launcher.ok": "claude launcher at {path}",
+    "doctor.launcher.absent": "no claude launcher at {path}, so new sessions start on whatever account `claude` uses; run `qr install` to add it (optional)",
+    "doctor.launcher.not_executable": "claude launcher {path} is not executable; run `qr install`",
+    "doctor.launcher.foreign": "{path} was not written by this installation (edited, or from another Python or copy); `qr install` and `qr uninstall` here will not touch it",
+    "doctor.launcher.path_ok": "{dir} comes before the real claude ({claude}) on PATH",
+    "doctor.launcher.path_missing": "{dir} is not on PATH, so `claude` starts without the launcher; add: {line}",
+    "doctor.launcher.path_late": "{dir} comes after the real claude ({claude}) on PATH, so `claude` starts without the launcher; put it first: {line}",
+    "doctor.launcher.no_real": "no claude executable on PATH apart from the launcher; the launcher has nothing to start",
+    "doctor.alias.none": "no shell alias or function named claude in {files}",
+    "doctor.alias.through": "{file}:{number}: this alias still finds claude on PATH, so it goes through the launcher: {text}",
+    "doctor.alias.bypass": "{file}:{number}: this alias runs {program} instead of claude from PATH, so the launcher is bypassed: {text}",
+    "doctor.alias.named": "{file}:{number}: this alias sets CLAUDE_CONFIG_DIR, so the launcher leaves the account as written: {text}",
+    "doctor.alias.function": "{file}:{number}: a shell function named claude decides what runs; the launcher is used only if it calls claude from PATH: {text}",
+    "doctor.launch.ok": "Claude accounts for new sessions: {keys}; a reading is on file for {read}",
+    "doctor.launch.none": "no Claude account has launch enabled, so new sessions always start on the default account",
+    "doctor.launch.no_reading": "no reading on file yet for the Claude accounts for new sessions ({keys}); run `qr status`",
+    # ---- qr launch: one line on stderr before claude starts ----
+    "launch.routed": "[quota-router] session on {reason}",
+    "launch.resume": "[quota-router] Resuming on the account that holds this conversation, {reason}",
+    "launch.resume_unknown": "[quota-router] Could not find which account holds this conversation; starting on the default account.",
+    "launch.blocked": "[quota-router] No account can take a new session ({reasons}); starting on the default account.",
+    "launch.blocked_row": "{key}: {reason}",
+    "launch.unreadable": "[quota-router] No account's quota could be read; starting on the default account.",
+    "launch.none_enabled": "[quota-router] No Claude account in the config has launch enabled; starting on the default account.",
+    "launch.no_config": '[quota-router] No config at {path} (run "qr init"); starting on the default account.',
+    "launch.config_error": "[quota-router] Config error in {path}: {detail}; starting on the default account.",
+    "launch.failed": "[quota-router] Choosing an account failed ({error}); starting on the default account.",
+    "launch.timeout": "[quota-router] Choosing an account took longer than {seconds:.0f} s; starting on the default account.",
+    "launch.out_of_quota": "⚠ {who}: {reason}; the session starts there anyway and may stop at once.",
+    "launch.overage_now": "⚠ PAID OVERAGE: {who} is out of subscription quota and has paid overage enabled; this session will be billed.",
+    "launch.overage_risk": "⚠ PAID OVERAGE POSSIBLE: {who} has paid overage enabled and its quota is low or unknown; this session may be billed.",
+    "launch.not_found": "quota-router: no claude executable found on PATH apart from the quota-router launcher in {dir}",
     # ---- hook ----
     "deny.header": "Dispatch #{index} ({family}/{model}) was blocked; the whole command was not run.",
     "suggest.best": "The account with the most available quota is {reason}",
@@ -374,8 +423,13 @@ quota-router：派子代理前問「現在該用哪個帳號」。
 用法：
   qr init [--force]         產生範例設定檔（依既有的 ~/.claude*、~/.codex* 目錄預填）
   qr config                 印出解析後的設定與每個值的來源
-  qr install [--config-dir 目錄]    把 hook 加進 Claude Code 的 settings.json（預設 ~/.claude），會先備份
-  qr uninstall [--config-dir 目錄]  移除 `qr install` 加的那一條 hook
+  qr install [--config-dir 目錄] [--no-launcher]
+                            把 hook 加進 Claude Code 的 settings.json（預設 ~/.claude），會先備份；
+                            並寫入 `claude` 啟動器（--no-launcher：只裝 hook）
+  qr uninstall [--config-dir 目錄] [--no-launcher]
+                            移除 `qr install` 加的 hook 與啟動器
+  qr launch [--] [參數…]    在額度最多的 Claude 帳號上執行 claude 參數
+                            （`claude` 啟動器就是跑這個；它不會擋下任何 session）
   qr doctor                 檢查 Python、設定檔、帳號目錄、hook 與平台功能
   qr pick claude            回一行：帳號環境變數前綴  # 理由（並預約該帳號 30 分鐘，忙碌只計前 5 分鐘）
   qr pick codex             同上，Codex 帳號
@@ -405,6 +459,7 @@ quota-router：派子代理前問「現在該用哪個帳號」。
     "cli.unset": "不設 {variable}（預設位置）",
     "cli.is_default": "（預設位置）",
     "cli.warning": "警告：{text}",
+    "cli.no_launch": "  （launch = false：不開新 session）",
     "init.header": """\
 # quota-router 設定檔。[general]、[hints]、[limits]、[timing]、[events]、[families.*]
 # 裡的值都可以不寫；這裡列的就是預設值。
@@ -632,7 +687,7 @@ quota-router：派子代理前問「現在該用哪個帳號」。
     "report.disclaimer": "預定時間可能提前，僅供參考",
     "report.stats": "派工統計",
     # ---- qr install / uninstall / doctor ----
-    "usage.install": "用法：qr install|uninstall [--config-dir 目錄]",
+    "usage.install": "用法：qr install|uninstall [--config-dir 目錄] [--no-launcher]",
     "install.added": "已把 quota-router 的 hook 加進 {path}",
     "install.updated": "已更新 {path} 裡的 quota-router hook",
     "install.unchanged": "{path} 已經有 quota-router 的 hook，沒有變更",
@@ -683,6 +738,47 @@ quota-router：派子代理前問「現在該用哪個帳號」。
     "doctor.run.not_started": "無法啟動（{detail}）",
     "doctor.run.no_shell": "PATH 裡找不到 bash，無法試跑 shell 形式的條目",
     "doctor.run.stderr": "stderr：{text}",
+    "install.launcher.added": "已寫入 claude 啟動器 {path}",
+    "install.launcher.updated": "已更新 claude 啟動器 {path}",
+    "install.launcher.unchanged": "claude 啟動器 {path} 已經在了，沒有變更",
+    "install.launcher.foreign": "{path} 已經存在，而且不是這份安裝寫的，沒有動它。請先移除它再執行 `qr install`，或加 --no-launcher。",
+    "install.launcher.removed": "已移除 claude 啟動器 {path}",
+    "install.launcher.absent": "{path} 沒有 `qr install` 寫的 claude 啟動器，沒有移除任何東西",
+    "install.launcher.kept": "{path} 不是這份安裝寫的，或寫入後被改過，沒有動它",
+    "install.launcher.failed": "quota-router：寫不進 claude 啟動器 {path}：{detail}",
+    "install.path_hint": "啟動器的目錄要排在 PATH 最前面，打 `claude` 才會經過它。請自己把下面這行加進 ~/.zshrc 或 ~/.bashrc，再開新的終端機：\n  {line}",
+    "install.path_hint_windows": "啟動器的目錄要排在 PATH 最前面，打 `claude` 才會經過它。請把 {line} 加到使用者 PATH 的最前面，再開新的終端機。",
+    "doctor.launcher.ok": "claude 啟動器在 {path}",
+    "doctor.launcher.absent": "{path} 沒有 claude 啟動器，新 session 會開在 `claude` 原本用的帳號；要加請執行 `qr install`（可選）",
+    "doctor.launcher.not_executable": "claude 啟動器 {path} 沒有執行權限；請執行 `qr install`",
+    "doctor.launcher.foreign": "{path} 不是這份安裝寫的（被改過，或來自另一個 Python、另一份程式）；這裡的 `qr install`、`qr uninstall` 不會動它",
+    "doctor.launcher.path_ok": "PATH 裡 {dir} 排在真正的 claude（{claude}）前面",
+    "doctor.launcher.path_missing": "{dir} 不在 PATH 裡，打 `claude` 不會經過啟動器；請加上：{line}",
+    "doctor.launcher.path_late": "PATH 裡 {dir} 排在真正的 claude（{claude}）後面，打 `claude` 不會經過啟動器；請把它移到最前面：{line}",
+    "doctor.launcher.no_real": "PATH 裡除了啟動器之外找不到 claude，啟動器沒有東西可以啟動",
+    "doctor.alias.none": "{files} 裡沒有叫 claude 的 shell alias 或函式",
+    "doctor.alias.through": "{file}:{number}：這個 alias 仍從 PATH 找 claude，所以會經過啟動器：{text}",
+    "doctor.alias.bypass": "{file}:{number}：這個 alias 跑的是 {program}，不是 PATH 上的 claude，會繞過啟動器：{text}",
+    "doctor.alias.named": "{file}:{number}：這個 alias 設了 CLAUDE_CONFIG_DIR，啟動器會照寫的帳號開：{text}",
+    "doctor.alias.function": "{file}:{number}：有一個叫 claude 的 shell 函式，跑什麼由它決定；它從 PATH 呼叫 claude 時才會經過啟動器：{text}",
+    "doctor.launch.ok": "可開新 session 的 Claude 帳號：{keys}；有讀數的：{read}",
+    "doctor.launch.none": "沒有任何 Claude 帳號開放 launch，新 session 一律開在預設帳號",
+    "doctor.launch.no_reading": "可開新 session 的 Claude 帳號（{keys}）都還沒有讀數；請執行 `qr status`",
+    "launch.routed": "[帳號分流] 這個 session 開在 {reason}",
+    "launch.resume": "[帳號分流] 接續對話，開在存放這段對話的帳號 {reason}",
+    "launch.resume_unknown": "[帳號分流] 找不到這段對話存在哪個帳號，開在預設帳號。",
+    "launch.blocked": "[帳號分流] 沒有帳號能開新 session（{reasons}），開在預設帳號。",
+    "launch.blocked_row": "{key}：{reason}",
+    "launch.unreadable": "[帳號分流] 讀不到任何帳號的額度，開在預設帳號。",
+    "launch.none_enabled": "[帳號分流] 設定檔裡沒有開放 launch 的 Claude 帳號，開在預設帳號。",
+    "launch.no_config": "[帳號分流] 找不到設定檔 {path}（請執行 qr init），開在預設帳號。",
+    "launch.config_error": "[帳號分流] 設定檔 {path} 有問題：{detail}；開在預設帳號。",
+    "launch.failed": "[帳號分流] 選帳號失敗（{error}），開在預設帳號。",
+    "launch.timeout": "[帳號分流] 選帳號超過 {seconds:.0f} 秒，開在預設帳號。",
+    "launch.out_of_quota": "⚠ {who}：{reason}；照樣開在這裡，可能一開就停。",
+    "launch.overage_now": "⚠ 付費超額：{who} 的訂閱額度已用完且開了付費超額，這個 session 會計費。",
+    "launch.overage_risk": "⚠ 可能付費超額：{who} 開了付費超額，額度偏低或不明，這個 session 可能會計費。",
+    "launch.not_found": "quota-router：PATH 裡除了 {dir} 的 quota-router 啟動器之外，找不到 claude",
     "deny.header": "第 {index} 個派工（{family}／{model}）被擋，整條指令未執行。",
     "suggest.best": "現在最寬裕的是：{reason}",
     "suggest.best_plain": "現在最寬裕的是 {reason}",

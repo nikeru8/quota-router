@@ -38,6 +38,8 @@ codex-2：訂閱額度用完，會改扣加購點數；點數餘額 40
 
 `alice`、`bob` 和帳號 key 都是虛構的。訊息裡的帳號用登入信箱 `@` 前面那一段來稱呼；信箱還不知道、或是在列帳號清單時，用設定檔裡的 key。上面是 `language = "zh-TW"` 的樣子，預設語言是英文（`[quota-router] Automatically routed to …`）。
 
+session 本身，以及它在自己程序裡做的事（內建的 Agent 工具、workflow），都留在它啟動時的帳號。為此 `qr install` 也會寫一個 `claude` 啟動器：把它放到 `PATH` 最前面，在終端機打 `claude` 就會開在額度最多的 Claude 帳號。見[開 session 也會挑帳號](#開-session-也會挑帳號)。
+
 ## 為什麼需要它
 
 - **好幾個帳號，一個 session。** 子代理跑在哪個帳號，看它的環境變數指到哪裡。不管它的話，全部都會擠在主管 session 自己用的那個帳號上。
@@ -95,6 +97,8 @@ python3 -m venv ~/.qr-venv
 
    它只加一條 `Bash` 的 `PreToolUse` 設定，檔案其餘內容維持原樣；原檔另存成同目錄的 `settings.json.bak-<時間>`。重複執行不會有任何變化。寫完後它會拿一個無害的測試事件把裝好的指令實際跑一次，那條指令沒有回應時結束碼是 1。安裝成功只代表 hook 啟動得了，不代表分流已經設定好：沒有設定檔時 hook 一樣會回應這個測試。
 
+   它也會把 `claude` 啟動器寫到 `~/.local/share/quota-router/bin/claude`（見[開 session 也會挑帳號](#開-session-也會挑帳號)）；那個目錄還沒排在真正的 `claude` 前面時，會印出要加進 `~/.zshrc` 或 `~/.bashrc` 的那一行。它自己絕不改這些檔案。`--no-launcher` 只裝 hook。
+
 4. **檢查安裝。**
 
    ```sh
@@ -110,6 +114,8 @@ python3 -m venv ~/.qr-venv
    ```
 
    工具回覆裡應該有一行以 `[帳號分流] 已自動改用`（英文介面是 `[quota-router] Automatically routed to`）開頭。`qr decisions` 可以看每次的決定與理由。
+
+   啟動器的目錄放上 `PATH` 之後，開一個新的終端機執行 `claude`：session 開始前會先印一行 `[帳號分流] 這個 session 開在`（英文介面是 `[quota-router] session on`）。
 
 不安裝、直接從原始碼跑：`git clone` 之後用 `bin/qr <指令>`（Windows 是 `python bin\qr <指令>`）。
 
@@ -149,6 +155,7 @@ dir = "~/.codex-b"
 | `family` | 必填 | `claude` 或 `codex`。 |
 | `key` | 必填 | 自己取的、不重複的名稱（英數字、`-`、`_`、`.`），會出現在訊息與紀錄裡。 |
 | `dir` | `""` | 你平常寫在 `CLAUDE_CONFIG_DIR`／`CODEX_HOME` 的目錄，`~` 與 `$HOME` 會展開。空字串、或等於 `~/.claude`／`~/.codex`，表示 CLI 的預設位置；每個家族只能有一個帳號用預設位置。 |
+| `launch` | `true` | 只用於 Claude 帳號。`false`：[`qr launch`](#開-session-也會挑帳號) 永遠不會在這裡開新 session。hook 的派工照樣會派過來，存在這裡的對話也照樣在這裡接續。 |
 
 帳號的排列順序在三種情況有影響：兩個帳號分數完全相同時，用排在前面的那個；兩個 Claude 目錄其實是同一個帳號時，由第一個不是主管所在的目錄代表它；時間預算不夠查完所有帳號時，讀數一樣舊的帳號照這個順序查。
 
@@ -204,8 +211,11 @@ dir = "~/.codex-b"
 ```
 qr init [--force]                    寫出範例設定檔
 qr config                            印出解析後的設定與來源
-qr install [--config-dir 目錄]       把 hook 加進 settings.json（預設 ~/.claude）
-qr uninstall [--config-dir 目錄]     移除 `qr install` 加的那一條 hook
+qr install [--config-dir 目錄] [--no-launcher]
+                                     把 hook 加進 settings.json（預設 ~/.claude），並寫入 claude 啟動器
+qr uninstall [--config-dir 目錄] [--no-launcher]
+                                     移除 `qr install` 加的 hook 與啟動器
+qr launch [--] [claude 參數]         在額度最多的 Claude 帳號上啟動 claude（啟動器跑的就是這個）
 qr doctor                            逐項檢查安裝狀況，每項一行 OK／WARN
 qr status                            所有帳號的表格
 qr pick <家族>                       印出最佳帳號的環境變數前綴並預約
@@ -242,6 +252,38 @@ eval "env $account codex exec \"\$prompt\""
 - **某個模型可以有自己的額度。** 設了 `scarce_model` 時，寫了那個模型、或完全沒寫模型的 Claude 派工，還會多檢查那個模型的專屬週額度。沒寫 `--model` 的接續對話，只要共用額度還有就留在原帳號，但會不會產生付費超額是照那份專屬額度判斷的。用量端點沒有回報那份額度時，就沒有東西可以檢查。
 - **重置看讀數，不靠推測。** 即時讀數顯示已用下降至少 `reset_drop_points` 點時，記成一次重置或補額度，每個 session 通知主管一次。五小時窗照預定時間換窗不通知；只是重置日期變了的，記在 `qr report` 裡、不另外通知。
 - **出錯就放行。** quota-router 自己壞掉時，指令照原樣執行。hook 以 `hook_budget_seconds` 秒內回答為目標；再過兩秒還沒結束，看門狗會直接結束它、不做任何決定。Python 啟動的時間另計。
+
+## 開 session 也會挑帳號
+
+hook 只看得到 session 透過 Bash 工具執行的 `claude -p`／`codex exec`。session 在自己程序裡做的事（內建 Agent 工具、workflow）都跑在它啟動時的帳號。啟動器就是在 session 開始時挑這個帳號。
+
+`qr install` 會在 `~/.local/share/quota-router/bin/` 寫一個叫 `claude` 的小腳本（有設 `$XDG_DATA_HOME` 時是 `$XDG_DATA_HOME/quota-router/bin/`；Windows 是 `%LOCALAPPDATA%\quota-router\bin\claude.cmd`）。在 `~/.zshrc` 或 `~/.bashrc` 把這個目錄放到 `PATH` 最前面：
+
+```sh
+export PATH="$HOME/.local/share/quota-router/bin:$PATH"
+```
+
+之後在終端機打 `claude` 會先跑 `qr launch`：它挑好帳號，再換成真正的 `claude`，帶著那個帳號的 `CLAUDE_CONFIG_DIR` 啟動（預設位置的帳號則是不設這個變數）。真正的 `claude` 每次啟動都會越過啟動器的目錄、在 `PATH` 上重新找，所以更新或搬動它都不用做任何事。stderr 上會有一行說明開在哪裡：
+
+```
+[帳號分流] 這個 session 開在 bob：週剩 88%（4.0 天後重置）
+```
+
+怎麼挑：
+
+- **新 session** 照 hook 的規則挑最好的 Claude 帳號：同樣的分數（週剩餘 % 除以距離重置的小時數，五小時窗緊或有任務在跑時下修）、同樣的跳過條件（五小時下限、週下限、週額度用完、沒有登入、未允許時會付費超額的帳號），也會像 `qr pick` 一樣預約。這時還沒有主管，所以沒有帳號會被當成主管的帳號保留。`launch = false` 的帳號永遠不會被選。沒寫 `--model` 時，跟派工一樣也會檢查稀缺模型的額度。
+- **接續對話**（`--resume <id>`、`-r <id>`、`--resume=<id>`、`--continue`、`-c`）開在存放那段對話的帳號。`--continue`，以及不帶 id 的 `--resume`（選單），開在目前目錄最近一段對話所在的帳號。就算那個帳號是 `launch = false` 或額度用完也一樣，只是那一行會帶 `⚠`。找不到帳號時開在預設帳號。
+- **不動、也不印任何東西：** 已經設了 `CLAUDE_CONFIG_DIR`（你或 hook 選過了）；在 Claude Code session 裡執行的指令（有 `CLAUDECODE`：那些由 hook 處理，包括它用來表示預設帳號的 `env -u CLAUDE_CONFIG_DIR claude -p …`）；`--help`、`-h`、`--version`、`-v`；子指令：`mcp`、`config`、`doctor`、`update`、`install`、`auth`、`plugin`、`setup-token`、`migrate-installer`，以及其他出現在第一個位置的單一小寫英文字。所以 `claude hello` 不會分流，`claude "hello there"` 會。
+- **絕不拒絕。** 所有帳號都被擋、讀不到任何帳號的額度、設定檔不存在或有問題、quota-router 自己出錯、或挑帳號超過 `hook_budget_seconds` 再加兩秒時，session 開在預設帳號，那一行會說明原因。會付費超額的帳號不會被自動選到；session 還是落在這種帳號時（接續對話、退回預設帳號、或有 `QR_ALLOW_CREDITS=1`／`allow_credits = true`），那一行會寫 `⚠ 付費超額`。
+- **單次執行也一樣。** 在終端機打的 `claude -p …`，或 `PATH` 最前面是啟動器的腳本、排程工作執行的，也照同樣方式分流，同樣不會被擋。
+
+它不做的事：
+
+- **它不會搬動執行中的 session。一個 session 只用一個帳號。** Agent 工具起的子代理與 workflow 一直留在 session 的帳號，額度再低也一樣；要換帳號請開新的 session。
+- 它不改 `~/.zshrc` 或任何啟動檔。`qr doctor` 會指出擋路的 `claude` alias 或函式。本身就是執行 `claude` 的 alias（`alias claude='claude --dangerously-skip-permissions'`）仍然會經過啟動器，因為 shell 會在 `PATH` 上找 alias 裡的 `claude`；執行絕對路徑、或設了 `CLAUDE_CONFIG_DIR` 的 alias 則會繞過它。
+- 它有成本：這樣啟動的每個 `claude` 都要先啟動 Python（約十分之一秒），額度讀數不新時查詢最多花 `hook_budget_seconds`。啟動器排在 session 的 `PATH` 最前面時，session 裡的派工也會經過它，它會立刻讓開。
+
+`qr launch [--] <claude 參數>` 不透過啟動器做同樣的事。它的決定記在 `decisions.log`，來源是 `qr launch`。
 
 ## 會看到的訊息
 
@@ -340,7 +382,7 @@ quota-router 自己出錯：
 
 另外：
 
-- 只接了 Claude Code 的 Bash 工具。用內建 Agent／Task 工具或 workflow 起的子代理跑在主管自己的帳號。寫在腳本裡面的派工不在指令文字裡，所以不分流、也不檢查（請在腳本裡用 `qr pick`）。
+- 只接了 Claude Code 的 Bash 工具。用內建 Agent／Task 工具或 workflow 起的子代理跑在主管自己的帳號；這個帳號由[啟動器](#開-session-也會挑帳號)在 session 開始時挑，之後不會再變。寫在腳本裡面的派工不在指令文字裡，所以不分流、也不檢查（請在腳本裡用 `qr pick`）。
 - 純粹是資料的文字不會被動到：引號裡的字串、註解、heredoc 的內容（不管分隔詞是什麼）。所以寫在餵給殼的 heredoc 裡的派工（`bash <<EOF … EOF`）同樣看不到。
 - 一條 Bash 指令只能整條放行或整條擋下。`codex exec a; claude -p b` 裡的 Claude 派工被擋時，Codex 那一段也不會執行。
 - 只處理週額度、五小時窗、以及一個模型專屬的週額度。
@@ -359,6 +401,7 @@ quota-router 自己出錯：
 | Codex 登入憑證來源 | `<目錄>/auth.json` | 同左 | 同左 |
 | 執行中任務怎麼算 | `ps`，連同每個任務的環境變數 | 同左 | PowerShell `Get-CimInstance Win32_Process`，只看得到命令列 |
 | 指令在哪個殼執行 | `sh`／`zsh` | `sh`／`bash` | Git Bash |
+| `claude` 啟動器 | `~/.local/share/quota-router/bin/claude`（或 `$XDG_DATA_HOME` 底下） | 同左 | `%LOCALAPPDATA%\quota-router\bin\claude.cmd`，未實測 |
 
 測試在三個平台的 CI 上都會跑。實際日常使用目前只有 macOS，Windows 是驗證最少的一個。
 
@@ -368,6 +411,7 @@ quota-router 自己出錯：
 - **Windows：列程序要啟動 PowerShell**，大約吃掉 hook 時間預算裡的 0.5 到 2 秒；超過 2 秒就當作沒有人在忙。
 - **Windows：路徑**寫進指令時一律用正斜線（`C:/Users/me/.claude-b`）。你自己寫的指令與設定檔則 `C:\…`、`C:/…`、`~/…`、以及 Git Bash 的寫法 `/c/…` 都認得；設定檔載入時會把 `/c/…` 轉成磁碟機路徑（只在 Windows）。
 - **Windows：存在別處的登入讀不到**，包含 `%APPDATA%\Anthropic` 底下的 Console 登入，以及存在系統憑證庫裡的 Codex 登入。
+- **Windows：啟動器未實測。** `qr install` 會寫一個批次檔 `claude.cmd` 來跑 `qr launch`；在 Windows 上 `claude` 是以子程序執行，而不是取代原程序。邏輯有測試涵蓋，但這個檔案沒有在真的 Windows 機器上跑過。
 
 ## 隱私與安全
 
@@ -378,6 +422,7 @@ quota-router 自己出錯：
 - 查詢失敗時的退路：Claude Code 存在 `.claude.json` 裡的用量，以及 Codex 的 `<目錄>/sessions/**.jsonl` 最後一筆 `rate_limits`。為了找到那一筆，最多會逐行讀最近的 20 個 session 檔；只留下那一筆。
 - 各帳號目錄裡對話檔的檔名與修改時間，用來找出接續的那段對話存在哪個帳號。
 - 程序列表，用來數每個帳號正在跑的 `claude`／`codex` 任務。這表示會讀到執行中程序的命令列（裡面可能有提示詞），macOS 與 Linux 上還包含 `claude`／`codex` 程序的環境變數。實際用到的只有程式名稱與 `CLAUDE_CONFIG_DIR`／`CODEX_HOME`，其餘都不儲存。
+- 只有 `qr doctor`：你的 shell 啟動檔（`~/.zshrc`、`~/.bashrc` 等幾個），用來找叫 `claude` 的 alias 或函式。只會顯示那幾行，看起來像憑證的內容會遮掉，什麼都不儲存。
 
 quota-router 自己不會刷新、改寫或另存任何 token。
 
@@ -396,6 +441,8 @@ quota-router 自己沒有遙測，也不發其他請求，除非你改了 `[endp
 - `hook-errors.log`：每個錯誤一行，記時間、作業名稱、例外類別、程式位置、相關的帳號 key 或狀態檔。不記例外訊息與錯誤堆疊，因為那些內容可能引用到請求標頭與回應內容。
 - `probe-<帳號>.log`：背景探測時 `codex` CLI 印出來的東西。
 - `*.lock` 檔，以及短暫存在的 `*.tmp` 檔。
+
+狀態目錄以外，它只寫 `qr install` 加的東西：你安裝的每個 `settings.json` 裡的 hook 條目，以及 `claude` 啟動器這個檔案。
 - `debug.log`，**只有設了 `QR_DEBUG=1` 才寫**：完整的錯誤堆疊。寫入前會做一次樣式遮罩，但只是盡力而為；這個檔可能含有 token、標頭、回應內容與設定值。請當成敏感資料，用完就刪。
 
 兩個紀錄檔的逐欄位格式在 [docs/REFERENCE.md](docs/REFERENCE.md)（英文）。
@@ -416,7 +463,7 @@ qr uninstall                              # 裝過的每個 --config-dir 各跑�
 pip uninstall quota-router
 ```
 
-`qr uninstall` 只移除 `qr install` 寫的那一條，認的是完全相同的指令與參數列表；手寫的、另一份安裝留下的、或只是參數裡提到這個套件的條目都不動。判定規則在 [docs/REFERENCE.md](docs/REFERENCE.md)。設定檔與狀態目錄會留著，要不要刪由你決定。
+`qr uninstall` 只移除 `qr install` 寫的那一條，認的是完全相同的指令與參數列表；手寫的、另一份安裝留下的、或只是參數裡提到這個套件的條目都不動。啟動器檔案內容和 `qr install` 寫的完全相同時也會一併移除（`--no-launcher` 則保留）。判定規則在 [docs/REFERENCE.md](docs/REFERENCE.md)。設定檔、狀態目錄、啟動器留下的空目錄，以及你 shell 啟動檔裡的 `PATH` 那一行會留著，要不要刪由你決定。
 
 ## 常見問題
 
