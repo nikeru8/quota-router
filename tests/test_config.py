@@ -94,8 +94,12 @@ def test_missing_file(home, monkeypatch):
     ('[[accounts]]\nfamily = "claude"\nkey = "a"\ndir = 3\n', "dir must be a string"),
     ('[[accounts]]\nfamily = "claude"\nkey = "a"\ndir = "relative/path"\n', "dir must be absolute"),
     ('[[accounts]]\nfamily = "claude"\nkey = "a"\n[[accounts]]\nfamily = "codex"\nkey = "a"\n', "listed twice"),
-    ('[[accounts]]\nfamily = "claude"\nkey = "a"\ndir = ""\n[[accounts]]\nfamily = "claude"\nkey = "b"\ndir = "~/.claude"\n',
+    ('[[accounts]]\nfamily = "claude"\nkey = "a"\ndir = ""\n[[accounts]]\nfamily = "claude"\nkey = "b"\ndir = ""\n',
      "both use the default claude location"),
+    ('[[accounts]]\nfamily = "codex"\nkey = "a"\ndir = ""\n[[accounts]]\nfamily = "codex"\nkey = "b"\ndir = "~/.codex"\n',
+     "both use the default codex location"),
+    ('[[accounts]]\nfamily = "claude"\nkey = "a"\ndir = "~/.claude-b"\n[[accounts]]\nfamily = "claude"\nkey = "b"\ndir = "~/.claude-b/"\n',
+     "use the same directory"),
     ('[general]\nlanguage = "fr"\n' + CONFIG, "general.language must be one of"),
     ('[general]\nprotect_threshold = "20"\n' + CONFIG, "general.protect_threshold must be a non-negative number"),
     ('[general]\nprotect_threshold = -1\n' + CONFIG, "general.protect_threshold must be a non-negative number"),
@@ -129,7 +133,9 @@ def test_missing_dir_means_empty(write_config):
     assert cfg.accounts[0]["dir"] is None and cfg.accounts[0]["default"] is True
 
 
-def test_naming_the_default_location_equals_leaving_it_empty(write_config, home):
+def test_naming_the_default_location_equals_leaving_it_empty(write_config, home, monkeypatch):
+    from quota_router import platform_compat
+    monkeypatch.setattr(platform_compat, "system", lambda: "linux")      # on macOS a written-out ~/.claude is its own account
     cfg = config.load(write_config('[[accounts]]\nfamily = "claude"\nkey = "a"\ndir = "~/.claude"\n'
                                    '[[accounts]]\nfamily = "codex"\nkey = "b"\ndir = "~/.codex/"\n'))
     assert cfg.accounts[0]["dir"] is None and cfg.accounts[0]["default"] is True

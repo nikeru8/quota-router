@@ -359,7 +359,10 @@ def explicit_account(cmd, fam, pos, seg, cleared=False):
     if kind == "ineffective":
         return "ineffective", val
     real = platform_compat.canonical(val.replace("$HOME", qr.HOME))
-    for k, d in account_dirs(fam).items():
+    # a value that names the default directory means the account configured with that directory written out
+    # (macOS: its own keychain item) when there is one, else the account at the default location
+    pairs = sorted(account_dirs(fam).items(), key=lambda kv: kv[0] == qr.DEFAULT_KEY[fam])
+    for k, d in pairs:
         if platform_compat.canonical(d) == real:
             return k, val
     return "?", val

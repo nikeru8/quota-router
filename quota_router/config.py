@@ -125,7 +125,7 @@ ACCOUNT_FIELDS = ("family", "key", "dir", "launch")
 def _accounts(raw, warnings=None):
     if not isinstance(raw, list) or not raw:
         raise ValueError("no accounts: add at least one [[accounts]] table")
-    accounts, keys, defaults = [], set(), {}
+    accounts, keys, defaults, dirs = [], set(), {}, {}
     for number, item in enumerate(raw, 1):
         where = f"accounts #{number}"
         if not isinstance(item, dict):
@@ -155,13 +155,24 @@ def _accounts(raw, warnings=None):
             raise ValueError(f"{where}: launch must be true or false, got {launch!r}")
         if "launch" in item and family != "claude" and warnings is not None:
             warnings.append(f'"launch" in {where} only applies to Claude accounts (ignored)')
-        # Naming the default location explicitly means the same thing as leaving dir empty.
-        is_default = path is None or os.path.realpath(path) == os.path.realpath(default_dir(family))
+        # Naming the default location explicitly means the same thing as leaving dir empty, except for Claude on
+        # macOS: there Claude Code files the login under a keychain item named after the CLAUDE_CONFIG_DIR value, so
+        # `CLAUDE_CONFIG_DIR=~/.claude claude` and a plain `claude` can be two different logins. Such an account is
+        # kept apart ("explicit_default") and dispatched to with the variable set.
+        names_default = path is not None and os.path.realpath(path) == os.path.realpath(default_dir(family))
+        explicit_default = names_default and family == "claude" and platform_compat.system() == "darwin"
+        is_default = path is None or (names_default and not explicit_default)
         if is_default:
             if family in defaults:
                 raise ValueError(f'{where} and "{defaults[family]}" both use the default {family} location')
             defaults[family] = key
+        elif path is not None:
+            real = os.path.realpath(path)
+            if (family, real) in dirs:
+                raise ValueError(f'{where} and "{dirs[(family, real)]}" use the same directory')
+            dirs[(family, real)] = key
         accounts.append({"family": family, "key": key, "raw_dir": raw_dir, "default": is_default,
+                         "explicit_default": explicit_default,
                          # whether `qr launch` may start an interactive session here (Claude only).
                          "launch": launch and family == "claude",
                          # Claude: None means "leave CLAUDE_CONFIG_DIR unset". Codex always gets a real path.

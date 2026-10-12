@@ -41,7 +41,7 @@ dir = "~/.codex-b"
 |---|---|---|
 | `family` | required | `claude` or `codex`. |
 | `key` | required | A unique name of your choosing (letters, digits, `-`, `_`, `.`). It appears in messages and logs. |
-| `dir` | `""` | The directory you would pass as `CLAUDE_CONFIG_DIR` / `CODEX_HOME`. `~` and `$HOME` are expanded. Empty, or equal to `~/.claude` / `~/.codex`, means the CLI's default location; one account per family may use it. |
+| `dir` | `""` | The directory you would pass as `CLAUDE_CONFIG_DIR` / `CODEX_HOME`. `~` and `$HOME` are expanded. Empty, or equal to `~/.claude` / `~/.codex`, means the CLI's default location; one account per family may use it. Exception, Claude on macOS: `dir = "~/.claude"` written out is a second, separate account (see [macOS: two logins in `~/.claude`](#macos-two-logins-in-claude)). |
 | `launch` | `true` | Claude accounts only. `false`: [`qr launch`](#sessions-and-the-claude-launcher) never starts a new session here. Even with `true`, a session only starts here once the hook is in this directory's `settings.json`. Dispatches from the hook still go to the account either way, and a conversation that lives there is still resumed there. |
 
 The order of the accounts matters in three cases: when two accounts score exactly the same, the one listed first is used; when two Claude directories are the same account, the first one that is not the lead's represents it; and when the time budget cannot cover every account, accounts with equally old readings are queried in this order (the oldest reading first, config order among equals).
@@ -59,6 +59,10 @@ In messages an account is shown by the part of its login email before the `@`, o
 - `~` and `$HOME` (any environment variable, in fact) are expanded when the file is loaded.
 - **Windows:** `C:\…`, `C:/…`, `~/…` and the Git Bash spelling `/c/…` are all accepted. `/c/…` is converted to `C:\…` when the file is loaded; this conversion happens on Windows only, since on other systems `/c/…` is an ordinary path.
 - A Claude account at the default location is run with `CLAUDE_CONFIG_DIR` *unset* (`env -u CLAUDE_CONFIG_DIR claude …`), not with the variable pointing at `~/.claude`. A Codex account always gets `CODEX_HOME=<dir>`.
+
+### macOS: two logins in `~/.claude`
+
+On macOS Claude Code keeps each login in the keychain under an item named after the value of `CLAUDE_CONFIG_DIR`: one item for a plain `claude` (the variable unset) and a different one for `CLAUDE_CONFIG_DIR=/Users/you/.claude claude`, even though both are the same directory. So the default location can hold two accounts at once. quota-router models that: `dir = ""` is the login a plain `claude` uses and is dispatched to with `env -u CLAUDE_CONFIG_DIR`; `dir = "~/.claude"` written out is the other login and is dispatched to with `CLAUDE_CONFIG_DIR=/Users/you/.claude`. Both may be in the config file; when they turn out to be the same account, the usual merging by e-mail applies. `qr doctor` warns when the second item holds a login that is not in the config. On Linux and Windows the two spellings read the same `.credentials.json`, so there `dir = "~/.claude"` still means the default location.
 
 ### Settings
 
@@ -103,7 +107,8 @@ In messages an account is shown by the part of its login email before the `@`, o
 | `endpoints.*` not starting with `http://` or `https://` | Error. |
 | No `[[accounts]]`, an account without `family` or `key`, `family` other than `claude` / `codex`, a key with characters outside letters, digits, `-`, `_`, `.`, a duplicate key | Error. |
 | `dir` that is not absolute after expansion | Error. |
-| Two accounts of one family at the default location (`dir = ""`, or a `dir` that resolves to `~/.claude` / `~/.codex`) | Error. |
+| Two accounts of one family at the default location (`dir = ""`, or a `dir` that resolves to `~/.claude` / `~/.codex`; on macOS a Claude `dir = "~/.claude"` is a separate account instead) | Error. |
+| Two accounts of one family with the same directory | Error. |
 | File is not UTF-8 or not valid TOML | Error. |
 
 On an error, `qr status`, `qr pick`, `qr check`, `qr report`, `qr decisions`, `qr leases` and `qr config` print one line and exit with status 2. `qr doctor` reports the error as a `WARN` line and still exits 0. `qr install` and `qr uninstall` do not need a usable config at all. The hook prints one line on stderr and lets the command run unchanged. `qr launch` prints one line on stderr and starts claude on the default account.

@@ -675,6 +675,23 @@ def uninstall_command(argv):
     run(uninstall, argv)
 
 
+def second_login(default_dir):
+    """macOS: the default Claude directory can hold two logins, one under the keychain item of the default location
+    and one under the item named after `CLAUDE_CONFIG_DIR=<that directory>`. Returns the `dir` spelling to configure
+    for the second one when both exist and differ, else None."""
+    def token(config_dir):
+        raw = platform_compat.claude_credentials(config_dir, core.run_local)
+        try:
+            return json.loads(raw)["claudeAiOauth"]["accessToken"] if raw else None
+        except (ValueError, KeyError, TypeError):
+            return None
+    plain, explicit = token(None), token(default_dir)
+    if explicit and explicit != plain:
+        home = platform_compat.home()
+        return "~" + default_dir[len(home):] if default_dir.startswith(home) else default_dir
+    return None
+
+
 def doctor(argv):
     """One line per check, each starting with OK or WARN. Always exits 0: it reports, it does not judge."""
     def line(ok, text):
@@ -733,6 +750,11 @@ def doctor(argv):
                 line(False, t("doctor.login_missing", account=label, path=credentials))
             if account["dir"] is not None:
                 hook_dirs.append(account["dir"])
+            if account["dir"] is None and platform_compat.system() == "darwin" \
+                    and not any(x.get("explicit_default") for x in cfg.accounts):
+                second = second_login(directory)
+                if second:
+                    line(False, t("doctor.second_login", path=directory, raw=second))
         else:
             credentials = os.path.join(directory, "auth.json")
             line(os.path.isfile(credentials), t("doctor.login_file", account=label, path=credentials)

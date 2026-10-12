@@ -348,11 +348,12 @@ def dir_key(d):
     if d in (None, "", "default"):
         return DEFAULT_KEY["claude"]
     real = platform_compat.canonical(str(d).replace("$HOME", HOME))
-    if real == platform_compat.canonical(config.default_dir("claude")):
-        return DEFAULT_KEY["claude"]
+    # an account configured with the default directory named explicitly (macOS: its own keychain item) comes first
     for a in CLAUDE_ACCOUNTS:
         if a["dir"] and platform_compat.canonical(a["dir"]) == real:
             return a["key"]
+    if real == platform_compat.canonical(config.default_dir("claude")):
+        return DEFAULT_KEY["claude"]
     return None
 
 
@@ -378,7 +379,8 @@ def detect_lead(hook_data=None):
             return k, False
     tp = (hook_data or {}).get("transcript_path") or ""
     if tp:
-        for a in CLAUDE_ACCOUNTS:
+        # the default location and the same directory named explicitly share one transcript directory: the default wins
+        for a in sorted(CLAUDE_ACCOUNTS, key=lambda a: a["dir"] is not None):
             d = a["dir"] or config.default_dir("claude")
             if platform_compat.canonical(tp).startswith(platform_compat.canonical(d) + os.sep):
                 return a["key"], False
