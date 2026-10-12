@@ -36,7 +36,8 @@ quota-router: ask "which account should this subagent use right now?"
                             --strict is accepted for compatibility and changes nothing
   qr check codex 2 --peek   check one account (key, number or directory) without reserving
   qr status                 table of every account
-  qr status --watch [N]     the same table, redrawn every N seconds (default 10) until Ctrl-C
+  qr status --bars          the table with a bar per quota window under each account
+  qr status --watch [N]     the table with bars, redrawn every N seconds (default 10) until Ctrl-C
   qr report [--days N]      reset events, current pace and dispatch statistics (default 7 days)
   qr leases --clear         drop all reservations
   qr decisions [N]          the last N routing decisions (default 30)
@@ -236,6 +237,8 @@ endpoints; they are never refreshed or written back.""",
     "status.col.rate": "%/hour",
     "status.col.busy": "run/sent",
     "status.col.state": "state",
+    "status.bar.weekly": "week",
+    "status.bar.five_hour": "5h",
     "status.unknown": "unknown",
     "status.ok": "ok",
     "status.split": "non-{model}: {other}; {model}: {scarce}",
@@ -451,7 +454,8 @@ quota-router：派子代理前問「現在該用哪個帳號」。
                          沒有帳號可派時結束碼 3、stdout 不輸出；--strict 只為相容而保留，沒有作用
   qr check codex 2 --peek   檢查指定帳號（key、第幾個或目錄），不預約
   qr status                 所有帳號完整表格
-  qr status --watch [N]     同一張表每 N 秒重畫（預設 10），Ctrl-C 離開
+  qr status --bars          表格每個帳號下面加各額度窗的長條
+  qr status --watch [N]     含長條的表格每 N 秒重畫（預設 10），Ctrl-C 離開
   qr report [--days N]      重置事件、目前步調與派工統計（預設 7 天）
   qr leases --clear         清掉所有預約
   qr decisions [N]          最近 N 筆分流決定（預設 30）
@@ -638,6 +642,8 @@ quota-router：派子代理前問「現在該用哪個帳號」。
     "status.col.rate": "每小時可用",
     "status.col.busy": "忙碌",
     "status.col.state": "狀態",
+    "status.bar.weekly": "週剩",
+    "status.bar.five_hour": "五小時",
     "status.unknown": "未知",
     "status.ok": "可派",
     "status.split": "非 {model}：{other}；{model}：{scarce}",

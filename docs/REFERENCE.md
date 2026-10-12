@@ -159,7 +159,8 @@ qr uninstall [--config-dir DIR] [--no-launcher]
 qr launch [--] [claude arguments]    start claude on the Claude account with the most quota left (what the launcher runs)
 qr doctor                            one OK/WARN line per check of the setup
 qr status                            table of every account
-qr status --watch [N]                the same table, redrawn every N seconds (default 10) until Ctrl-C
+qr status --bars                     the table with a bar per quota window under each account
+qr status --watch [N]                the table with bars, redrawn every N seconds (default 10) until Ctrl-C
 qr pick <family>                     print the best account as an env prefix and reserve it
                                      (--env, --peek, --model <name>; --strict is accepted and ignored)
 qr check <family> <key|number|dir>   check one specific account

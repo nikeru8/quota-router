@@ -1587,7 +1587,19 @@ def check_account(family, account, model=None, peek=False, force=False):
     print(f"{prefix(family, row)}   # {reason(row)}")
 
 
-def status(force=False):
+BAR_WIDTH = 20
+
+
+def bar(left, width=BAR_WIDTH):
+    """`▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱  43/100%` for a percentage left; an unknown value is an empty bar with `?`."""
+    if left is None:
+        return "\u25b1" * width + "   ?/100%"
+    left = min(100, max(0, left))
+    filled = int(round(left / 100 * width))
+    return "\u25b0" * filled + "\u25b1" * (width - filled) + f"  {left:.0f}/100%"
+
+
+def status(force=False, bars=False):
     failures = recent_failures()
     if failures:
         print(t("fail.recent", count=failures))
@@ -1628,6 +1640,14 @@ def status(force=False):
             name = who(r) + (t("status.lead_tag") if r.get("is_lead") else "")
             print(f"{name:<16}{dirs:<24}{wk:>6}{fmt_clock(r['wk_reset']):>14}{fh:>9}{rate:>10}{r['busy_detail']:>10}  {st}"
                   + (t("paren", text=extra) if extra else ""))
+            if bars:
+                parts = [t("status.bar.weekly") + " " + bar(r["wk_left"])]
+                if fam == "claude":
+                    parts.append(t("status.bar.five_hour") + " " + bar(r["fh_left"]))
+                    if SCARCE:
+                        fb = (r.get("usage") or {}).get(SCARCE)
+                        parts.append(SCARCE_LABEL + " " + bar(max(0, 100 - fb["used"]) if fb else None))
+                print("  " + "   ".join(parts))
         if fam == "claude":
             missing = quiet_call(hookless_accounts, default=[])
             if missing:
@@ -2236,7 +2256,7 @@ def report(days=7):
     decision_statistics(days, rows)
 
 
-def watch_status(force, interval):
+def watch_status(force, interval, bars=True):
     """`qr status --watch [N]`: the status table again every N seconds until Ctrl-C. On a terminal the screen is
     cleared before each redraw; elsewhere (a pipe, a file) the tables are separated by a line of dashes. --refresh
     applies to the first draw only: later draws reuse the cached numbers, so watching does not hammer the usage
@@ -2248,7 +2268,7 @@ def watch_status(force, interval):
         while True:
             buf = io.StringIO()
             with redirect_stdout(buf):
-                status(force)
+                status(force, bars=bars)
             force = False
             if tty:
                 if platform_compat.system() == "windows":
@@ -2297,7 +2317,7 @@ def main(argv):
                 raise SystemExit(2)
             watch_status(force, interval)
         else:
-            status(force)
+            status(force, bars="--bars" in argv)
     elif argv[0] == "report":
         try:
             days = int(argv[argv.index("--days") + 1]) if "--days" in argv else 7

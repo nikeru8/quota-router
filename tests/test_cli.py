@@ -127,8 +127,22 @@ def test_status_watch_redraws_until_interrupted(router, monkeypatch, capsys):
     monkeypatch.setattr(core.time, "sleep", lambda seconds: (sleeps.append(seconds), None)[1]
                         if len(sleeps) < 1 else (_ for _ in ()).throw(KeyboardInterrupt()))
     real_status = core.status
-    monkeypatch.setattr(core, "status", lambda force=False: (forced.append(force), real_status(force))[1])
+    monkeypatch.setattr(core, "status", lambda force=False, bars=False: (forced.append(force), real_status(force, bars))[1])
     code, out, err = run(["status", "--watch", "3", "--refresh"], capsys)
     assert (code, err) == (0, "") and sleeps == [3] and forced == [True, False]
     assert out.count("qr status --watch") == 2 and out.count("[claude]") == 2 and "\x1b[" not in out
     assert out.startswith("-" * 72 + "\n")
+
+
+def test_status_bars(router, capsys):
+    from quota_router import core
+    assert core.bar(43) == "\u25b0" * 9 + "\u25b1" * 11 + "  43/100%"
+    assert core.bar(0) == "\u25b1" * 20 + "  0/100%" and core.bar(100) == "\u25b0" * 20 + "  100/100%"
+    assert core.bar(None) == "\u25b1" * 20 + "   ?/100%" and core.bar(250).startswith("\u25b0" * 20)
+    code, out, _ = run(["status"], capsys)
+    assert code == 0 and "/100%" not in out
+    code, out, _ = run(["status", "--bars"], capsys)
+    bars = [line for line in out.splitlines() if "/100%" in line]
+    assert code == 0 and len(bars) == len([l for l in out.splitlines() if "/100%" in l]) >= 2
+    assert all(line.startswith("  ") and "\u25b0" in line or "\u25b1" in line for line in bars)
+    assert any("5h" in line for line in bars) and any(line.count("/100%") == 1 for line in bars)   # codex: weekly only
