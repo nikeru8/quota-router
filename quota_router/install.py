@@ -688,7 +688,9 @@ def second_login(default_dir):
     plain, explicit = token(None), token(default_dir)
     if explicit and explicit != plain:
         home = platform_compat.home()
-        return "~" + default_dir[len(home):] if default_dir.startswith(home) else default_dir
+        if platform_compat.canonical(default_dir).startswith(platform_compat.canonical(home) + os.sep):
+            return "~/" + os.path.relpath(default_dir, home).replace(os.sep, "/")
+        return default_dir.replace("\\", "/")
     return None
 
 

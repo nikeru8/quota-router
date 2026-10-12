@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from conftest import CONFIG
+from conftest import CONFIG, posix_only
 from quota_router import config, core, hook, install, platform_compat
 
 TWO = CONFIG.replace('key = "claude-b"', 'key = "claude-888"\ndir = "~/.claude"\n\n[[accounts]]\nfamily = "claude"\nkey = "claude-b"', 1)
@@ -65,6 +65,7 @@ def test_the_explicit_account_wins_for_that_directory(two, home, monkeypatch):
     assert core.prefix("claude", rows["claude-888"]) == "CLAUDE_CONFIG_DIR=" + platform_compat.shell_quote(explicit)
 
 
+@posix_only            # a Windows home path has backslashes, which the hook reads as shell escapes
 def test_naming_the_directory_in_a_command_means_the_explicit_account(two, home):
     explicit = str(home / ".claude")
     cmd = f"CLAUDE_CONFIG_DIR={explicit} claude -p hi --model opus"
