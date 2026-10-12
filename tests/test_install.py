@@ -316,9 +316,10 @@ def test_python_m_entry_point(home):
 
 # ---- doctor ---------------------------------------------------------------------------
 @pytest.fixture
-def quiet_machine(monkeypatch):
+def quiet_machine(home, monkeypatch):
     """doctor looks at the process table and PATH; give it fakes so the test neither depends on nor reads the real ones."""
     from quota_router import install, platform_compat
+    monkeypatch.setenv("PATH", str(home / "empty-bin"))
     monkeypatch.setattr(platform_compat, "list_processes", lambda run: {1: (0, "init"), 2: (1, "claude -p x")})
     monkeypatch.setattr(install.shutil, "which", lambda name, **kwargs: {"claude": "/fake/bin/claude"}.get(name))
     return platform_compat

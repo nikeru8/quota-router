@@ -62,6 +62,36 @@ def default_state_dir(platform=None, env=None):
     return os.path.join(base, "quota-router")
 
 
+def default_launcher_dir(platform=None, env=None):
+    """Directory of the `claude` launcher that `qr install` writes; it goes on PATH ahead of the real claude.
+
+    macOS/Linux: $XDG_DATA_HOME/quota-router/bin, default ~/.local/share/quota-router/bin.
+    Windows: %LOCALAPPDATA%\\quota-router\\bin (falls back to ~/AppData/Local).
+    """
+    platform = platform or system()
+    env = os.environ if env is None else env
+    if platform == "windows":
+        base = env.get("LOCALAPPDATA") or os.path.join(home(), "AppData", "Local")
+        return os.path.join(base, "quota-router", "bin")
+    base = env.get("XDG_DATA_HOME") or os.path.join(home(), ".local", "share")
+    return os.path.join(base, "quota-router", "bin")
+
+
+def launcher_name(platform=None):
+    """File name of the launcher: a POSIX sh script `claude`, or a batch file `claude.cmd` on Windows."""
+    return "claude.cmd" if (platform or system()) == "windows" else "claude"
+
+
+def executable_names(name, platform=None, env=None):
+    """The file names a shell would accept for program `name`: the name itself, and on Windows every
+    PATHEXT suffix (`claude.exe`, `claude.cmd`, …) in PATHEXT order."""
+    if (platform or system()) != "windows":
+        return [name]
+    env = os.environ if env is None else env
+    suffixes = [s for s in (env.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(";") if s]
+    return [name + suffix.lower() for suffix in suffixes]
+
+
 # ---- shell text ---------------------------------------------------------------
 def shell_quote(path):
     """A path as exactly one word of a POSIX shell command, whatever characters it contains.
@@ -354,20 +384,52 @@ def claude_credentials(config_dir, run):
 
     `config_dir` None means the default location. Read-only: nothing is refreshed
     or written back. `run` is the same budget-aware runner as in list_processes().
-    macOS: the login keychain, through `security find-generic-password`; when it
-    has no entry (Claude Code itself falls back to a file when the keychain is
-    locked, for example over SSH), <config_dir or ~/.claude>/.credentials.json.
-    Linux and Windows: that file only.
+    macOS: the login keychain, through `security find-generic-password`. One service
+    name can hold several items (one with the account "unknown" that has only MCP
+    logins, one under the user's name with `claudeAiOauth`), and `security` returns
+    whichever it finds first, so the item of the user's account is asked for first,
+    then any item of the service (not after a query that got no answer in time). When neither holds `claudeAiOauth` (Claude Code
+    itself falls back to a file when the keychain is locked, for example over SSH):
+    <config_dir or ~/.claude>/.credentials.json, and failing that whatever the keychain
+    returned. Linux and Windows: that file only.
     """
+    found = []
     if system() == "darwin":
-        result = run(["security", "find-generic-password", "-s", keychain_service(config_dir), "-w"])
-        if result is not None and result.returncode == 0 and result.stdout.strip():
-            return result.stdout
+        service = keychain_service(config_dir)
+        queries = [["security", "find-generic-password", "-a", user, "-s", service, "-w"] for user in login_names()]
+        for argv in queries + [["security", "find-generic-password", "-s", service, "-w"]]:
+            result = run(argv)
+            if result is None:
+                break                    # no answer in time (or no `security`): asking again would only wait again
+            if result.returncode == 0 and result.stdout.strip():
+                if has_claude_login(result.stdout):
+                    return result.stdout
+                found.append(result.stdout)
     try:
         with open(credentials_file(config_dir), encoding="utf-8") as f:
-            return f.read()
+            text = f.read()
+        if has_claude_login(text) or not found:
+            return text
     except (OSError, ValueError):
-        return None
+        pass
+    return found[0] if found else None
+
+
+def login_names():
+    """The user name the keychain items are filed under; empty when it cannot be told."""
+    import getpass
+    try:
+        name = getpass.getuser()
+    except Exception:
+        return []
+    return [name] if name else []
+
+
+def has_claude_login(text):
+    try:
+        return isinstance(json.loads(text).get("claudeAiOauth"), dict)
+    except (ValueError, AttributeError):
+        return False
 
 
 def credentials_file(config_dir):

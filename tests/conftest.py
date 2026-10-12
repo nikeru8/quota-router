@@ -67,7 +67,8 @@ dir = "~/.codex-b"
 """
 
 SCRUBBED = ("QR_CONFIG", "QR_STATE", "QR_LANG", "QR_ALLOW_CREDITS", "QR_NO_PROBE", "XDG_STATE_HOME", "XDG_CONFIG_HOME",
-            "APPDATA", "LOCALAPPDATA", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "CLAUDECODE", "CLAUDE_SESSION_ID")
+            "XDG_DATA_HOME", "ZDOTDIR", "APPDATA", "LOCALAPPDATA", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "CLAUDECODE",
+            "CLAUDE_SESSION_ID")
 
 
 @pytest.fixture(autouse=True)
@@ -138,6 +139,7 @@ def router(home, write_config, monkeypatch):
     monkeypatch.setattr(core, "codex_reading", reading)
     real_running_jobs = core.running_jobs
     monkeypatch.setattr(core, "running_jobs", lambda: {})
+    monkeypatch.setattr(core, "running_sessions", lambda: {})
     monkeypatch.setattr(core.subprocess, "run", blocked)
     monkeypatch.setattr(core, "open_url", blocked)
     monkeypatch.setattr(core.urllib.request, "urlopen", blocked)

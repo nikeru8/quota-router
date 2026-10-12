@@ -38,6 +38,7 @@ SETTINGS = [
     ("timing", "notice_ttl_hours", 6),
     ("events", "reset_drop_points", 3),
     ("families.claude", "scarce_model", "fable"),
+    ("launch", "route_print", False),
     ("endpoints", "claude_usage", "https://api.anthropic.com/api/oauth/usage"),
     ("endpoints", "claude_profile", "https://api.anthropic.com/api/oauth/profile"),
     ("endpoints", "codex_usage", "https://chatgpt.com/backend-api/wham/usage"),
@@ -118,7 +119,7 @@ def _check_type(name, value, default):
         raise ValueError(f"{name} must be {want}, got {value!r}")
 
 
-ACCOUNT_FIELDS = ("family", "key", "dir")
+ACCOUNT_FIELDS = ("family", "key", "dir", "launch")
 
 
 def _accounts(raw, warnings=None):
@@ -149,6 +150,11 @@ def _accounts(raw, warnings=None):
         path = expand_dir(raw_dir) if raw_dir.strip() else None
         if path is not None and not os.path.isabs(path):
             raise ValueError(f"{where}: dir must be absolute or start with ~, got {raw_dir!r}")
+        launch = item.get("launch", True)
+        if not isinstance(launch, bool):
+            raise ValueError(f"{where}: launch must be true or false, got {launch!r}")
+        if "launch" in item and family != "claude" and warnings is not None:
+            warnings.append(f'"launch" in {where} only applies to Claude accounts (ignored)')
         # Naming the default location explicitly means the same thing as leaving dir empty.
         is_default = path is None or os.path.realpath(path) == os.path.realpath(default_dir(family))
         if is_default:
@@ -156,6 +162,8 @@ def _accounts(raw, warnings=None):
                 raise ValueError(f'{where} and "{defaults[family]}" both use the default {family} location')
             defaults[family] = key
         accounts.append({"family": family, "key": key, "raw_dir": raw_dir, "default": is_default,
+                         # whether `qr launch` may start an interactive session here (Claude only).
+                         "launch": launch and family == "claude",
                          # Claude: None means "leave CLAUDE_CONFIG_DIR unset". Codex always gets a real path.
                          "dir": (None if family == "claude" else default_dir(family)) if is_default else path})
     return accounts

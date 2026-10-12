@@ -1,9 +1,11 @@
 """`qr install`, `qr uninstall` and `qr doctor`.
 
-install/uninstall edit one file, Claude Code's settings.json, and only the one
-PreToolUse entry that belongs to this tool. doctor only looks: it checks that
-files exist, never what is in a credential.
+install/uninstall edit Claude Code's settings.json, and only the one PreToolUse
+entry that belongs to this tool, plus the `claude` launcher file this tool
+writes in its own directory. doctor only looks: it checks that files exist,
+never what is in a credential.
 """
+import hashlib
 import json
 import os
 import re
@@ -14,7 +16,7 @@ import sys
 import tempfile
 import time
 
-from . import config, core, platform_compat
+from . import config, core, launch, platform_compat
 from .i18n import t
 
 ENTRY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "__main__.py")
@@ -77,14 +79,15 @@ def known_pairs(path):
     return None   # nothing recorded for this file: is_ours() falls back to the exact invocation of this package
 
 
-def remember(path, installed):
-    """Record (installed=True) or forget what was put into this settings file. Failing to is not an error:
-    the entry for the current interpreter and location is recognised without the record."""
+def remember(path, installed, entry=None):
+    """Record (installed=True) or forget what was put into this settings file, or with `entry`, what was written
+    to the launcher file. Failing to is not an error: what the current interpreter and location would write is
+    recognised without the record."""
     try:
         record = read_record()
         key = os.path.normcase(os.path.abspath(path))
         if installed:
-            record[key] = {"python": sys.executable, "entry": ENTRY_FILE, "args": hook_entry()["args"]}
+            record[key] = entry or {"python": sys.executable, "entry": ENTRY_FILE, "args": hook_entry()["args"]}
         elif record.pop(key, None) is None:
             return
         os.makedirs(os.path.dirname(record_path()), exist_ok=True)
@@ -341,6 +344,242 @@ def installed_state(config_dir=None):
     return "absent", None
 
 
+# ---- the `claude` launcher ---------------------------------------------------------------
+# A small script named `claude` in a directory of its own (platform_compat.default_launcher_dir). Put first on
+# PATH, it runs `qr launch` with the same interpreter and entry file as the hook, and that starts the real claude
+# on the roomiest account. The record holds a hash of the exact text written: only that file, unchanged, is ours.
+LAUNCHER_LIMIT = 64 * 1024
+
+
+def launcher_path():
+    return os.path.join(platform_compat.default_launcher_dir(), platform_compat.launcher_name())
+
+
+def launcher_text(python=None, entry=None, platform=None):
+    """The launcher file. It must never be the reason `claude` does not start: when the interpreter or the package
+    is gone, the package is an older one without `qr launch`, or quota-router fails, it starts the first other
+    `claude` on PATH unchanged.
+
+    POSIX: `qr launch --resolve` only answers which claude to start and with which CLAUDE_CONFIG_DIR; the sh
+    script starts it with `exec`, so claude takes over the process, its terminal and its signals."""
+    python, entry = python or sys.executable, entry or ENTRY_FILE
+    if (platform or platform_compat.system()) == "windows":
+        import ntpath
+        package = ntpath.join(ntpath.dirname(entry), "launch.py")
+        return "\r\n".join([
+            "@echo off",
+            f"rem {launch.MARKER}: starts claude on the account with the most quota left (qr launch).",
+            "rem Written by `qr install`; `qr uninstall` removes it. Without a working quota-router it starts claude as it is.",
+            "setlocal",
+            f'if exist "{python}" if exist "{entry}" if exist "{package}" goto quota_router',
+            "goto plain",
+            ":quota_router",
+            f'"{python}" {" ".join(INTERPRETER_FLAGS)} "{entry}" launch -- %*',
+            "exit /b %ERRORLEVEL%",
+            ":plain",
+            "for /f \"delims=\" %%C in ('where claude 2^>nul') do if /i not \"%%~dpC\"==\"%~dp0\" (set \"QR_CLAUDE=%%C\" & goto found)",
+            "echo quota-router: no claude executable found on PATH apart from the launcher 1>&2",
+            "exit /b 127",
+            ":found",
+            '"%QR_CLAUDE%" %*',
+            "exit /b %ERRORLEVEL%", ""])
+    return "\n".join([
+        "#!/bin/sh",
+        f"# {launch.MARKER}: starts claude on the account with the most quota left (`qr launch`).",
+        "# Written by `qr install`; `qr uninstall` removes it. Without a working quota-router it starts claude as it is.",
+        f"qr_python={shlex.quote(python)}",
+        f"qr_entry={shlex.quote(entry)}",
+        'qr_self=${0%/*}',
+        'if [ -x "$qr_python" ] && [ -f "$qr_entry" ] &&',
+        f'   qr_answer=$("$qr_python" {" ".join(INTERPRETER_FLAGS)} "$qr_entry" launch --resolve -- "$@"); then',
+        '  { IFS= read -r qr_tag; IFS= read -r qr_action; IFS= read -r qr_dir; IFS= read -r qr_program; } <<QR_END',
+        "$qr_answer",
+        "QR_END",
+        f'  if [ "$qr_tag" = "{launch.RESOLVED}" ] && [ -x "$qr_program" ]; then',
+        "    case $qr_action in",
+        "      set) CLAUDE_CONFIG_DIR=$qr_dir; export CLAUDE_CONFIG_DIR ;;",
+        "      unset) unset CLAUDE_CONFIG_DIR ;;",
+        "    esac",
+        '    exec "$qr_program" "$@"',
+        "  fi",
+        "fi",
+        "# quota-router did not answer: the first other claude on PATH, as it is.",
+        "set -f",
+        "qr_ifs=$IFS",
+        "IFS=:",
+        "for qr_dir in $PATH; do",
+        '  case $qr_dir in /*) ;; *) continue ;; esac',
+        '  [ "$qr_dir" = "$qr_self" ] && continue',
+        '  if [ -f "$qr_dir/claude" ] && [ -x "$qr_dir/claude" ] &&',
+        f"     ! dd if=\"$qr_dir/claude\" bs=512 count=1 2>/dev/null | grep -q '{launch.MARKER}'; then",
+        "    IFS=$qr_ifs",
+        "    set +f",
+        '    exec "$qr_dir/claude" "$@"',
+        "  fi",
+        "done",
+        'echo "quota-router: no claude executable found on PATH apart from the launcher" >&2',
+        "exit 127", ""])
+
+
+def text_hash(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def read_launcher(path):
+    """The launcher file's bytes; None when there is no file. A file too big to be a launcher is read only in part."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(LAUNCHER_LIMIT + 1)
+    except FileNotFoundError:
+        return None
+
+
+def launcher_is_ours(path, data):
+    """The file is exactly what an earlier `qr install` recorded writing there, or what this one would write."""
+    saved = read_record().get(os.path.normcase(os.path.abspath(path)))
+    recorded = saved.get("sha256") if isinstance(saved, dict) else None
+    return data == launcher_text().encode("utf-8") or (isinstance(recorded, str) and text_hash(data) == recorded)
+
+
+def executable(path):
+    return platform_compat.system() == "windows" or os.access(path, os.X_OK)
+
+
+def install_launcher():
+    """Write the launcher. Returns (status, path): 'added', 'updated', 'unchanged', or 'foreign' when a file this
+    installation did not write (or that was edited since) is in the way; that file is left alone."""
+    path = launcher_path()
+    wanted = launcher_text().encode("utf-8")
+    current = read_launcher(path)
+    if current is not None and current != wanted and not launcher_is_ours(path, current):
+        return "foreign", path
+    if current == wanted and executable(path):
+        remember(path, True, launcher_record(wanted))
+        return "unchanged", path
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(prefix=".claude.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(handle, "wb") as f:
+            f.write(wanted)
+        os.chmod(temporary, 0o755)
+        platform_compat.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    remember(path, True, launcher_record(wanted))
+    return ("added" if current is None else "updated"), path
+
+
+def launcher_record(data):
+    return {"launcher": True, "python": sys.executable, "entry": ENTRY_FILE, "sha256": text_hash(data)}
+
+
+def uninstall_launcher():
+    """Remove the launcher if it is ours and unchanged. Returns (status, path): 'removed', 'absent' or 'kept'.
+    The directory is left in place: it may be on PATH, and an empty directory there does no harm."""
+    path = launcher_path()
+    current = read_launcher(path)
+    if current is None:
+        remember(path, False)
+        return "absent", path
+    if not launcher_is_ours(path, current):
+        return "kept", path
+    os.unlink(path)
+    remember(path, False)
+    return "removed", path
+
+
+def path_dirs(path=None):
+    path = os.environ.get("PATH", "") if path is None else path
+    return [platform_compat.canonical(d.strip('"')) for d in path.split(os.pathsep) if d.strip('"') and os.path.isabs(d.strip('"'))]
+
+
+def launcher_order(path=None):
+    """('ok' | 'missing' | 'late', the real claude or None): whether the launcher's directory is on PATH ahead of
+    the claude it stands in for."""
+    dirs = path_dirs(path)
+    mine = platform_compat.canonical(platform_compat.default_launcher_dir())
+    real = launch.real_claude(path)
+    if mine not in dirs:
+        return "missing", real
+    if real and dirs.index(platform_compat.canonical(os.path.dirname(real))) < dirs.index(mine):
+        return "late", real
+    return "ok", real
+
+
+def path_line():
+    """What to add to PATH: a shell line on macOS and Linux (with $HOME when the directory is under it), the
+    directory itself on Windows."""
+    directory = platform_compat.default_launcher_dir()
+    if platform_compat.system() == "windows":
+        return directory
+    home = platform_compat.home().rstrip("/")
+    rest = directory[len(home):] if home and directory.startswith(home + "/") else None
+    if rest is not None and re.fullmatch(r"[A-Za-z0-9_./+-]+", rest):
+        return f'export PATH="$HOME{rest}:$PATH"'
+    return f'export PATH={shlex.quote(directory)}:"$PATH"'
+
+
+def path_hint():
+    if launcher_order()[0] == "ok":
+        return None
+    key = "install.path_hint_windows" if platform_compat.system() == "windows" else "install.path_hint"
+    return t(key, line=path_line())
+
+
+# ---- shell aliases that would get in the way ---------------------------------------------
+RC_FILES = (".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile", ".bash_aliases", ".profile")
+ALIAS = re.compile(r"^\s*alias\s+(?:-\S+\s+)*(?:\S+=\S*\s+)*claude=(.*)$")
+FUNCTION = re.compile(r"^\s*(?:function\s+claude\b|claude\s*\(\s*\))")
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def rc_files():
+    """The shell startup files to look at: zsh's under $ZDOTDIR when that is set."""
+    home = platform_compat.home()
+    zsh = os.environ.get("ZDOTDIR") or home
+    return [os.path.join(zsh if name.startswith(".z") else home, name) for name in RC_FILES]
+
+
+def alias_verdict(value):
+    """(verdict, program) for the text after `alias claude=`: 'through' when it still runs `claude` found on
+    PATH (an alias is not expanded again inside itself, so the shell looks `claude` up on PATH and finds the
+    launcher), 'named' when it sets CLAUDE_CONFIG_DIR, 'bypass' when it runs anything else."""
+    try:
+        body = shlex.split(value, comments=True)
+        words = shlex.split(body[0]) if body else []
+    except ValueError:
+        return "bypass", value.strip()
+    named = False
+    while words and (ASSIGNMENT.match(words[0]) or words[0] in ("command", "env", "noglob", "nocorrect", "exec")):
+        named = named or words[0].startswith("CLAUDE_CONFIG_DIR=")
+        words.pop(0)
+    if named:
+        return "named", "claude"
+    program = words[0] if words else ""
+    return ("through", program) if program == "claude" else ("bypass", program or value.strip())
+
+
+def shell_overrides():
+    """[(file, line number, line, verdict, program)] for each alias or function named claude in the shell
+    startup files. Only those lines are kept; they are shown with secrets masked."""
+    found = []
+    for path in rc_files():
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = f.read(1024 * 1024).splitlines()
+        except OSError:
+            continue
+        for number, text in enumerate(lines, 1):
+            match = ALIAS.match(text)
+            if match:
+                found.append((path, number, text, *alias_verdict(match[1])))
+            elif FUNCTION.match(text):
+                found.append((path, number, text, "function", "claude"))
+    return found
+
+
 # ---- running the installed command once -----------------------------------------------
 SELF_TEST_EVENT = {"tool_name": "Bash", "tool_input": {"command": "true"}, "quota_router_self_test": True}
 SELF_TEST_TIMEOUT = 20
@@ -406,8 +645,26 @@ def run(action, argv):
                 print("WARN    " + t("doctor.run.stderr", text=text), file=sys.stderr)
             # settings.json is written, but a hook that does not answer routes nothing: scripts must be able to tell.
             raise SystemExit(1)
+    if "--no-launcher" not in argv and config_dir is None:
+        # one launcher serves every account: `--config-dir` is about one settings.json and leaves it alone.
+        run_launcher(action is install)
     if status in ("added", "updated"):
         print(t("install.next"))
+
+
+def run_launcher(installing):
+    """The launcher half of `qr install` / `qr uninstall`. It never edits a shell startup file: when the
+    launcher's directory is not first on PATH, the line to add is printed instead."""
+    try:
+        status, path = install_launcher() if installing else uninstall_launcher()
+    except OSError as error:
+        print(t("install.launcher.failed", path=launcher_path(), detail=error.strerror or type(error).__name__), file=sys.stderr)
+        raise SystemExit(2)
+    print(t("install.launcher." + status, path=path))
+    if installing and status != "foreign":
+        hint = path_hint()
+        if hint:
+            print(hint)
 
 
 def install_command(argv):
@@ -455,6 +712,8 @@ def doctor(argv):
         line(bool(bash), t("doctor.bash_ok", path=bash) if bash else t("doctor.bash_missing"))
     for family in config.FAMILIES:
         found = shutil.which(family)
+        if family == "claude" and found and launch.is_launcher(found):
+            found = launch.real_claude()              # the launcher is not the CLI; say where the real one is
         if cfg is None or cfg.family(family):
             line(bool(found), t("doctor.cli_ok", name=family, path=found) if found else t("doctor.cli_missing", name=family))
     hook_dirs = [None]
@@ -490,6 +749,82 @@ def doctor(argv):
         line(bool(ok), t("doctor.run.ok", path=target) if ok else t("doctor.run.bad", path=target, detail=detail))
         for text in ([] if ok else stderr):
             line(False, "  " + t("doctor.run.stderr", text=text))
+    doctor_launcher(line, cfg)
+
+
+def doctor_launcher(line, cfg):
+    """The launcher: present, ours and executable; ahead of the real claude on PATH; not bypassed by a shell
+    alias; and at least one Claude account it can start a session on, with a reading on file."""
+    path = launcher_path()
+    try:
+        data = read_launcher(path)
+    except OSError:
+        data = b""                                    # something unreadable in the launcher's place: not ours
+    if data is None:
+        line(False, t("doctor.launcher.absent", path=path))
+        return
+    if not launcher_is_ours(path, data):
+        line(False, t("doctor.launcher.foreign", path=path))
+    elif not executable(path):
+        line(False, t("doctor.launcher.not_executable", path=path))
+    else:
+        line(True, t("doctor.launcher.ok", path=path))
+    order, real = launcher_order()
+    directory = platform_compat.default_launcher_dir()
+    if real is None:
+        line(False, t("doctor.launcher.no_real"))
+    elif order == "ok":
+        line(True, t("doctor.launcher.path_ok", dir=directory, claude=real))
+    else:
+        line(False, t("doctor.launcher.path_missing" if order == "missing" else "doctor.launcher.path_late",
+                      dir=directory, claude=real, line=path_line()))
+    overrides = shell_overrides()
+    if not overrides:
+        line(True, t("doctor.alias.none", files=", ".join(rc_files())))
+    for file, number, text, verdict, program in overrides:
+        values = {"file": file, "number": number, "text": core.redact(text.strip())[:200], "program": program}
+        line(verdict == "through", t("doctor.alias." + verdict, **values))
+    ok, detail, stderr = try_launcher(path)
+    line(ok, t("doctor.launcher.runs", output=detail) if ok else t("doctor.launcher.does_not_run", path=path, detail=detail))
+    for text in ([] if ok else stderr):
+        line(False, "  " + t("doctor.run.stderr", text=text))
+    if cfg is None or not cfg.family("claude"):
+        return
+    ready = launch.readiness(cfg)
+    for account in cfg.family("claude"):
+        if ready[account["key"]] == "no-hook":
+            hint = "qr install" + ("" if account["dir"] is None else " --config-dir " + platform_compat.shell_quote(account["dir"]))
+            line(False, t("doctor.launch.no_hook", account=account["key"], command=hint))
+    accounts = [key for key, why in ready.items() if why is None]
+    if not accounts:
+        line(False, t("doctor.launch.none"))
+        return
+    try:
+        with open(os.path.join(config.state_dir()[0], "cache.json"), encoding="utf-8") as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    read = [key for key in accounts if isinstance(cache, dict) and isinstance(cache.get(key), dict) and cache[key].get("usage")]
+    if read:
+        line(True, t("doctor.launch.ok", keys=", ".join(accounts), read=", ".join(read)))
+    else:
+        line(False, t("doctor.launch.no_reading", keys=", ".join(accounts)))
+
+
+def try_launcher(path):
+    """Run the launcher once with `--version`, as a terminal would: (ok, first line of its output or why not,
+    first lines of stderr). `--version` passes straight through to the real claude."""
+    try:
+        result = subprocess.run([path, "--version"], stdin=subprocess.DEVNULL, capture_output=True, timeout=SELF_TEST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, t("doctor.run.timeout", seconds=SELF_TEST_TIMEOUT), []
+    except OSError as error:
+        return False, t("doctor.run.not_started", detail=error.strerror or type(error).__name__), []
+    stderr = [text.strip()[:200] for text in result.stderr.decode("utf-8", "replace").splitlines() if text.strip()][:3]
+    output = next((text.strip()[:100] for text in result.stdout.decode("utf-8", "replace").splitlines() if text.strip()), "")
+    if result.returncode == 0 and output:
+        return True, output, stderr
+    return False, t("doctor.launcher.exit", code=result.returncode), stderr
 
 
 def check_lock(state):

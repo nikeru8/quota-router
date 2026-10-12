@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Sessions start on the roomiest account.** `qr install` also writes a `claude` launcher (`~/.local/share/quota-router/bin/claude`, or under `$XDG_DATA_HOME`; Windows `claude.cmd` under `%LOCALAPPDATA%`, untested). With its directory first on `PATH`, `claude` typed in a terminal asks `qr launch` for the Claude account, by the hook's scoring, and starts the real claude there. There is no lead to protect at that point. Only accounts set up for sessions are candidates: `launch` not `false`, and the quota-router hook in that directory's `settings.json` (each directory has its own settings; quota-router does not copy them). Interactive sessions already running on an account count as jobs there, and an account whose quota can be read comes before one whose quota cannot. A resumed conversation starts on the account that holds it; `--continue` uses a record of the sessions started through the launcher in that directory, so it is not misled by a dispatch the hook sent elsewhere. When stderr is a terminal, one line says where the session went and why.
+- **`qr launch [--] <claude arguments>`**, the command behind the launcher. It never refuses to start a session: when nothing fits, nothing can be read, the config is broken, it fails or it takes too long, claude starts on the default account with a line saying why, and `⚠ PAID OVERAGE` when that account would bill. `--help`, `--version`, `--bg`, subcommands (`claude mcp …`), `claude -p …`, a `CLAUDE_CONFIG_DIR` already set and commands inside a Claude Code session pass through untouched.
+- **The launcher never stands in the way.** When the Python it was installed with is gone, the package is removed or is an older version without `qr launch`, or quota-router fails, it starts the first other `claude` on `PATH` unchanged.
+- `launch = false` in an `[[accounts]]` table keeps new sessions off that account. `[launch] route_print = true` routes `claude -p` started outside Claude Code as well.
+- `qr install --no-launcher` installs the hook only; `qr uninstall` removes the launcher when it is exactly the file `qr install` wrote (`--no-launcher` keeps it). With `--config-dir`, neither touches the launcher. Neither edits a shell startup file; `qr install` prints the `PATH` line to add.
+- `qr doctor` checks the launcher, runs `claude --version` through it, its place on `PATH`, `claude` aliases and functions in the shell startup files that would bypass it, accounts listed without a hook, and that some account can take new sessions. `qr status` and `qr config` name accounts passed over for missing the hook.
+- `decisions.log` source `qr launch`, with kinds `launch`, `launch-resume` and `launch-default`.
+
+### Fixed
+
+- **macOS: the login at the default location could read as "not logged in".** A keychain service can hold two items, one with only MCP logins (account `unknown`) and one with the Claude login (account = your user name), and `security find-generic-password -s` returned the first. The item filed under your user name is now asked for first, then any item of the service, then `.credentials.json`; the first with a Claude login is used. This affects the hook, `qr status` and the launcher alike.
+
+### Not changed
+
+- The hook routes dispatches exactly as before; in particular it does not count interactive sessions as busy, and it treats an unreadable account as before. A session still runs on one account from start to end: subagents from the Agent tool and workflows are not moved mid-session.
+
+### Known issues
+
+Found in review, not fixed yet:
+
+- `qr doctor` does not notice `CLAUDE_CONFIG_DIR` exported in a shell startup file or already in its environment; with it set, every `claude` passes through the launcher unrouted.
+- `qr doctor` only reads the startup files it names; a `claude` alias or function in a file they `source` is not seen.
+- Windows: a choice abandoned after the time limit keeps running in a background thread next to claude (on macOS and Linux claude replaces the process); and `claude.cmd` passes its arguments on with `%*`, which `cmd` re-parses, so arguments with `"`, `%`, `^` or `&` may arrive changed. The Windows launcher is untested on a real machine.
+
 ## 0.1.0
 
 First public version. It is a port of a tool that has been routing subagents on one macOS machine, with everything specific to that machine moved into a config file.

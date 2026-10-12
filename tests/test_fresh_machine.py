@@ -170,9 +170,32 @@ def test_install_and_first_dispatch_on_a_fresh_machine(tmp_path, vendors):
     listed = run(qr, "decisions")
     assert listed.returncode == 0 and "claude-b" in listed.stdout
 
+    # `qr install` also wrote the claude launcher and said how to put it on PATH. Typed in a terminal, `claude`
+    # now starts the real claude (a stand-in that prints what it got) on the roomiest account.
+    launcher = home / ".local" / "share" / "quota-router" / "bin" / "claude"
+    assert launcher.exists() and 'export PATH="$HOME/.local/share/quota-router/bin:$PATH"' in added.stdout
+    (stand_ins / "claude").write_text('#!/bin/sh\necho "dir=${CLAUDE_CONFIG_DIR-unset} args=$*"\n')
+    (stand_ins / "claude").chmod(0o755)
+    terminal = dict(env, PATH=f"{launcher.parent}{os.pathsep}{env['PATH']}")
+
+    def claude(*args):
+        return subprocess.run(["claude", *args], env=terminal, cwd=str(home), capture_output=True, text=True,
+                              encoding="utf-8", timeout=120)
+
+    # ~/.claude-b has no hook yet, so no session lands there: main is the only account set up for sessions.
+    started = claude("--model", "opus", "fix it")
+    assert started.returncode == 0 and started.stdout == "dir=unset args=--model opus fix it\n", started.stderr
+    second = run(qr, "install", "--config-dir", str(home / ".claude-b"))
+    assert second.returncode == 0 and "claude launcher" not in second.stdout, second.stderr
+    started = claude("--model", "opus", "fix it")
+    assert started.returncode == 0 and started.stdout == f"dir={home / '.claude-b'} args=--model opus fix it\n", started.stderr
+    assert started.stderr == ""                                             # not a terminal: no extra line
+    assert "| qr launch | lead=- | sess=- | claude | launch | pick=claude-b |" in (state / "decisions.log").read_text()
+    assert run(qr, "uninstall", "--config-dir", str(home / ".claude-b")).returncode == 0 and launcher.exists()
+
     # And it comes out again without leaving anything behind in settings.json.
     removed = run(qr, "uninstall")
     assert removed.returncode == 0, removed.stderr
-    assert "quota_router" not in settings.read_text()
+    assert "quota_router" not in settings.read_text() and not launcher.exists()
     silent = run(qr, "hook", input=json.dumps(dict(event, tool_input={"command": "ls"})))
     assert (silent.returncode, silent.stdout, silent.stderr) == (0, "", "")

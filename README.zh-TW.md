@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-quota-router 是一個 Claude Code hook，幫你把子代理的工作分到不同的訂閱帳號上。你的 session 準備執行 `claude -p "summarize the diff" --model opus` 時，hook 會先查你列出的每個帳號還剩多少額度，改成在最寬裕的那個帳號上執行 `env CLAUDE_CONFIG_DIR=/home/you/.claude-b claude -p "summarize the diff" --model opus`；沒有帳號接得下、或這件工作會花到付費點數時，它會擋下指令並說明原因。它只處理 Claude Code session 透過 Bash 工具執行的 `claude -p` 和 `codex exec`。session 本身始終待在它自己那一個帳號上，用內建 Agent／Task 工具或 workflow 開的子代理也跟著它留在原帳號。
+quota-router 是一個 Claude Code hook，幫你把子代理的工作分到不同的訂閱帳號上。你的 session 準備執行 `claude -p "summarize the diff" --model opus` 時，hook 會先查你列出的每個帳號還剩多少額度，改成在最寬裕的那個帳號上執行 `env CLAUDE_CONFIG_DIR=/home/you/.claude-b claude -p "summarize the diff" --model opus`；沒有帳號接得下、或這件工作會花到付費點數時，它會擋下指令並說明原因。在 session 裡，它只處理透過 Bash 工具執行的 `claude -p` 和 `codex exec`。`qr install` 另外會寫一個 `claude` 啟動器，所以你在終端機打 `claude` 開的 session，會開在剩餘額度最多的 Claude 帳號上。一個 session 就是一個帳號：session 跑起來之後不會被搬走，用內建 Agent／Task 工具或 workflow 開的子代理也跟著它留在那個帳號。
 
 每條被分流的指令，session 都會看到一行像這樣的附註：
 
@@ -54,7 +54,7 @@ Homebrew、Debian 和多數發行版的 Python 會回 "externally-managed-enviro
 
    設定檔裡每個帳號在 `qr status` 都有額度讀數，就完成了。只留下有讀數的帳號。
 
-3. **把 hook 加進每一個會派工的 Claude Code 帳號：**
+3. **把 hook 加進每一個會派工、或想開 session 的 Claude Code 帳號。** 第一行同時會寫入 `claude` 啟動器：
 
    ```sh
    qr install                              # ~/.claude/settings.json
@@ -79,6 +79,14 @@ Homebrew、Debian 和多數發行版的 Python 會回 "externally-managed-enviro
 
    工具回覆裡有一行以 `[quota-router] Automatically routed to`（中文介面是 `[帳號分流] 已自動改用`）開頭，就成功了。`qr decisions` 可以看每次怎麼決定、為什麼。
 
+6. **讓 session 經過啟動器開。** 把 `qr install` 印出的那行 `PATH` 自己加進 `~/.zshrc` 或 `~/.bashrc`（quota-router 不會改這些檔），例如：
+
+   ```sh
+   export PATH="$HOME/.local/share/quota-router/bin:$PATH"
+   ```
+
+   `qr doctor` 的啟動器那幾行都是 `OK`、在新的終端機打 `claude` 時 session 開始前先印一行 `[quota-router]` 開頭的說明（`session on <帳號>`，或為什麼用了預設帳號；中文介面是 `[帳號分流]`），而且 `qr decisions` 出現 `qr launch` 那一行，就完成了。
+
 ## 怎麼挑帳號
 
 - **只在同一家裡挑。** 用 Claude 還是 Codex 由你決定，hook 只決定用哪個帳號。另一家的額度只當建議附上。
@@ -91,13 +99,22 @@ Homebrew、Debian 和多數發行版的 Python 會回 "externally-managed-enviro
 - **你寫明的帳號就照用。** `CLAUDE_CONFIG_DIR=… claude -p …`、`CODEX_HOME=… codex exec …` 照原樣執行；那個帳號本來會被跳過時，附一句警告。
 - **出錯就放行。** quota-router 自己出錯、或超過時間預算時，指令照原樣執行。
 
-完整規則和所有例外：[REFERENCE.md › How it decides](docs/REFERENCE.md#how-it-decides)。
+經過啟動器開的新 session，分數和跳過的規則都一樣，差別在：
+
+- **不保護主 session。** session 剛開始時還沒有主 session。已經在跑的互動 session 會算進那個帳號的工作數。
+- **只挑設定好的帳號。** `launch` 不是 `false`、而且那個目錄的 `settings.json` 裝了 quota-router hook，才會是候選。查得到額度的帳號排在查不到的前面。
+- **一次性的執行照原樣跑。** 在 Claude Code 外面執行的 `claude -p`，除非設了 `[launch] route_print = true`，否則照原樣執行；`--help`、`--version`、子指令、已經設好的 `CLAUDE_CONFIG_DIR`、在 Claude Code session 裡跑的指令也一樣。
+- **接續對話留在原帳號。** `--resume <id>` 開在存放那段對話的帳號。`-c`／`--continue` 會去這個目錄最近一次由啟動器開的 session 所在的帳號；沒經過啟動器開的 session，它不會知道。
+- **一定會開得起來。** 沒有帳號合適、什麼都讀不到、或設定檔壞了時，claude 開在預設帳號，並用一行說明原因（那個帳號會扣錢時附 `⚠ PAID OVERAGE`）。quota-router 自己跑不起來時，啟動器會直接啟動 `PATH` 上下一個 `claude`，不做任何改動。
+
+完整規則和所有例外：[REFERENCE.md › How it decides](docs/REFERENCE.md#how-it-decides) 與 [› Sessions and the claude launcher](docs/REFERENCE.md#sessions-and-the-claude-launcher)。
 
 ## 它讀什麼、送什麼、改什麼
 
 - 它會讀每個帳號的登入 token（唯讀），只送到該廠商自己的用量端點。它不會更新、改寫或複製 token，也不送任何遙測資料。
 - 即時查 Codex 失敗、而且本機數字已經超過兩小時，它會在背景用那個帳號跑一次很小的 `codex exec` 來更新數字。設 `QR_NO_PROBE=1` 可以關掉。
 - hook 在每條 Bash 指令執行前都會跑，而且可以改寫指令。它只會加上帳號前綴，或擋下整條指令。前幾次派工之後，請看一下 `qr decisions`。
+- 在它自己的狀態目錄之外，它只寫兩樣東西：你安裝進去的每個 `settings.json` 裡的 hook 設定，和 `claude` 啟動器檔案。
 - 能改設定檔的人就能把你的 token 導去別的地方，所以請像保護 `settings.json` 一樣保護它。
 
 ## 實際最容易踩到的限制
@@ -105,8 +122,9 @@ Homebrew、Debian 和多數發行版的 Python 會回 "externally-managed-enviro
 - **接續對話寫成 `=`。** `--resume=ID` 會被當成新派工，可能被換到沒有那段對話的帳號。請寫 `--resume ID`。
 - **看不到的派工。** 寫在 `bash -c '…'`、`eval`、腳本裡，或餵給殼執行的 heredoc 裡的派工，hook 看不到：不分流，也不檢查會不會花點數。請在腳本裡自己呼叫 `qr pick <family> --env`。
 - **迴圈只會落在一個帳號。** `for` 迴圈或 `xargs` 算一次派工，整批都會派到同一個帳號。請在迴圈裡呼叫 `qr pick`。
-- **只接了 Bash 工具。** 用 Agent／Task 工具或 workflow 開的子代理，都跑在主 session 的帳號上。
-- **Windows 只支援 Git Bash，驗證最少。** Claude Code 用 PowerShell 工具跑的指令不會分流，正在跑的工作也算得比較不準。測試在 CI 的 Windows 上有跑，但日常使用目前都在 macOS。
+- **只接了 Bash 工具。** 用 Agent／Task 工具或 workflow 開的子代理，都跑在主 session 的帳號上，也就是 session 開始時啟動器挑的那個。
+- **帳號之間什麼都不同步。** 每個帳號目錄有自己的 `settings.json`、`CLAUDE.md`、MCP 伺服器、模型和權限設定，session 或派工落在哪個帳號，就用那個帳號的設定。
+- **Windows 只支援 Git Bash，驗證最少。** Claude Code 用 PowerShell 工具跑的指令不會分流，正在跑的工作也算得比較不準，`claude.cmd` 啟動器也還沒在真的 Windows 上測過。測試在 CI 的 Windows 上有跑，但日常使用目前都在 macOS。
 
 完整的對照表和每一種的改法：[REFERENCE.md › Known limitations](docs/REFERENCE.md#known-limitations)。
 
@@ -116,6 +134,7 @@ Homebrew、Debian 和多數發行版的 Python 會回 "externally-managed-enviro
 
 - 帳號、設定值、環境變數 → [REFERENCE.md › Configuration](docs/REFERENCE.md#configuration)
 - 每個安裝步驟在做什麼、為什麼 → [REFERENCE.md › Install notes](docs/REFERENCE.md#install-notes)
+- 啟動器：安裝紀錄、參數、`--continue`、退回預設帳號 → [REFERENCE.md › Sessions and the claude launcher](docs/REFERENCE.md#sessions-and-the-claude-launcher)
 - 所有指令，以及在腳本裡用 `qr pick` → [REFERENCE.md › Commands](docs/REFERENCE.md#commands)（也可以看 `qr --help`）
 - 每一種訊息和它的意思 → [REFERENCE.md › Messages you will see](docs/REFERENCE.md#messages-you-will-see)
 - 隱私：讀了什麼、送了什麼、記了什麼 → [REFERENCE.md › Privacy and security](docs/REFERENCE.md#privacy-and-security)

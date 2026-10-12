@@ -67,7 +67,8 @@ def test_config_prints_values_and_sources(write_config, home, monkeypatch, capsy
     assert any(line.startswith("protect_threshold       35         [config file]") for line in lines)
     assert any(line.startswith('language                "en"       [default]') for line in lines)
     assert any(line.startswith("other_idle              90         [default]") for line in lines)
-    assert f"claude  claude-main     CLAUDE_CONFIG_DIR unset (default location)  [config file]" in lines
+    # no hook in ~/.claude yet, so `qr launch` would pass this account over (review finding 2).
+    assert f"claude  claude-main     CLAUDE_CONFIG_DIR unset (default location)  (launch: hook missing)  [config file]" in lines
     assert f"codex   codex-2         CODEX_HOME={home / '.codex-b'}  [config file]" in lines
     for section, key, _ in config.SETTINGS:
         assert any(line.startswith(key + " ") for line in lines), key
