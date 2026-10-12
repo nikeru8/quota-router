@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from conftest import CONFIG, ROOT, child_env, default_config_file
+from conftest import CONFIG, ROOT, WINDOWS, child_env, default_config_file
 
 EXISTING = """{
     "model": "opus",
@@ -308,10 +308,15 @@ def test_installed_hook_runs_end_to_end(home):
 
 
 def test_python_m_entry_point(home):
+    """qr writes to a pipe in the console's encoding (on Windows the ANSI code page, e.g. cp1252; see REFERENCE.md,
+    "Console output"), so that is how its output is read here. Reading it as UTF-8 broke on Windows as soon as the
+    help text held a "…" (0x85 in cp1252)."""
+    import locale
     env = child_env(home, PYTHONPATH=ROOT)
-    result = subprocess.run([sys.executable, "-m", "quota_router", "--help"], env=env, capture_output=True, text=True,
-                            encoding="utf-8", timeout=60)
-    assert result.returncode == 0 and "qr install [--config-dir DIR]" in result.stdout and "qr doctor" in result.stdout
+    result = subprocess.run([sys.executable, "-m", "quota_router", "--help"], env=env, capture_output=True, timeout=60)
+    out = result.stdout.decode(locale.getencoding() if WINDOWS else "utf-8")
+    assert result.returncode == 0, result.stderr
+    assert "qr install [--config-dir DIR]" in out and "qr doctor" in out and "qr launch [--] [ARGS...]" in out
 
 
 # ---- doctor ---------------------------------------------------------------------------

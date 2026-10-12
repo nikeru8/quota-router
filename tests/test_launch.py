@@ -21,11 +21,25 @@ def accounts_set_up(request):
     """New sessions only land on account directories that carry the hook (review finding 2): with the router,
     both Claude directories of the fake home get it, as `qr install` and `qr install --config-dir` would write it."""
     if "router" not in request.fixturenames:
+        yield
         return
     from quota_router import install
     home = request.getfixturevalue("router").home
     install.install(None)
     install.install(str(home / ".claude-b"))
+    yield
+    # "fell back to the default account" must never hide a crash (a ModuleNotFoundError did once, on Windows):
+    # a failure of the choice leaves a `launch` line in hook-errors.log, and only tests that ask for it may.
+    errors = home / "state" / "hook-errors.log"
+    failed = [line for line in (errors.read_text(encoding="utf-8").splitlines() if errors.exists() else [])
+              if line.split(" | ")[1:2] == ["launch"]]
+    if failed and "launch_failure_expected" not in request.fixturenames:
+        pytest.fail("qr launch failed and fell back to the default account: " + "; ".join(failed))
+
+
+@pytest.fixture
+def launch_failure_expected():
+    """For the tests that make the choice fail on purpose (see accounts_set_up)."""
 
 
 def decisions(home):
@@ -249,7 +263,7 @@ def test_unreadable_quota_starts_on_the_default_account(router):
     assert leases(router.home) == [] and "no account could be read" in decisions(router.home)[-1]
 
 
-def test_an_internal_error_starts_on_the_default_account(router, monkeypatch):
+def test_an_internal_error_starts_on_the_default_account(router, monkeypatch, launch_failure_expected):
     from quota_router import launch
     monkeypatch.setattr(router.core, "read_family", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("secret detail")))
     directory, text = launch.choose(["fix it"])
@@ -466,29 +480,33 @@ class Started(Exception):
 
 @pytest.fixture
 def exec_spy(monkeypatch):
+    """Records how claude would be started: os.execve on macOS and Linux, a child process on Windows."""
+    from quota_router import launch
     calls = []
 
     def execve(program, argv, env):
         calls.append((program, argv, env))
         raise Started()
     monkeypatch.setattr(os, "execve", execve)
+    monkeypatch.setattr(launch.subprocess, "Popen", lambda argv, env: execve(argv[0], argv, env))
     return calls
 
 
 def test_main_execs_the_real_claude_with_the_account(router, exec_spy, monkeypatch, capsys):
+    """Runs the platform's own code: pinning system() to "linux" here once sent Windows into `import fcntl`, and
+    the test only saw the session fall back to the default account."""
     from quota_router import cli, launch, platform_compat
-    monkeypatch.setattr(platform_compat, "system", lambda: "linux")
-    real = fake_claude(router.home / "npm-bin")
+    real = fake_claude(router.home / "npm-bin", name="claude.exe" if WINDOWS else "claude")
     monkeypatch.setenv("PATH", os.pathsep.join([platform_compat.default_launcher_dir(), str(real.parent)]))
     monkeypatch.setenv("KEEP_ME", "1")
     monkeypatch.setattr(launch, "stderr_is_terminal", lambda: True)
     with pytest.raises(Started):
         cli.main(["launch", "--", "--model", "opus", "fix it"])
+    err = capsys.readouterr().err                     # first, so a fallback shows its reason instead of a KeyError
+    assert err.count("\n") == 1 and err.startswith("[quota-router] session on claude-b"), err
     ((program, argv, env),) = exec_spy
     assert program == str(real) and argv == [str(real), "--model", "opus", "fix it"]
     assert env["CLAUDE_CONFIG_DIR"] == str(router.home / ".claude-b") and env["KEEP_ME"] == "1"
-    err = capsys.readouterr().err
-    assert err.count("\n") == 1 and err.startswith("[quota-router] session on claude-b")
     # finding 3: the line is for a person; with stderr going to a file or a pipe nothing is added.
     monkeypatch.setattr(launch, "stderr_is_terminal", lambda: False)
     exec_spy.clear()
@@ -810,7 +828,7 @@ def test_help_lists_launch(home, capsys):
     from quota_router import cli
     cli.main(["--help"])
     out = capsys.readouterr().out
-    assert "qr launch [--] [ARGS…]" in out and "--no-launcher" in out
+    assert "qr launch [--] [ARGS...]" in out and "--no-launcher" in out
 
 
 # ---- round-1 review findings ------------------------------------------------------------

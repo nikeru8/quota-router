@@ -26,6 +26,11 @@ def test_tables_use_the_same_placeholders():
     assert {key: fields(i18n.EN[key]) for key in i18n.EN} == {key: fields(i18n.ZH_TW[key]) for key in i18n.ZH_TW}
 
 
+def test_english_help_is_ascii():
+    """`qr --help` goes to a console or pipe in the local code page on Windows; ASCII reads the same in all of them."""
+    assert i18n.EN["help"].isascii(), [c for c in i18n.EN["help"] if not c.isascii()]
+
+
 def test_english_table_is_english():
     assert [key for key, text in i18n.EN.items() if CJK.search(text)] == []
 

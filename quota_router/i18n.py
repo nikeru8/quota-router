@@ -24,7 +24,7 @@ quota-router: ask "which account should this subagent use right now?"
                             and write the `claude` launcher (--no-launcher: hook only)
   qr uninstall [--config-dir DIR] [--no-launcher]
                             remove the hook and the launcher that `qr install` added
-  qr launch [--] [ARGS…]    start claude ARGS on the Claude account with the most quota left
+  qr launch [--] [ARGS...]  start claude ARGS on the Claude account with the most quota left
                             (what the `claude` launcher runs; it never refuses to start a session)
   qr doctor                 check Python, the config file, account directories, the hook and platform support
   qr pick claude            one line: account prefix  # reason (and reserve that account)
