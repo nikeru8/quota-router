@@ -2236,6 +2236,35 @@ def report(days=7):
     decision_statistics(days, rows)
 
 
+def watch_status(force, interval):
+    """`qr status --watch [N]`: the status table again every N seconds until Ctrl-C. On a terminal the screen is
+    cleared before each redraw; elsewhere (a pipe, a file) the tables are separated by a line of dashes. --refresh
+    applies to the first draw only: later draws reuse the cached numbers, so watching does not hammer the usage
+    endpoints."""
+    import io
+    from contextlib import redirect_stdout
+    tty = sys.stdout.isatty()
+    try:
+        while True:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                status(force)
+            force = False
+            if tty:
+                if platform_compat.system() == "windows":
+                    os.system("cls")
+                else:
+                    sys.stdout.write("\x1b[2J\x1b[H")
+            else:
+                print("-" * 72)
+            print(t("watch.header", seconds=interval, clock=time.strftime("%H:%M:%S")))
+            sys.stdout.write(buf.getvalue())
+            sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print()
+
+
 def main(argv):
     force = "--refresh" in argv
     model = None
@@ -2255,7 +2284,20 @@ def main(argv):
     elif argv[0] == "check" and len(argv) > 2 and argv[1] in ("claude", "codex"):
         check_account(argv[1], argv[2], model=model, peek="--peek" in argv, force=force)
     elif argv[0] == "status":
-        status(force)
+        if "--watch" in argv:
+            i = argv.index("--watch") + 1
+            interval = 10
+            if i < len(argv) and not argv[i].startswith("--"):
+                try:
+                    interval = int(argv[i])
+                except ValueError:
+                    interval = 0
+            if interval <= 0:
+                print(t("usage.watch"), file=sys.stderr)
+                raise SystemExit(2)
+            watch_status(force, interval)
+        else:
+            status(force)
     elif argv[0] == "report":
         try:
             days = int(argv[argv.index("--days") + 1]) if "--days" in argv else 7

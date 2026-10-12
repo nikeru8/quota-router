@@ -36,6 +36,7 @@ quota-router: ask "which account should this subagent use right now?"
                             --strict is accepted for compatibility and changes nothing
   qr check codex 2 --peek   check one account (key, number or directory) without reserving
   qr status                 table of every account
+  qr status --watch [N]     the same table, redrawn every N seconds (default 10) until Ctrl-C
   qr report [--days N]      reset events, current pace and dispatch statistics (default 7 days)
   qr leases --clear         drop all reservations
   qr decisions [N]          the last N routing decisions (default 30)
@@ -95,6 +96,8 @@ endpoints; they are never refreshed or written back.""",
     "setting.endpoints.codex_usage": "where Codex usage is queried; the login token is sent there (tests / proxies only)",
     "usage.model": "usage: --model <name>",
     "usage.report": "usage: qr report [--days <positive integer>]",
+    "usage.watch": "usage: qr status --watch [<seconds, a positive integer; default 10>]",
+    "watch.header": "qr status --watch: redrawn every {seconds}s, last at {clock}; Ctrl-C to stop",
     "usage.leases": "usage: qr leases --session <id>",
     "decisions.empty": "(no records yet)",
     # ---- separators and small labels ----
@@ -448,6 +451,7 @@ quota-router：派子代理前問「現在該用哪個帳號」。
                          沒有帳號可派時結束碼 3、stdout 不輸出；--strict 只為相容而保留，沒有作用
   qr check codex 2 --peek   檢查指定帳號（key、第幾個或目錄），不預約
   qr status                 所有帳號完整表格
+  qr status --watch [N]     同一張表每 N 秒重畫（預設 10），Ctrl-C 離開
   qr report [--days N]      重置事件、目前步調與派工統計（預設 7 天）
   qr leases --clear         清掉所有預約
   qr decisions [N]          最近 N 筆分流決定（預設 30）
@@ -505,6 +509,8 @@ quota-router：派子代理前問「現在該用哪個帳號」。
     "setting.endpoints.codex_usage": "查 Codex 用量的網址；登入 token 會送到這裡（只供測試或代理環境）",
     "usage.model": "用法：--model <名稱>",
     "usage.report": "用法：qr report [--days 正整數]",
+    "usage.watch": "用法：qr status --watch [秒數，正整數，預設 10]",
+    "watch.header": "qr status --watch：每 {seconds} 秒重畫，最近更新 {clock}；Ctrl-C 離開",
     "usage.leases": "用法：qr leases --session <id>",
     "decisions.empty": "（還沒有紀錄）",
     "sep.comma": "，",

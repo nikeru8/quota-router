@@ -109,3 +109,26 @@ def test_bin_qr_runs_from_a_checkout(home):
     assert subprocess.run(qr + ["init"], env=env, capture_output=True, text=True, timeout=60).returncode == 0
     shown = subprocess.run(qr + ["config"], env=env, capture_output=True, text=True, timeout=60)
     assert shown.returncode == 0 and "claude-main" in shown.stdout and "[[accounts]]" in shown.stdout
+
+
+# ---- qr status --watch ----------------------------------------------------------------
+def test_status_watch_rejects_a_bad_interval(write_config, capsys):
+    write_config(CONFIG)
+    for bad in ("0", "-5", "abc"):
+        code, out, err = run(["status", "--watch", bad], capsys)
+        assert (code, out) == (2, "") and "--watch" in err, bad
+
+
+def test_status_watch_redraws_until_interrupted(router, monkeypatch, capsys):
+    """Not a terminal here, so no clear-screen codes: each draw is a dashed line, a header line and the table.
+    --refresh only forces the first draw."""
+    from quota_router import core
+    sleeps, forced = [], []
+    monkeypatch.setattr(core.time, "sleep", lambda seconds: (sleeps.append(seconds), None)[1]
+                        if len(sleeps) < 1 else (_ for _ in ()).throw(KeyboardInterrupt()))
+    real_status = core.status
+    monkeypatch.setattr(core, "status", lambda force=False: (forced.append(force), real_status(force))[1])
+    code, out, err = run(["status", "--watch", "3", "--refresh"], capsys)
+    assert (code, err) == (0, "") and sleeps == [3] and forced == [True, False]
+    assert out.count("qr status --watch") == 2 and out.count("[claude]") == 2 and "\x1b[" not in out
+    assert out.startswith("-" * 72 + "\n")
