@@ -1590,6 +1590,17 @@ def check_account(family, account, model=None, peek=False, force=False):
 BAR_WIDTH = 20
 
 
+def display_width(text):
+    """Terminal columns a string takes: CJK and other wide characters count 2."""
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
+
+
+def pad(text, width):
+    """Left-align `text` in `width` terminal columns (CJK-aware)."""
+    return text + " " * max(0, width - display_width(text))
+
+
 def bar(left, width=BAR_WIDTH):
     """`▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱  43/100%` for a percentage left; an unknown value is an empty bar with `?`."""
     if left is None:
@@ -1615,8 +1626,9 @@ def status(force=False, bars=False):
             print(t("status.lead", who=who(lr) if lr else lead_key or "?", dir=dir_label(ld),
                     assumed=t("status.assumed") if assumed else "", floor=LEAD_FLOOR))
         col = lambda name: t("status.col." + name)
-        print(f"{col('account'):<16}{col('dir'):<24}{col('weekly'):>6}{col('weekly_reset'):>14}{col('five_hour'):>9}"
-              f"{col('rate'):>10}{col('busy'):>10}  {col('state')}")
+        if not bars:
+            print(f"{col('account'):<16}{col('dir'):<24}{col('weekly'):>6}{col('weekly_reset'):>14}{col('five_hour'):>9}"
+                  f"{col('rate'):>10}{col('busy'):>10}  {col('state')}")
         for r in sorted(rows, key=lambda r: -r["score"]):
             wk = f"{r['wk_left']:.0f}%" if r["wk_left"] is not None else "?"
             fh = f"{r['fh_left']:.0f}%" if r["fh_left"] is not None else "-"
@@ -1638,16 +1650,21 @@ def status(force=False, bars=False):
             if fam == "codex":
                 dirs = dir_label(r["dir"])
             name = who(r) + (t("status.lead_tag") if r.get("is_lead") else "")
-            print(f"{name:<16}{dirs:<24}{wk:>6}{fmt_clock(r['wk_reset']):>14}{fh:>9}{rate:>10}{r['busy_detail']:>10}  {st}"
-                  + (t("paren", text=extra) if extra else ""))
-            if bars:
-                parts = [t("status.bar.weekly") + " " + bar(r["wk_left"])]
-                if fam == "claude":
-                    parts.append(t("status.bar.five_hour") + " " + bar(r["fh_left"]))
-                    if SCARCE:
-                        fb = (r.get("usage") or {}).get(SCARCE)
-                        parts.append(SCARCE_LABEL + " " + bar(max(0, 100 - fb["used"]) if fb else None))
-                print("  " + "   ".join(parts))
+            if not bars:
+                print(f"{name:<16}{dirs:<24}{wk:>6}{fmt_clock(r['wk_reset']):>14}{fh:>9}{rate:>10}{r['busy_detail']:>10}  {st}"
+                      + (t("paren", text=extra) if extra else ""))
+                continue
+            # card layout: one bar per line, CJK-aware alignment, fits 80 columns
+            label = lambda text: "  " + pad(text, 9)
+            print(f"\n{pad(name, 22)}{dirs}")
+            print(label(t("status.bar.weekly")) + bar(r["wk_left"]) + "   " + t("status.bar.reset", clock=fmt_clock(r["wk_reset"])))
+            if fam == "claude":
+                print(label(t("status.bar.five_hour")) + bar(r["fh_left"]))
+                if SCARCE:
+                    fb = (r.get("usage") or {}).get(SCARCE)
+                    print(label(SCARCE_LABEL) + bar(max(0, 100 - fb["used"]) if fb else None))
+            card_extra = t("sep.semicolon").join(r["notes"]) if fam == "claude" else extra   # the bar already shows the bucket
+            print(label(col("state")) + t("sep.dot").join(filter(None, [st, r["busy_detail"], col("rate") + " " + rate, card_extra])))
         if fam == "claude":
             missing = quiet_call(hookless_accounts, default=[])
             if missing:

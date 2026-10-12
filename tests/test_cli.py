@@ -139,10 +139,13 @@ def test_status_bars(router, capsys):
     assert core.bar(43) == "\u25b0" * 9 + "\u25b1" * 11 + "  43/100%"
     assert core.bar(0) == "\u25b1" * 20 + "  0/100%" and core.bar(100) == "\u25b0" * 20 + "  100/100%"
     assert core.bar(None) == "\u25b1" * 20 + "   ?/100%" and core.bar(250).startswith("\u25b0" * 20)
+    assert core.display_width("ab") == 2 and core.display_width("中文a") == 5 and core.pad("中", 4) == "中  "
     code, out, _ = run(["status"], capsys)
-    assert code == 0 and "/100%" not in out
+    assert code == 0 and "/100%" not in out and "week reset" in out          # the table, unchanged
     code, out, _ = run(["status", "--bars"], capsys)
-    bars = [line for line in out.splitlines() if "/100%" in line]
-    assert code == 0 and len(bars) == len([l for l in out.splitlines() if "/100%" in l]) >= 2
-    assert all(line.startswith("  ") and "\u25b0" in line or "\u25b1" in line for line in bars)
-    assert any("5h" in line for line in bars) and any(line.count("/100%") == 1 for line in bars)   # codex: weekly only
+    lines = out.splitlines()
+    bars = [line for line in lines if "/100%" in line]
+    assert code == 0 and "week reset" not in out and len(bars) >= 3
+    assert all(line.startswith("  ") and line.count("/100%") == 1 for line in bars)   # one bar per line
+    assert sum("resets " in line for line in bars) == len([l for l in lines if l.startswith("  week")])
+    assert any(line.startswith("  5h") for line in bars) and any(line.startswith("  state") for line in lines)
