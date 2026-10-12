@@ -26,6 +26,7 @@ Found in review, not fixed yet:
 
 - `qr doctor` does not notice `CLAUDE_CONFIG_DIR` exported in a shell startup file or already in its environment; with it set, every `claude` passes through the launcher unrouted.
 - `qr doctor` only reads the startup files it names; a `claude` alias or function in a file they `source` is not seen.
+- `claude --continue` with two launcher-started sessions in the same directory on different accounts resumes the account started last, not the one with the newest conversation (claude's own `--continue` picks the newest conversation).
 - Windows: a choice abandoned after the time limit keeps running in a background thread next to claude (on macOS and Linux claude replaces the process); and `claude.cmd` passes its arguments on with `%*`, which `cmd` re-parses, so arguments with `"`, `%`, `^` or `&` may arrive changed. The Windows launcher is untested on a real machine.
 
 ## 0.1.0
