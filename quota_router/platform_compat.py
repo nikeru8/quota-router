@@ -199,12 +199,20 @@ _windows_processes = None      # (monotonic time, result) of the last successful
 
 
 def list_processes(run):
-    """Processes as {pid: (parent pid, command line)}.
+    """Processes as {pid: (parent pid, command line)}; failure of any kind gives an empty dict, so nobody is
+    counted as busy. See read_processes()."""
+    return read_processes(run) or {}
+
+
+def read_processes(run):
+    """Processes as {pid: (parent pid, command line)}, or None when the list could not be read.
 
     `run(argv)` runs a command and returns a CompletedProcess, or None when it
     could not run or ran out of time (the caller supplies it so its time budget
-    applies). Failure of any kind gives an empty dict: nobody is counted as busy.
-    macOS/Linux: every process, from `ps`.
+    applies). Callers that must fail closed (the login renewal) treat None as
+    "a Claude Code process may be running anywhere".
+    macOS/Linux: every process, from `ps`. An empty list counts as unreadable:
+    `ps` always lists at least itself.
     Windows: the processes whose command line mentions claude or codex, from
     Get-CimInstance Win32_Process through PowerShell. Starting PowerShell costs
     roughly 0.5-2 s, so one successful answer is reused for a few seconds within
@@ -216,18 +224,24 @@ def list_processes(run):
             return dict(_windows_processes[1])
         result = run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PROCESS_QUERY])
         if result is None or result.returncode != 0:
-            return {}
+            return None
+        try:
+            if result.stdout.strip():
+                json.loads(result.stdout)
+        except ValueError:
+            return None                  # cut off or garbled: unreadable, not "no Claude process"
         procs = parse_windows_processes(result.stdout)
         _windows_processes = (time.monotonic(), procs)
         return dict(procs)
     result = run(["ps", "-axww", "-o", "pid=,ppid=,command="])
-    out = result.stdout if result else ""
+    if result is None or result.returncode != 0:
+        return None
     procs = {}
-    for line in out.splitlines():
+    for line in result.stdout.splitlines():
         m = re.match(r"\s*(\d+)\s+(\d+)\s+(.*)", line)
         if m:
             procs[int(m[1])] = (int(m[2]), m[3])
-    return procs
+    return procs or None
 
 
 def parse_windows_processes(text):
@@ -326,7 +340,7 @@ def directory_from_command_lines(pid, procs, variable):
 
 
 def spawn_detached(argv, env, stdout, stderr):
-    """Start a background process that outlives the caller.
+    """Start a background process that outlives the caller; returns its Popen.
 
     macOS/Linux: a new session. Windows: DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     (no console, not hit by the caller's Ctrl+C); the program is looked up on PATH
@@ -335,10 +349,9 @@ def spawn_detached(argv, env, stdout, stderr):
     if system() == "windows":
         flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         program = shutil.which(argv[0], path=(env or os.environ).get("PATH")) or argv[0]
-        subprocess.Popen([program, *argv[1:]], env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                         creationflags=flags, close_fds=True)
-        return
-    subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
+        return subprocess.Popen([program, *argv[1:]], env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                creationflags=flags, close_fds=True)
+    return subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
 
 
 # ---- paths ---------------------------------------------------------------------
@@ -443,10 +456,15 @@ def save_claude_login(where, text, run):
     refused unless has_claude_login() accepts it, so a partial object is never written.
     Keychain (macOS): `add-generic-password -U` on the same service and account, with the JSON hex-encoded (`-X`)
     and the command fed to `security -i` on stdin. That is exactly how Claude Code 2.1.296 writes this item, and
-    it keeps the token off every command line. Like Claude Code, a command longer than its stdin limit goes on
-    argv instead. `run(argv, input=None)` is the budget-aware runner.
+    it keeps the token off the command line as long as the command fits Claude Code's stdin limit (4032
+    characters). A longer one (a login with several MCP logins next to it) goes on argv instead, again like
+    Claude Code: then the hex-encoded login, refresh token included, is on `security`'s command line for as long
+    as it runs, where other local users can read it with `ps`. `run(argv, input=None)` is the budget-aware runner.
     File (Linux, Windows, or a login read from the file): a temporary file with mode 0600 next to
     .credentials.json, then renamed over it, so a reader sees the old file or the new one, never half of one.
+    Only an existing .credentials.json is replaced: a missing one means the login lives elsewhere (the keychain,
+    or on Windows possibly the Credential Manager, which quota-router cannot read), and creating the file would
+    put a second copy of it next to the live one.
     """
     if not has_claude_login(text):
         raise ValueError("not a complete Claude login")
@@ -465,6 +483,8 @@ def save_claude_login(where, text, run):
             raise OSError(errno.EIO, "security add-generic-password failed")
         return
     path = where[1]
+    if not os.path.isfile(path):
+        raise OSError(errno.ENOENT, "no credentials file to replace")
     folder = os.path.dirname(path)
     tmp = os.path.join(folder, f".credentials.json.{os.getpid()}.{os.urandom(6).hex()}.tmp")
     try:
@@ -481,28 +501,43 @@ def save_claude_login(where, text, run):
             pass
 
 
-# Claude Code serialises its own refreshes with proper-lockfile: a directory `<config dir>/.oauth_refresh.lock`
-# (mtime renewed every 5 s, stale after 60 s), plus a legacy one, `<config dir, links resolved>.lock`. Holding both
-# while quota-router renews a login keeps a Claude Code process that starts meanwhile from renewing it at the same time.
+# Claude Code's locks around its stored login, read from the 2.1.296 bundle. All three are proper-lockfile locks:
+# a directory created with mkdir, whose mtime its holder renews while it holds it (every stale/2), and which anyone
+# may take over once its mtime is older than the stale limit.
+# - `<config dir>/.oauth_refresh.lock`, around a token refresh; stale after 60 s.
+# - `<config dir, links resolved>.lock`, the older name of the same lock, still taken; stale after 60 s.
+# - `<config dir>/.storage-write.lock`, around every read-modify-write of the credential store (a refresh's save,
+#   an MCP login, a logout); stale after 15 s. Claude Code retries it 10 times over about 8 s, then gives up.
+# Holding all three while quota-router renews a login keeps every Claude Code process that honours them from
+# renewing or rewriting that login at the same time.
 CLAUDE_LOCK_STALE_SEC = 60
+CLAUDE_STORAGE_LOCK_STALE_SEC = 15
+CLAUDE_LOCK_BEAT_SEC = 5         # quota-router renews the mtime of the locks it holds this often (under 15 / 2)
+
+
+def claude_locks(config_dir):
+    """[(lock directory, stale limit in seconds)] in the order they are taken."""
+    base = config_dir or os.path.join(home(), ".claude")
+    return [(os.path.join(base, ".oauth_refresh.lock"), CLAUDE_LOCK_STALE_SEC),
+            (os.path.realpath(base) + ".lock", CLAUDE_LOCK_STALE_SEC),
+            (os.path.join(base, ".storage-write.lock"), CLAUDE_STORAGE_LOCK_STALE_SEC)]
 
 
 def claude_refresh_locks(config_dir):
-    base = config_dir or os.path.join(home(), ".claude")
-    return [os.path.join(base, ".oauth_refresh.lock"), os.path.realpath(base) + ".lock"]
+    return [path for path, _ in claude_locks(config_dir)]
 
 
 def take_claude_refresh_lock(config_dir):
-    """Take Claude Code's refresh locks for a config directory. Returns the list of lock directories to hand to
-    release_claude_refresh_lock(), or None when Claude Code (or another quota-router) holds one. A lock older than
-    Claude Code's stale limit is taken over, as Claude Code itself would."""
+    """Take Claude Code's locks for a config directory (see claude_locks()). Returns the list of lock directories
+    to hand to release_claude_refresh_lock(), or None when Claude Code (or another quota-router) holds one; then
+    none is kept. A lock whose mtime is older than its stale limit is taken over, as Claude Code itself would."""
     taken = []
-    for path in claude_refresh_locks(config_dir):
+    for path, stale_after in claude_locks(config_dir):
         try:
             os.mkdir(path)
         except FileExistsError:
             try:
-                stale = time.time() - os.stat(path).st_mtime > CLAUDE_LOCK_STALE_SEC
+                stale = time.time() - os.stat(path).st_mtime > stale_after
                 if stale:
                     os.rmdir(path)
                     os.mkdir(path)
@@ -524,6 +559,31 @@ def release_claude_refresh_lock(taken):
             os.rmdir(path)
         except OSError:
             pass
+
+
+class LockHeartbeat:
+    """Renews the mtime of the lock directories it is given every CLAUDE_LOCK_BEAT_SEC seconds, as proper-lockfile
+    does for its holder, so a renewal that waits up to 30 s for its answer is not taken for a dead holder."""
+
+    def __init__(self, paths):
+        self.paths, self.stop = list(paths or []), threading.Event()
+        self.thread = threading.Thread(target=self.run, name="quota-router-lock-beat", daemon=True)
+
+    def run(self):
+        while not self.stop.wait(CLAUDE_LOCK_BEAT_SEC):
+            for path in self.paths:
+                try:
+                    os.utime(path)
+                except OSError:
+                    pass
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        self.thread.join(1)
 
 
 def login_names():

@@ -44,8 +44,10 @@ quota-router: ask "which account should this subagent use right now?"
   qr decisions [N]          the last N routing decisions (default 30)
   qr hook                   the Claude Code PreToolUse hook (reads the hook JSON on stdin)
 
-Read-only: login tokens are only used to call the vendor's own usage / profile
-endpoints; they are never refreshed or written back.""",
+Login tokens are only sent to the vendor's own usage / profile endpoints. One
+exception: an expired Claude login is renewed in the background with its refresh
+token, as Claude Code would, and saved back where Claude Code keeps it
+([families.claude] refresh_logins = false or QR_NO_REFRESH=1 turns this off).""",
     # ---- cli / config ----
     "cli.no_config": 'quota-router: no config at {path}, run "qr init"',
     "cli.config_error": "quota-router: config error in {path}: {detail}",
@@ -64,10 +66,12 @@ endpoints; they are never refreshed or written back.""",
     "cli.no_launch": "  (launch = false: no new sessions)",
     "cli.no_hook": "  (launch: hook missing)",
     "status.launch_hook_missing": "launch: hook missing for {keys}; new sessions do not start there until `qr install --config-dir <dir>` adds it",
+    "status.renewal_wait": "renewing the login of {keys} in the background; waiting up to {seconds} s …",
     "init.header": """\
 # quota-router config. Every value in [general], [hints], [limits], [timing],
 # [events] and [families.*] is optional; what you see here are the defaults.
-# [endpoints] is for tests and proxies only and is left commented out.
+# [endpoints] is for tests and proxies only and is left commented out; the login
+# tokens are sent to these URLs, and to claude_token the refresh token as well.
 # `qr config` prints the resolved values and where each one came from.""",
     "init.accounts": """\
 # One [[accounts]] table per login. family: claude | codex. key: any unique name.
@@ -93,7 +97,7 @@ endpoints; they are never refreshed or written back.""",
     "setting.events.reset_drop_points": "usage must drop by this many points to count as a reset / refill",
     "setting.launch.route_print": "true = `claude -p` started outside Claude Code also gets an account from the launcher (default: left as written)",
     "setting.families.claude.scarce_model": 'the Claude model with its own weekly bucket; commands without --model are assumed to use it ("" = none)',
-    "setting.families.claude.refresh_logins": "renew an expired Claude login with its refresh token and save it where Claude Code keeps it (QR_NO_REFRESH=1 also turns this off)",
+    "setting.families.claude.refresh_logins": "renew an expired Claude login in the background with its refresh token and save it where Claude Code keeps it (QR_NO_REFRESH=1 also turns this off)",
     "setting.endpoints.claude_usage": "where Claude usage is queried; the login token is sent there (tests / proxies only)",
     "setting.endpoints.claude_profile": "where the Claude account email is queried; the login token is sent there (tests / proxies only)",
     "setting.endpoints.claude_token": "where an expired Claude login is renewed; the refresh token is sent there (tests / proxies only)",
@@ -137,6 +141,7 @@ endpoints; they are never refreshed or written back.""",
     "err.expired": "login token expired (normal for an idle account; it refreshes the next time the account is used)",
     "err.login_dead": "login can no longer be renewed: run `claude login` with this account's directory",
     "err.refresh_unsaved": "the login was renewed but could not be saved; if this account stops working, run `claude login` with its directory",
+    "err.login_on_hold": "the account is on hold, so its login is not renewed; see claude.ai, then run `claude login` with its directory",
     "err.unreachable": "cannot reach the usage endpoint ({error})",
     "err.codex_live_failed": "live query failed ({error}); using the latest local numbers",
     "err.claude_fallback_suffix": "; using the usage Claude Code cached itself",
@@ -144,6 +149,7 @@ endpoints; they are never refreshed or written back.""",
     "err.no_local_log": "no rate-limit record found in the local logs",
     # ---- notes attached to an account ----
     "note.probe_started": "started one background probe to refresh the local log",
+    "note.refresh_started": "renewing the login in the background",
     "note.merged": "same account logged in at {dirs}; counted once",
     "note.reset_passed": "scheduled reset has passed; presumed reset, not yet confirmed",
     "note.stale_codex": "Using a cached quota reading; the quota may have reset",
@@ -470,7 +476,9 @@ quota-router：派子代理前問「現在該用哪個帳號」。
   qr decisions [N]          最近 N 筆分流決定（預設 30）
   qr hook                   Claude Code 的 PreToolUse hook（從 stdin 讀 hook 的 JSON）
 
-只讀：登入憑證只拿來打原廠自己的用量／身分網址，不刷新、不寫回；Codex 另讀本機紀錄檔。""",
+登入憑證只送到原廠自己的用量／身分網址；Codex 另讀本機紀錄檔。唯一的例外：Claude 登入過期時，
+會像 Claude Code 一樣在背景用 refresh token 更新，再存回 Claude Code 存放登入的地方
+（[families.claude] 設 refresh_logins = false，或設 QR_NO_REFRESH=1 可關掉）。""",
     "cli.no_config": "quota-router：找不到設定檔 {path}，請先執行 qr init",
     "cli.config_error": "quota-router：設定檔 {path} 有問題：{detail}",
     "cli.exists": "quota-router：{path} 已經存在；要覆寫請用 qr init --force",
@@ -488,10 +496,12 @@ quota-router：派子代理前問「現在該用哪個帳號」。
     "cli.no_launch": "  （launch = false：不開新 session）",
     "cli.no_hook": "  （launch：缺 hook）",
     "status.launch_hook_missing": "launch：{keys} 缺 hook，在用 `qr install --config-dir <目錄>` 補上之前不會在那裡開新 session",
+    "status.renewal_wait": "正在背景更新 {keys} 的登入，最多等 {seconds} 秒……",
     "init.header": """\
 # quota-router 設定檔。[general]、[hints]、[limits]、[timing]、[events]、[families.*]
 # 裡的值都可以不寫；這裡列的就是預設值。
-# [endpoints] 只供測試或代理環境使用，預設是註解掉的。
+# [endpoints] 只供測試或代理環境使用，預設是註解掉的；登入 token 會送到這些網址，
+# claude_token 還會收到 refresh token。
 # qr config 會印出解析後的值與每個值的來源。""",
     "init.accounts": """\
 # 每個登入帳號一個 [[accounts]]。family：claude | codex。key：任意不重複的名稱。
@@ -517,7 +527,7 @@ quota-router：派子代理前問「現在該用哪個帳號」。
     "setting.events.reset_drop_points": "已用下降這麼多點才算重置／補額度",
     "setting.launch.route_print": "true = 在 Claude Code 之外執行的 `claude -p` 也由啟動器挑帳號（預設：照原樣執行）",
     "setting.families.claude.scarce_model": "有專屬週額度的 Claude 模型；沒寫 --model 的指令當作用它（\"\" 表示沒有）",
-    "setting.families.claude.refresh_logins": "Claude 登入過期時用 refresh token 更新，並存回 Claude Code 存放登入的地方（設 QR_NO_REFRESH=1 也會關掉）",
+    "setting.families.claude.refresh_logins": "Claude 登入過期時在背景用 refresh token 更新，並存回 Claude Code 存放登入的地方（設 QR_NO_REFRESH=1 也會關掉）",
     "setting.endpoints.claude_usage": "查 Claude 用量的網址；登入 token 會送到這裡（只供測試或代理環境）",
     "setting.endpoints.claude_profile": "查 Claude 帳號 email 的網址；登入 token 會送到這裡（只供測試或代理環境）",
     "setting.endpoints.claude_token": "更新過期 Claude 登入的網址；refresh token 會送到這裡（只供測試或代理環境）",
@@ -557,12 +567,14 @@ quota-router：派子代理前問「現在該用哪個帳號」。
     "err.expired": "登入憑證過期（閒置帳號常見，下次使用時會自動更新）",
     "err.login_dead": "登入已無法更新：請用這個帳號的目錄執行 `claude login`",
     "err.refresh_unsaved": "登入已更新但存不回去；這個帳號如果不能用了，請用它的目錄執行 `claude login`",
+    "err.login_on_hold": "帳號被暫停（on hold），所以登入不會更新；請到 claude.ai 查看，再用它的目錄執行 `claude login`",
     "err.unreachable": "連不上用量網址（{error}）",
     "err.codex_live_failed": "即時查詢失敗（{error}），改用最近一筆本機數字",
     "err.claude_fallback_suffix": "，改用 Claude 自己存的用量",
     "err.probe_failed_suffix": "；探測失敗（{error}）",
     "err.no_local_log": "找不到任何額度紀錄",
     "note.probe_started": "已在背景探測一次更新紀錄",
+    "note.refresh_started": "正在背景更新登入",
     "note.merged": "同帳號登在 {dirs}，合併計算",
     "note.reset_passed": "預定重置已過，推定已重置，待確認",
     "note.stale_codex": "非即時數字、可能已重置",
