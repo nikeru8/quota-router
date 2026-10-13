@@ -88,12 +88,14 @@ On macOS Claude Code keeps each login in the keychain under an item named after 
 | `timing.notice_ttl_hours` | `6` | A reset notice is shown for this long. |
 | `events.reset_drop_points` | `3` | Usage must drop by this many points to count as a reset or refill. |
 | `families.claude.scarce_model` | `"fable"` | The Claude model that has its own weekly bucket. `""` turns the per-model check off. |
+| `families.claude.refresh_logins` | `true` | Renew an expired Claude login with its refresh token and save it where Claude Code keeps it, so an idle account keeps live numbers. `false` (or `QR_NO_REFRESH=1`): never; an idle account then shows "login token expired" until Claude Code is used there. See [Renewing an expired Claude login](#renewing-an-expired-claude-login). |
 | `launch.route_print` | `false` | `true`: the [launcher](#sessions-and-the-claude-launcher) also chooses the account for `claude -p …` started outside Claude Code. By default those run as written. |
 | `endpoints.claude_usage` | `"https://api.anthropic.com/api/oauth/usage"` | Where Claude usage is queried. |
 | `endpoints.claude_profile` | `"https://api.anthropic.com/api/oauth/profile"` | Where a Claude account's email is queried. |
+| `endpoints.claude_token` | `"https://platform.claude.com/v1/oauth/token"` | Where an expired Claude login is renewed. The refresh token is sent here. |
 | `endpoints.codex_usage` | `"https://chatgpt.com/backend-api/wham/usage"` | Where Codex usage is queried. |
 
-`[endpoints]` exists for tests and for networks that reach the vendors through a proxy. **Your login token is sent to whatever these point at**; keep the defaults unless you need one of those two cases. `qr init` writes them commented out, so that a later change of the default addresses is not pinned by old config files.
+`[endpoints]` exists for tests and for networks that reach the vendors through a proxy. **Your login token, and for `claude_token` the refresh token, is sent to whatever these point at**; keep the defaults unless you need one of those two cases. `qr init` writes them commented out, so that a later change of the default addresses is not pinned by old config files.
 
 ### Validation
 
@@ -122,6 +124,7 @@ On an error, `qr status`, `qr pick`, `qr check`, `qr report`, `qr decisions`, `q
 | `QR_LANG` | `en` or `zh-TW`; overrides the config file. |
 | `QR_ALLOW_CREDITS=1` | As a prefix of one dispatch (`QR_ALLOW_CREDITS=1 codex exec …`), lets that dispatch spend credits. `export` does not count for the hook; `qr pick` / `qr check` read it from the environment. |
 | `QR_NO_PROBE=1` | Never start the background Codex probe (see [Privacy and security](#privacy-and-security)). |
+| `QR_NO_REFRESH=1` | Never renew an expired Claude login, whatever `refresh_logins` says (see [Renewing an expired Claude login](#renewing-an-expired-claude-login)). |
 | `QR_DEBUG=1` | Also write full tracebacks to `debug.log` in the state directory. That file can contain sensitive text. |
 | `QR_E2E_ONLINE=1` | Tests only: lets `tests/test_fresh_machine.py` download packages (see [Development](#development)). |
 
@@ -553,6 +556,7 @@ Also:
 | Config file | `~/.config/quota-router/config.toml` | same | `%APPDATA%\quota-router\config.toml` |
 | State directory | `~/.local/state/quota-router` (or `$XDG_STATE_HOME`) | same | `%LOCALAPPDATA%\quota-router` |
 | Claude login read from | keychain, else `<dir>/.credentials.json` | `<dir>/.credentials.json` | `<dir>\.credentials.json` |
+| Renewed Claude login written to | the keychain item it was read from (`security -i`), or that file | `<dir>/.credentials.json`, mode 600 | `<dir>\.credentials.json` |
 | Codex login read from | `<dir>/auth.json` | same | same |
 | Running jobs counted from | `ps`, including each job's environment | same | PowerShell `Get-CimInstance Win32_Process`, command lines only |
 | Shell the command runs in | `sh` / `zsh` | `sh` / `bash` | Git Bash |
@@ -595,7 +599,7 @@ See [research-windows.md](research-windows.md) for the sources these choices are
 
 ## Privacy and security
 
-**What it reads**, all read-only:
+**What it reads**:
 
 - The Claude Code OAuth token: on macOS from the login keychain through `security find-generic-password`, otherwise from `<dir>/.credentials.json`. One keychain service can hold more than one item (one with only MCP logins, one with the Claude login), so the item filed under your user name is asked for first, then any item of that service, then the file. Details: [Where a Claude login is read](#where-a-claude-login-is-read).
 - The Codex token in `<dir>/auth.json`.
@@ -604,12 +608,13 @@ See [research-windows.md](research-windows.md) for the sources these choices are
 - The process list, to count running `claude` / `codex` jobs per account. That means the command lines of running processes, which can contain prompt text, and on macOS and Linux the environment of the `claude` / `codex` ones. Only the program name and `CLAUDE_CONFIG_DIR` / `CODEX_HOME` are used; none of it is stored.
 - `qr doctor` only: your shell startup files (`~/.zshrc`, `~/.bashrc` and a few more), to find a `claude` alias or function. Only those lines are shown, with anything that looks like a credential masked; nothing is stored.
 
-quota-router itself never refreshes, rewrites or copies a token.
+Codex tokens are only read. A Claude login is only read too, with one exception: when its access token has expired and no Claude Code process runs on that directory, quota-router renews it with the refresh token, exactly as Claude Code would, and writes the renewed login back to the keychain item or `.credentials.json` it came from. It never copies a token anywhere else. Details and how to turn it off: [Renewing an expired Claude login](#renewing-an-expired-claude-login).
 
-**Where it sends anything.** Each token goes to its own vendor's usage endpoint and nowhere else. HTTP redirects are never followed; a redirect counts as a failed query:
+**Where it sends anything.** Each token goes to its own vendor's endpoints and nowhere else. HTTP redirects are never followed; a redirect counts as a failed query:
 
 - `https://api.anthropic.com/api/oauth/usage`
 - `https://api.anthropic.com/api/oauth/profile`
+- `https://platform.claude.com/v1/oauth/token`: only the refresh token of an expired Claude login, only when it is being renewed
 - `https://chatgpt.com/backend-api/wham/usage`
 
 quota-router itself sends no telemetry and makes no other request, unless you change `[endpoints]`.
@@ -625,7 +630,7 @@ quota-router itself sends no telemetry and makes no other request, unless you ch
 - `*.lock` files and, briefly, `*.tmp` files.
 - `debug.log`, **only with `QR_DEBUG=1`**: full tracebacks. A pattern-based scrub is applied, but it is best effort; this file can contain tokens, headers, response bodies and config values. Treat it as sensitive and delete it when you are done.
 
-Outside the state directory it writes only what `qr install` adds: the hook entry in each `settings.json` you install into, and the `claude` launcher file.
+Outside the state directory it writes only what `qr install` adds (the hook entry in each `settings.json` you install into, and the `claude` launcher file) and, when it renews an expired Claude login, that login in Claude Code's own store, plus Claude Code's lock directories for the moment it takes.
 
 The field-by-field formats are under [Log files](#log-files).
 
@@ -634,6 +639,18 @@ The field-by-field formats are under [Log files](#log-files).
 ### Where a Claude login is read
 
 macOS: the login keychain, through `security find-generic-password … -w`, read-only. One service name (`Claude Code-credentials`, or `Claude Code-credentials-<8 hex digits of the SHA-256 of the directory>` for other directories) can hold more than one item: one filed under the account name `unknown` with only MCP logins, one filed under the macOS user name with `claudeAiOauth`. `security -s <service>` alone returns whichever it finds first, so the item filed under the user name (`-a <user>`) is asked for first; then any item of the service; then `<dir>/.credentials.json`. The first one with `claudeAiOauth` is used; when none has it, whatever the keychain returned. A query that does not answer within its time is not repeated. Linux and Windows: `<dir>/.credentials.json` only.
+
+### Renewing an expired Claude login
+
+Claude Code renews its login only when it is used, so an account nobody uses for about a day ends up with an expired access token. Without renewal quota-router cannot read that account's quota, ranks it in the middle and so does not prefer it, and it stays unused and unread. With `refresh_logins = true` (the default) quota-router renews it itself when it is about to query that account's usage:
+
+- **When.** The access token expires within five minutes (Claude Code uses the same margin), the login has a refresh token, and `refreshTokenExpiresAt`, when stored, has not passed.
+- **Not when** a Claude Code process of any kind (a session, a `claude -p` job, a subcommand, a resident helper) runs on that directory, judged from the process list as for busy accounts: that process renews the login itself. Nor when Claude Code holds its refresh lock for the directory (`<dir>/.oauth_refresh.lock`, or the older `<dir>.lock`), when less than six seconds of the hook's time budget are left, or within ten minutes of a failed attempt. In all these cases the account reads as before: "login token expired" and the last known numbers.
+- **How.** One POST, JSON, to `endpoints.claude_token`: `grant_type=refresh_token`, the refresh token, Claude Code's public client id (or the one stored with the login) and the scopes stored with the login. This is the request Claude Code 2.1.296 sends, except that Claude Code first asks for its full current scope list and falls back to the stored scopes; quota-router asks for the stored scopes straight away. No redirect is followed. quota-router takes a lock of its own and both of Claude Code's lock directories first, reads the login again inside them and does not ask at all when someone else has renewed it meanwhile.
+- **Where it is written.** Back to where it was read: on macOS the same keychain item (`security add-generic-password -U` on the same service and account, the JSON hex-encoded and given to `security -i` on stdin, as Claude Code writes it), otherwise `<dir>/.credentials.json` through a temporary file with mode 600 that is renamed over it. Only `accessToken`, `refreshToken` (the answer's new one when it rotates it), `expiresAt`, `refreshTokenExpiresAt` and `scopes` change; every other field and every other top-level entry (`mcpOAuth`) is kept as it is at that moment. It is written only when the stored refresh token is still the one that was sent; otherwise whatever is stored now wins. The login is read back afterwards to check that it was saved.
+- **When it fails.** A failed or refused request leaves the stored login untouched and the account reads as before. A refresh token the server refuses (`invalid_grant`) is shown as "login can no longer be renewed: run `claude login` with this account's directory" and is not sent again. When the renewal worked but the write did not, the new refresh token may be lost, which can sign that directory out: that is recorded in `hook-errors.log` (`login-refresh-save`) and shown on the account until the next attempt.
+- **What is recorded.** One `decisions.log` line per attempt, source `refresh` (see below). No token ever reaches a log or a state file; `cache.json` keeps only a 12-hex-digit hash of a refused refresh token, to know not to send it again.
+- **Turning it off.** `refresh_logins = false` under `[families.claude]`, or `QR_NO_REFRESH=1` in the environment.
 
 ### Log files
 
@@ -652,13 +669,13 @@ One line per decision, nine fields separated by ` | `:
 | Field | Content |
 |---|---|
 | time | `MM-DD HH:MM:SS`, local time |
-| source | `hook`, `qr pick`, `qr check`, `probe` or `qr launch` |
+| source | `hook`, `qr pick`, `qr check`, `probe`, `qr launch` or `refresh` |
 | `lead=` | key of the account the dispatching session runs on, with ` (assumed)` when it was not detected; `?` when unknown; `-` for `qr launch`, which starts a session and has no lead |
 | `sess=` | first 8 characters of Claude Code's session id; a hash when the id has an unusual shape; `-` when there is none |
 | family | `claude`, `codex` or `?` |
-| kind | `auto` (routed), `explicit` (account named in the command), `explicit-unknown` (named directory not in the config), `resume`, `resume-unknown`, `deny`, `fail`, `pick`, `check`, `probe`; for `qr launch`: `launch` (a new session routed), `launch-resume` (a resumed conversation kept on its account), `launch-default` (started on the default account; `pick=` is the key of the account at the default location, or `-`), `fail`. A pass-through (`--help`, a subcommand, `CLAUDE_CONFIG_DIR` already set, inside a session) is not logged. |
+| kind | `auto` (routed), `explicit` (account named in the command), `explicit-unknown` (named directory not in the config), `resume`, `resume-unknown`, `deny`, `fail`, `pick`, `check`, `probe`; for `qr launch`: `launch` (a new session routed), `launch-resume` (a resumed conversation kept on its account), `launch-default` (started on the default account; `pick=` is the key of the account at the default location, or `-`), `fail`; for `refresh` (an expired Claude login, `pick=` the account): `refresh` (renewed and saved), `refresh-failed`, `refresh-dead` (the refresh token was refused or has expired), `refresh-unsaved` (renewed, but the write failed). A pass-through (`--help`, a subcommand, `CLAUDE_CONFIG_DIR` already set, inside a session) is not logged. |
 | `pick=` | account key; `-` when there is none |
-| detail | `; `-separated: a fixed phrase, the numbers behind the choice (`weekly N% left`, `five-hour N% left`, `N running, N reserved`), `model <class>`, `credits allowed`. The phrases `qr launch` adds: `launched with a warning`, `on paid overage`, `no account can take it`, `no account could be read`, `no account is set up for sessions`, and `conversation location unknown` / `kept the original account` as for the hook. For `deny` only the category: `blocked: credits`, `paid overage`, `lead protection`, `five-hour window`, `weekly quota`, `wrong account for resume`, `no account available`, `other`. For `fail` the exception class name. |
+| detail | `; `-separated: a fixed phrase, the numbers behind the choice (`weekly N% left`, `five-hour N% left`, `N running, N reserved`), `model <class>`, `credits allowed`. The phrases `qr launch` adds: `launched with a warning`, `on paid overage`, `no account can take it`, `no account could be read`, `no account is set up for sessions`, and `conversation location unknown` / `kept the original account` as for the hook. For `refresh`: `login renewed`, `renewal failed`, `refresh token refused; run claude login there`, `renewed but could not be saved`. For `deny` only the category: `blocked: credits`, `paid overage`, `lead protection`, `five-hour window`, `weekly quota`, `wrong account for resume`, `no account available`, `other`. For `fail` the exception class name. |
 | `cmd#` | first 12 hex digits of the SHA-256 of the command; `-` when there is no command. For `qr launch` the command is `claude` followed by its arguments, shell-quoted. |
 
 Never written: the command or prompt, an email address, a directory, a note in the display language, an exception message. An account key, lead key, model class or session id that contains anything but letters, digits, `_`, `.` and `-` is written as `#` plus 12 hex digits of its hash. When several dispatches share one Bash command and one of them is denied, only the denial is logged.
@@ -673,7 +690,7 @@ One line per event, five fields:
 2026-10-11 21:02:09 | skipped-history | - | - | -
 ```
 
-Time, operation, exception class, code location (`file:line:function` of the innermost frame inside this package), subject (a state file, a lock name or an account key). Operations: `hook` (the hook itself failed; this is what "routing failed N times" counts), `launch` (`qr launch` failed and started the default account), `launch-timeout` (`qr launch` gave up waiting for its choice), `usage-query`, `state-save`, `lock-timeout`, `lock-failed`, `unlock-failed`, `skipped-decision-log`, `skipped-history`, `skipped-notices`, `skipped-failure-count`.
+Time, operation, exception class, code location (`file:line:function` of the innermost frame inside this package), subject (a state file, a lock name or an account key). Operations: `hook` (the hook itself failed; this is what "routing failed N times" counts), `launch` (`qr launch` failed and started the default account), `launch-timeout` (`qr launch` gave up waiting for its choice), `usage-query`, `login-refresh` (renewing a Claude login failed), `login-refresh-save` (a renewed Claude login could not be saved; see [Renewing an expired Claude login](#renewing-an-expired-claude-login)), `state-save`, `lock-timeout`, `lock-failed`, `unlock-failed`, `skipped-decision-log`, `skipped-history`, `skipped-notices`, `skipped-failure-count`.
 
 No exception message and no traceback is written here, because both can quote request headers, response bodies and config values. With `QR_DEBUG=1`, full tracebacks are appended to `debug.log`. A pattern-based scrub is applied to that file (`Bearer …` / `Basic …` values, strings starting with `sk-`, JWT-shaped strings, `NAME=<20 or more characters>` unless the value looks like a path), but it is best effort.
 

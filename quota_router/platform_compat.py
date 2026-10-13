@@ -380,10 +380,16 @@ def keychain_service(config_dir):
 
 
 def claude_credentials(config_dir, run):
-    """Raw JSON text of Claude Code's stored login for a config directory, or None.
+    """Raw JSON text of Claude Code's stored login for a config directory, or None. See claude_login()."""
+    return claude_login(config_dir, run)[0]
 
-    `config_dir` None means the default location. Read-only: nothing is refreshed
-    or written back. `run` is the same budget-aware runner as in list_processes().
+
+def claude_login(config_dir, run):
+    """(raw JSON text, where it came from) of Claude Code's stored login for a config directory, or (None, None).
+
+    `config_dir` None means the default location. Only reads. `where` is what save_claude_login() needs to
+    write a renewed login back to the same place: ("keychain", service, account) or ("file", path); the account
+    is None when the item was found by its service alone. `run` is the same budget-aware runner as in list_processes().
     macOS: the login keychain, through `security find-generic-password`. One service
     name can hold several items (one with the account "unknown" that has only MCP
     logins, one under the user's name with `claudeAiOauth`), and `security` returns
@@ -396,23 +402,128 @@ def claude_credentials(config_dir, run):
     found = []
     if system() == "darwin":
         service = keychain_service(config_dir)
-        queries = [["security", "find-generic-password", "-a", user, "-s", service, "-w"] for user in login_names()]
-        for argv in queries + [["security", "find-generic-password", "-s", service, "-w"]]:
+        queries = [(["security", "find-generic-password", "-a", user, "-s", service, "-w"], user) for user in login_names()]
+        for argv, user in queries + [(["security", "find-generic-password", "-s", service, "-w"], None)]:
             result = run(argv)
             if result is None:
                 break                    # no answer in time (or no `security`): asking again would only wait again
             if result.returncode == 0 and result.stdout.strip():
                 if has_claude_login(result.stdout):
-                    return result.stdout
-                found.append(result.stdout)
+                    return result.stdout, ("keychain", service, user)
+                found.append((result.stdout, ("keychain", service, user)))
+    path = credentials_file(config_dir)
     try:
-        with open(credentials_file(config_dir), encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             text = f.read()
         if has_claude_login(text) or not found:
-            return text
+            return text, ("file", path)
     except (OSError, ValueError):
         pass
-    return found[0] if found else None
+    return found[0] if found else (None, None)
+
+
+def keychain_account(service, run):
+    """The account attribute of the item `security find-generic-password -s <service>` finds, which is the one the
+    same query with -w read the login from; None when it cannot be told. Asks for the attributes only (without -w
+    or -g, `security` prints no secret)."""
+    result = run(["security", "find-generic-password", "-s", service])
+    if result is None or result.returncode != 0:
+        return None
+    m = re.search(r'"acct"<blob>="([^"\n]*)"', result.stdout)
+    return m[1] if m and m[1] else None
+
+
+KEYCHAIN_STDIN_LIMIT = 4032      # Claude Code's limit for one `security -i` command line; above it, it uses argv
+
+
+def save_claude_login(where, text, run):
+    """Write a renewed Claude Code login back to where claude_login() read it. Raises OSError when it was not written.
+
+    `text` must be the complete JSON (claudeAiOauth with every other top-level key of the stored one); it is
+    refused unless has_claude_login() accepts it, so a partial object is never written.
+    Keychain (macOS): `add-generic-password -U` on the same service and account, with the JSON hex-encoded (`-X`)
+    and the command fed to `security -i` on stdin. That is exactly how Claude Code 2.1.296 writes this item, and
+    it keeps the token off every command line. Like Claude Code, a command longer than its stdin limit goes on
+    argv instead. `run(argv, input=None)` is the budget-aware runner.
+    File (Linux, Windows, or a login read from the file): a temporary file with mode 0600 next to
+    .credentials.json, then renamed over it, so a reader sees the old file or the new one, never half of one.
+    """
+    if not has_claude_login(text):
+        raise ValueError("not a complete Claude login")
+    if where[0] == "keychain":
+        _, service, account = where
+        for value in (account, service):
+            if not value or '"' in value or "\n" in value:
+                raise OSError(errno.EINVAL, "unusable keychain item name")
+        payload = text.encode("utf-8").hex()
+        command = f'add-generic-password -U -a "{account}" -s "{service}" -X "{payload}"\n'
+        if len(command) <= KEYCHAIN_STDIN_LIMIT:
+            result = run(["security", "-i"], input=command)
+        else:
+            result = run(["security", "add-generic-password", "-U", "-a", account, "-s", service, "-X", payload])
+        if result is None or result.returncode != 0:
+            raise OSError(errno.EIO, "security add-generic-password failed")
+        return
+    path = where[1]
+    folder = os.path.dirname(path)
+    tmp = os.path.join(folder, f".credentials.json.{os.getpid()}.{os.urandom(6).hex()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+# Claude Code serialises its own refreshes with proper-lockfile: a directory `<config dir>/.oauth_refresh.lock`
+# (mtime renewed every 5 s, stale after 60 s), plus a legacy one, `<config dir, links resolved>.lock`. Holding both
+# while quota-router renews a login keeps a Claude Code process that starts meanwhile from renewing it at the same time.
+CLAUDE_LOCK_STALE_SEC = 60
+
+
+def claude_refresh_locks(config_dir):
+    base = config_dir or os.path.join(home(), ".claude")
+    return [os.path.join(base, ".oauth_refresh.lock"), os.path.realpath(base) + ".lock"]
+
+
+def take_claude_refresh_lock(config_dir):
+    """Take Claude Code's refresh locks for a config directory. Returns the list of lock directories to hand to
+    release_claude_refresh_lock(), or None when Claude Code (or another quota-router) holds one. A lock older than
+    Claude Code's stale limit is taken over, as Claude Code itself would."""
+    taken = []
+    for path in claude_refresh_locks(config_dir):
+        try:
+            os.mkdir(path)
+        except FileExistsError:
+            try:
+                stale = time.time() - os.stat(path).st_mtime > CLAUDE_LOCK_STALE_SEC
+                if stale:
+                    os.rmdir(path)
+                    os.mkdir(path)
+            except OSError:
+                stale = False
+            if not stale:
+                release_claude_refresh_lock(taken)
+                return None
+        except OSError:
+            release_claude_refresh_lock(taken)
+            return None
+        taken.append(path)
+    return taken
+
+
+def release_claude_refresh_lock(taken):
+    for path in reversed(taken or []):
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass
 
 
 def login_names():

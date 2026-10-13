@@ -21,7 +21,7 @@ POISON = f"Authorization: Bearer {TOKEN} for {EMAIL} while running {COMMAND}"
 NEEDLES = (TOKEN, EMAIL, "alice", PROMPT, "claude -p", "codex exec", "API_TOKEN", "Bearer")
 ERROR_LINE = re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \| ([a-z-]+|#[0-9a-f]{12}) \| (-|[A-Za-z_][A-Za-z0-9_]*) \| "
                         r"(-|[a-z_]+\.py:\d+:[A-Za-z0-9_]+) \| (-|[A-Za-z0-9_.-]+|#[0-9a-f]{12})")
-DECISION_LINE = re.compile(r"\d\d-\d\d \d\d:\d\d:\d\d \| (hook|qr pick|qr check|probe|other) \| lead=[A-Za-z0-9_.#?-]+( \(assumed\))? \| "
+DECISION_LINE = re.compile(r"\d\d-\d\d \d\d:\d\d:\d\d \| (hook|qr pick|qr check|probe|refresh|other) \| lead=[A-Za-z0-9_.#?-]+( \(assumed\))? \| "
                            r"sess=(-|[A-Za-z0-9_.-]{1,8}|#[0-9a-f]{12}) \| (claude|codex|\?|other) \| ([a-z-]+|#[0-9a-f]{12}) \| "
                            r"pick=(-|[A-Za-z0-9_.-]+|#[0-9a-f]{12}) \| [A-Za-z0-9 %.,;:#-]* \| cmd#([0-9a-f]{12}|-)")
 
@@ -209,3 +209,31 @@ def test_debug_file_is_separate_and_opt_in(live, monkeypatch, capsys):
     assert "Traceback" in debug and "usage-query" in debug          # the detail is here, and may be sensitive
     (state / "debug.log").unlink()
     logs(live)                                                      # every other file is still clean
+
+
+@pytest.mark.parametrize("outcome", ["renewed", "dead", "failed", "unsaved"])
+def test_login_renewal(router, write_config, monkeypatch, capsys, outcome):
+    """A renewed Claude login: neither the old nor the new tokens, nor anything the token endpoint says, reach a log
+    file or the output. The tokens are only ever written to Claude Code's own credential file."""
+    import test_login_refresh as lr
+    core = router.core
+    store = lr.make_store(router, write_config, monkeypatch, "file")
+    monkeypatch.setattr(core, "claude_reading", lambda acc, cache, force=False: core.cached_reading("claude", acc, cache, force))
+    store.put(lr.login(access=f"old-{TOKEN}", refresh=f"refresh-{TOKEN}"))
+    body = json.dumps({"error": "invalid_grant", "error_description": POISON}).encode()
+    store.answer = {
+        "dead": lambda: urllib.error.HTTPError(lr.TOKEN_URL, 400, POISON, {}, io.BytesIO(body)),
+        "failed": lambda: OSError(POISON),
+    }.get(outcome, lr.answer(access_token=f"new-{TOKEN}", refresh_token=f"rotated-{TOKEN}"))
+    if outcome == "unsaved":
+        real = store.pc.replace
+        monkeypatch.setattr(store.pc, "replace", lambda source, target: (_ for _ in ()).throw(PermissionError(13, POISON, target))
+                            if target.endswith(".credentials.json") else real(source, target))
+    captured = run_hook(monkeypatch, capsys, command='claude -p "summarise" --model opus')
+    assert len(store.token_calls) == 1
+    for needle in (TOKEN, EMAIL):
+        assert needle not in captured.err and needle not in captured.out
+    found = logs(router)
+    assert " | refresh | " in found["decisions.log"]
+    saved = store.stored()["claudeAiOauth"]
+    assert saved["accessToken"] == (f"new-{TOKEN}" if outcome == "renewed" else f"old-{TOKEN}")

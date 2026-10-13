@@ -38,6 +38,7 @@ reset_drop_points = 5
 
 [families.claude]
 scarce_model = "Opus"
+refresh_logins = false
 
 [launch]
 route_print = true
@@ -45,6 +46,7 @@ route_print = true
 [endpoints]
 claude_usage = "http://127.0.0.1:1/usage"
 claude_profile = "http://127.0.0.1:1/profile"
+claude_token = "http://127.0.0.1:1/token"
 codex_usage = "http://127.0.0.1:1/codex"
 """ + CONFIG
 
@@ -60,6 +62,7 @@ def test_full_file_overrides_every_default(write_config):
     assert cfg["timing.codex_stale_hours"] == 1.5
     assert cfg["events.reset_drop_points"] == 5
     assert cfg["families.claude.scarce_model"] == "opus"   # compared case-insensitively
+    assert cfg["families.claude.refresh_logins"] is False
     assert cfg["launch.route_print"] is True
     assert [a["key"] for a in cfg.accounts] == ["claude-main", "claude-b", "codex-1", "codex-2"]
     assert cfg.warnings == []
@@ -73,6 +76,7 @@ def test_accounts_only_file_uses_defaults(write_config):
     assert cfg["general.allow_credits"] is False
     assert (cfg["hints.home_low"], cfg["hints.other_high"], cfg["hints.other_idle"]) == (30, 50, 90)
     assert cfg["families.claude.scarce_model"] == "fable"
+    assert cfg["families.claude.refresh_logins"] is True
 
 
 def test_missing_file(home, monkeypatch):
@@ -240,12 +244,14 @@ def test_endpoints_default_to_the_vendors_and_can_be_overridden(write_config):
     cfg = config.load(write_config())
     assert cfg["endpoints.claude_usage"] == "https://api.anthropic.com/api/oauth/usage"
     assert cfg["endpoints.claude_profile"] == "https://api.anthropic.com/api/oauth/profile"
+    assert cfg["endpoints.claude_token"] == "https://platform.claude.com/v1/oauth/token"
     assert cfg["endpoints.codex_usage"] == "https://chatgpt.com/backend-api/wham/usage"
     previous = core.ENDPOINTS
     try:
         core.configure(config.load(write_config('[endpoints]\ncodex_usage = "http://127.0.0.1:9/u"\n' + CONFIG)))
         assert core.ENDPOINTS == {"claude_usage": "https://api.anthropic.com/api/oauth/usage",
                                   "claude_profile": "https://api.anthropic.com/api/oauth/profile",
+                                  "claude_token": "https://platform.claude.com/v1/oauth/token",
                                   "codex_usage": "http://127.0.0.1:9/u"}
     finally:
         core.ENDPOINTS = previous
