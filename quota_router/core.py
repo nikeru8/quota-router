@@ -6,7 +6,7 @@ from contextvars import ContextVar
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 
-from . import config, i18n, platform_compat
+from . import __version__, config, i18n, platform_compat
 from .i18n import t
 
 HOME = os.path.expanduser("~")
@@ -46,6 +46,7 @@ AGY_MODEL = ""                 # --model added to an `agy -p` dispatch that name
 AGY_PROGRAM = "agy"            # the Antigravity CLI that is asked for its quota (`agy -p /usage`)
 LABELS = {"claude": "Claude", "codex": "Codex", "agy": "agy"}
 VERBS = {"claude": "claude -p", "codex": "codex exec", "agy": "agy -p"}
+REFRESH_LOGINS = True          # renew an expired Claude login with its refresh token, as Claude Code would (QR_NO_REFRESH=1: never)
 # where the login tokens are sent; the config file can point these elsewhere for tests or a proxy.
 ENDPOINTS = {name.split(".", 1)[1]: url for name, url in config.DEFAULTS.items() if name.startswith("endpoints.")}
 
@@ -90,6 +91,7 @@ def configure(cfg):
         NOTICE_TTL=cfg["timing.notice_ttl_hours"] * 3600,
         RESET_DROP=cfg["events.reset_drop_points"],
         ALLOW_CREDITS=cfg["general.allow_credits"],
+        REFRESH_LOGINS=cfg["families.claude.refresh_logins"],
         ENDPOINTS={name: cfg["endpoints." + name] for name in ENDPOINTS},
         SCARCE=scarce, SCARCE_LABEL=scarce.capitalize() if scarce else "")
 
@@ -207,11 +209,16 @@ def log_error(operation, error=None, subject=None):
     """One structured line in hook-errors.log: time | operation | exception class | code location | subject.
 
     Nothing else is ever written there. In particular not the exception's message and not a traceback: both
-    can quote request headers, response bodies, config values or the command. `operation` is a fixed name from
-    the code and `subject` a state file, lock or account key, hashed when it has unusual characters.
+    can quote request headers, response bodies, config values or the command. The one exception is the status
+    code of an HTTP error answer, appended to its class (`HTTPError-403`): a number, and without it a refusal
+    could not be told from an outage. `operation` is a fixed name from the code and `subject` a state file, lock
+    or account key, hashed when it has unusual characters.
     QR_DEBUG=1 additionally appends the full traceback to debug.log, which may therefore hold sensitive text."""
     try:
         kind = log_token(type(error).__name__) if error is not None else "-"
+        status = getattr(error, "code", None) if isinstance(error, urllib.error.HTTPError) else None
+        if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 999:
+            kind += f"-{status}"
         with open(os.path.join(STATE, "hook-errors.log"), "a", encoding="utf-8") as f:
             f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} | {log_token(operation)} | {kind} | "
                     f"{error_location(error)} | {log_token(subject)}\n")
@@ -265,13 +272,13 @@ def state_lock(name, timeout=2):
                 f.close()
 
 
-def run_local(argv):
+def run_local(argv, input=None):
     """Local commands (keychain, ps) share the time budget; a timeout counts as no data."""
     if remaining() <= 0:
         return None
     try:
         return subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=min(2, remaining()))
+                              timeout=min(2, remaining()), input=input)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
 
@@ -444,6 +451,463 @@ def oauth_get(path, tok):
     return network_json(req)
 
 
+# ---- renewing an expired Claude login ----------------------------------------
+# What Claude Code 2.1.296 does, read from its bundle (~/.local/share/claude/versions/2.1.296, function RSe and its
+# callers): when the access token expires within five minutes it POSTs JSON (Content-Type: application/json) to
+# TOKEN_URL https://platform.claude.com/v1/oauth/token with
+#   {"grant_type": "refresh_token", "refresh_token": ..., "client_id": <clientId stored with the login, else
+#    CLIENT_ID 9d1c250a-e61b-44d9-88ed-5944d1962f5e>, "scope": <scopes joined by spaces>}
+# with a 30 s timeout. It stores accessToken, refreshToken, expiresAt = now + expires_in (ms),
+# refreshTokenExpiresAt (kept when the answer has none) and scopes, keeps subscriptionType and rateLimitTier, and saves
+# only when the stored refreshToken is still the one it sent (else it adopts what another process saved), retrying
+# the save three times. A 400/401 answer with error "invalid_grant" means the refresh token is dead; the same with
+# "account_on_hold" in error_description means the account is on hold. It does not renew a login that has neither
+# the user:inference scope nor a subscriptionType. For the default client it asks for its full current scope list
+# and, on "invalid_scope", repeats the request with the stored scopes; quota-router sends the stored scopes straight
+# away (one request, always a subset of what was granted).
+# What the real endpoint did when the supervisor tried it on 2026-10-13:
+# - It sits behind Cloudflare, which refuses Python's default User-Agent with HTTP 403 (error 1010) before the
+#   request reaches the application; any other honest User-Agent (quota-router/<version>) is let through.
+# - A successful answer has token_type "Bearer", access_token, expires_in 28800 (8 h), refresh_token,
+#   refresh_token_expires_in 1862778 (about 21.6 days), scope (the same six scopes, space separated), and token_uuid,
+#   organization and account (objects; not stored). The refresh token is rotated: the answer carries a new one and
+#   the one sent is dead from then on. So once the server has answered, the new refresh token must be saved or that
+#   directory is signed out; that is why the renewal runs in a background process of its own (see renewal_main()).
+# - A bad refresh token gets HTTP 400 {"error": "invalid_grant", "error_description": "..."}.
+# - A handful of failed requests within a minute get HTTP 429 {"error": {"type": "rate_limit_error", ...}}.
+REFRESH_MARGIN_SEC = 300       # renew when the access token expires within five minutes, like Claude Code
+REFRESH_TIMEOUT_SEC = 30       # the background renewal's socket timeout, as Claude Code's
+REFRESH_CEILING_SEC = 120      # ...and the most it waits for a whole answer that trickles in
+REFRESH_RETRY_SEC = 600        # after a failed renewal (an answer that was an error, or none), ten minutes until the next
+REFRESH_IDLE_SEC = 60          # after "busy" / "none": a minute, so an expired login with a session on it is not re-checked on every dispatch
+REFRESH_GAP_SEC = 120          # at most one renewal is started per account in this long
+REFRESH_WAIT_SEC = 35          # `qr status --refresh` on a terminal waits this long for the renewals it started
+REFRESH_START_SEC = 2          # a reading starts a renewal only with this much of its time budget left (the process list, the start)
+REFRESH_LIFE_FALLBACK = 3600   # the expiry stored when an answer's expires_in is unusable
+REFRESH_WRITE_PAUSES = (0, 0.2, 0.5)   # one write attempt after each pause, like Claude Code's three
+REFRESH_READBACK_PAUSES = (0, 0.2, 0.5)   # a read-back that finds no login at all is repeated after these
+CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+USER_AGENT = f"quota-router/{__version__}"
+ENTRY_FILE = os.path.join(PACKAGE_DIR, "__main__.py")
+RENEWALS = []                  # (account key, Popen) of the renewals this process started; `qr status --refresh` waits for them
+# the outcomes that only wait REFRESH_IDLE_SEC; every other one waits REFRESH_RETRY_SEC.
+REFRESH_IDLE_OUTCOMES = ("busy", "none")
+REFRESH_TEXT = {
+    "started": "renewal started in the background",
+    "renewed": "login renewed",
+    "adopted": "already renewed elsewhere",
+    "busy": "Claude Code may be using that directory",
+    "locked": "Claude Code holds its lock",
+    "running": "another renewal is running",
+    "none": "nothing to renew with",
+    "failed": "renewal failed",
+    "odd": "odd answer; new refresh token kept",
+    "dead": "refresh token refused; run claude login there",
+    "on-hold": "account on hold",
+    "unsaved": "renewed but could not be saved",
+    "unverified": "renewed and saved; read-back failed",
+    "off": "renewal turned off",
+}
+
+
+def classify_claude_process(cmd):
+    """'claude' for any Claude Code process (a session, a -p job, a subcommand, a resident helper), else None. Any of
+    them may renew its directory's login itself, so quota-router leaves that login alone while one runs."""
+    argv = split_command_line(cmd)
+    if not argv or any(x in argv[0] for x in NOT_SUBAGENT[:3]):
+        return None
+    exe = program_name(argv[0])
+    if exe in SCRIPT_HOSTS:
+        script = next((i for i, word in enumerate(argv[1:], 1) if not word.startswith("-")), None)
+        exe = script_cli(argv[script]) if script else None
+    return "claude" if exe == "claude" else None
+
+
+def login_busy(acc):
+    """True when a Claude Code process may be using this account's directory, and also whenever that cannot be told:
+    the process list could not be read, or a Claude Code process's directory is unknown. On Windows another
+    process's environment is unreadable, so any Claude Code process whose CLAUDE_CONFIG_DIR is not written on its
+    own or an ancestor's command line (a launcher session, the session the hook runs in) makes every account busy."""
+    procs = platform_compat.read_processes(run_local)
+    if procs is None:
+        return True
+    default = os.path.join(HOME, ".claude")
+    mine = platform_compat.canonical(acc["dir"] or default)
+    for pid, (_, cmd) in procs.items():
+        if not classify_claude_process(cmd):
+            continue
+        env = platform_compat.process_environment(pid, cmd, run_local)
+        if env is not None:
+            found = re.findall(r"(?:^|\s)CLAUDE_CONFIG_DIR=(\S*)", env)
+            value = found[-1] if found else None
+        else:
+            # POSIX: it ended meanwhile, or `ps` gave no answer in time. Windows: only a command line can tell.
+            value = platform_compat.directory_from_command_lines(pid, procs, "CLAUDE_CONFIG_DIR")
+            if value is None:
+                return True
+        if platform_compat.canonical(value or default) == mine:
+            return True
+    return False
+
+
+def stored_claude_login(acc):
+    """(whole stored JSON as a dict, its claudeAiOauth, where it came from), or (None, None, None)."""
+    text, where = platform_compat.claude_login(acc["dir"], run_local)
+    try:
+        data = json.loads(text)
+        oauth = data["claudeAiOauth"]
+        if isinstance(oauth, dict) and isinstance(oauth.get("accessToken"), str):
+            return data, oauth, where
+    except (TypeError, ValueError, KeyError):
+        pass
+    return None, None, None
+
+
+def login_expiry(oauth):
+    value = oauth.get("expiresAt")
+    return value / 1000 if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def number(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
+
+
+def refresh_disabled():
+    return not REFRESH_LOGINS or bool(os.environ.get("QR_NO_REFRESH"))
+
+
+def renewal_blocker(oauth, c):
+    """Why this stored login is not to be renewed: "none" (no refresh token, or not a login Claude Code itself would
+    renew: no user:inference among its stored scopes), "dead" (the refresh token was refused before or has expired),
+    or None when it may be. `c` is the account's cache entry."""
+    refresh = oauth.get("refreshToken")
+    if not isinstance(refresh, str) or not refresh:
+        return "none"
+    if c.get("refresh_dead") == fingerprint(refresh):
+        return "dead"
+    dies = number(oauth.get("refreshTokenExpiresAt"))
+    if dies is not None and dies / 1000 <= now():
+        c["refresh_dead"] = fingerprint(refresh)
+        return "dead"
+    scopes = oauth.get("scopes")
+    if not (isinstance(scopes, list) and all(isinstance(x, str) for x in scopes) and "user:inference" in scopes):
+        return "none"
+    if platform_compat.system() == "windows" and os.environ.get("CLAUDE_CODE_FORCE_WINDOWS_CREDMAN"):
+        return "none"           # the live login is in the Credential Manager; a .credentials.json is a leftover
+    return None
+
+
+def renewal_error(state):
+    """The error a reading shows for an expired login, given where its renewal stands."""
+    return t({"dead": "err.login_dead", "on-hold": "err.login_on_hold",
+              "unsaved": "err.refresh_unsaved"}.get(state, "err.expired"))
+
+
+def start_renewal(acc, c):
+    """Called by a reading (the hook, qr status / pick / check / launch) that finds a Claude login expired or about to
+    expire. It never contacts the token endpoint itself: when the login may be renewed it starts one background
+    process (`renew-login <key>`, see renewal_main()) and returns "started". Otherwise it returns why not: "off",
+    "budget", the outcome of the last attempt while its cooldown runs, "busy", "none", "dead" or "running" (one was
+    started less than REFRESH_GAP_SEC ago). `c` is the account's cache entry; the cooldown lives there."""
+    if refresh_disabled():
+        return "off"
+    if c.get("refresh_retry_at", 0) > now():
+        return c.get("refresh_failed", "failed")
+    for field in ("refresh_failed", "refresh_retry_at"):     # an earlier attempt's outcome no longer applies
+        c.pop(field, None)
+    if remaining() < REFRESH_START_SEC:
+        return "budget"
+    _, oauth, where = stored_claude_login(acc)
+    if oauth is None or where is None:
+        state = "none"
+    elif login_expiry(oauth) - now() >= REFRESH_MARGIN_SEC:
+        return "adopted"
+    else:
+        state = renewal_blocker(oauth, c) or ("busy" if login_busy(acc) else None)
+    if state:
+        c["refresh_failed"] = state
+        c["refresh_retry_at"] = now() + (REFRESH_IDLE_SEC if state in REFRESH_IDLE_OUTCOMES else REFRESH_RETRY_SEC)
+        return state
+    marker = os.path.join(STATE, f"refresh-{acc['key']}.start")
+    try:
+        # removing an old marker and claiming a new one with O_EXCL both happen under the cache lock, like the Codex probe's.
+        with state_lock("cache"):
+            try:
+                if now() - os.stat(marker).st_mtime >= REFRESH_GAP_SEC:
+                    os.unlink(marker)
+            except FileNotFoundError:
+                pass
+            try:
+                os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+            except FileExistsError:
+                return "running"
+        process = spawn_renewal(acc)
+    except Exception as e:
+        log_error("login-refresh-start", e, acc["key"])
+        return "failed"
+    if process is not None:
+        RENEWALS.append((acc["key"], process))
+    log_decision("refresh", "claude", "refresh-started", account=acc["key"], text=REFRESH_TEXT["started"])
+    return "started"
+
+
+def spawn_renewal(acc):
+    """Start `python -I -X utf8 <this package>/__main__.py renew-login <key>` detached, its output appended to
+    refresh-<key>.log in the state directory. Separate so tests can replace it."""
+    with open(os.path.join(STATE, f"refresh-{acc['key']}.log"), "a", encoding="utf-8") as log:
+        return platform_compat.spawn_detached([sys.executable, "-I", "-X", "utf8", ENTRY_FILE, "renew-login", acc["key"]],
+                                              env=dict(os.environ), stdout=log, stderr=log)
+
+
+def wait_for_renewals(seconds=REFRESH_WAIT_SEC):
+    """Wait, up to `seconds` in all, for the renewals this process started. True when at least one has ended."""
+    end, ended = time.monotonic() + seconds, False
+    while RENEWALS:
+        _, process = RENEWALS.pop()
+        try:
+            process.wait(timeout=max(0.0, end - time.monotonic()))
+            ended = True
+        except Exception:
+            pass
+    return ended
+
+
+def renewal_main(argv):
+    """`qr renew-login <key>`: the background renewal a reading started (see start_renewal()). Not a user command.
+
+    It runs outside every hook's time budget, takes the account's quota-router lock and Claude Code's three locks
+    (claude_locks()), checks again that no Claude Code process uses the directory and that the login still needs
+    renewing, POSTs with a 30 s timeout, and writes the answer back with up to three attempts. From the POST until
+    the write is confirmed it ignores SIGINT, SIGTERM and SIGHUP (on Windows SIGINT and SIGBREAK only; a
+    TerminateProcess, as Task Manager or `taskkill /F` do, cannot be refused). Every outcome is one line in
+    decisions.log and one in refresh-<key>.log; a failure also one in hook-errors.log, with the HTTP status code when
+    there was one. No token, no answer body and no error_description is written anywhere but the credential store."""
+    acc = next((a for a in CLAUDE_ACCOUNTS if argv and a["key"] == argv[0]), None)
+    if acc is None:
+        return 2
+    try:
+        outcome = renew_login(acc)
+    except BaseException as e:            # anything at all: one structured line, never a traceback
+        outcome = finish_renewal(acc, "failed", error=e)
+    print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {outcome}", flush=True)
+    return 0
+
+
+def renew_login(acc):
+    if refresh_disabled():
+        return "off"
+    with state_lock("refresh-" + acc["key"], timeout=0) as locked:
+        if not locked:
+            return finish_renewal(acc, "busy", text=REFRESH_TEXT["running"])
+        held = platform_compat.take_claude_refresh_lock(acc["dir"])
+        if held is None:
+            return finish_renewal(acc, "busy", text=REFRESH_TEXT["locked"])
+        try:
+            with platform_compat.LockHeartbeat(held):
+                return renew_locked(acc)
+        finally:
+            platform_compat.release_claude_refresh_lock(held)
+
+
+def renew_locked(acc):
+    """The part of renew_login() that runs with every lock held."""
+    data, oauth, where = stored_claude_login(acc)
+    if oauth is None or where is None:
+        return finish_renewal(acc, "none")
+    if login_expiry(oauth) - now() >= REFRESH_MARGIN_SEC:
+        return finish_renewal(acc, "adopted")            # renewed by someone else meanwhile
+    c = load("cache.json", {}).get(acc["key"], {})
+    blocker = renewal_blocker(oauth, c)
+    if blocker:
+        return finish_renewal(acc, blocker, dead=c.get("refresh_dead"))
+    if where[0] == "keychain" and where[2] is None:
+        account = platform_compat.keychain_account(where[1], run_local)
+        if not account:
+            return finish_renewal(acc, "none")
+        where = (where[0], where[1], account)
+    if where[0] == "file" and not os.path.isfile(where[1]):
+        return finish_renewal(acc, "none")
+    if login_busy(acc):
+        return finish_renewal(acc, "busy")
+    refresh = oauth["refreshToken"]
+    client = oauth.get("clientId") if isinstance(oauth.get("clientId"), str) and oauth.get("clientId") else CLAUDE_CLIENT_ID
+    body = json.dumps({"grant_type": "refresh_token", "refresh_token": refresh, "client_id": client,
+                       "scope": " ".join(oauth["scopes"])}).encode()
+    with interruption_shield():
+        try:
+            answer = post_token(body)
+        except urllib.error.HTTPError as e:
+            code, description = oauth_error(e)
+            if e.code in (400, 401, 403) and code in ("invalid_grant", "access_denied") and "account_on_hold" in description:
+                return finish_renewal(acc, "on-hold", error=e)
+            if e.code in (400, 401) and code == "invalid_grant":
+                return finish_renewal(acc, "dead", error=e, dead=fingerprint(refresh))
+            return finish_renewal(acc, "failed", error=e)          # 429 and 5xx included: never retried here
+        except Exception as e:
+            return finish_renewal(acc, "failed", error=e)
+        try:
+            fields, complete = renewed_login(oauth, answer, refresh)
+        except ValueError as e:
+            return finish_renewal(acc, "failed", error=e)
+        written = write_renewed_login(acc, where, refresh, fields)
+    if written != "renewed":
+        return finish_renewal(acc, written, error=OSError(written))
+    if not complete:
+        return finish_renewal(acc, "failed", text=REFRESH_TEXT["odd"])
+    return finish_renewal(acc, "renewed", old=oauth["accessToken"], new=fields["accessToken"])
+
+
+@contextmanager
+def interruption_shield():
+    """Ignore the signals that ask a process to stop while the block runs; restore them afterwards."""
+    saved = {}
+    import signal, threading
+    if threading.current_thread() is threading.main_thread():
+        for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"):
+            number_ = getattr(signal, name, None)
+            if number_ is None:
+                continue
+            try:
+                saved[number_] = signal.signal(number_, signal.SIG_IGN)
+            except (OSError, ValueError, RuntimeError):
+                pass
+    try:
+        yield
+    finally:
+        for number_, handler in saved.items():
+            try:
+                signal.signal(number_, handler)
+            except (OSError, ValueError, RuntimeError, TypeError):
+                pass
+
+
+def post_token(body):
+    """The one POST to the token endpoint; redirects are never followed (NoRedirect)."""
+    req = urllib.request.Request(ENDPOINTS["claude_token"], data=body, method="POST",
+                                 headers={"Content-Type": "application/json", "Accept": "application/json",
+                                          "User-Agent": USER_AGENT})
+
+    def fetch():
+        with open_url(req, timeout=REFRESH_TIMEOUT_SEC) as response:
+            return json.load(response)
+    return platform_compat.call_with_deadline(fetch, REFRESH_CEILING_SEC, lambda: TimeoutError("token answer too slow"))
+
+
+def oauth_error(error):
+    """(the `error` code of an OAuth error answer or None, its error_description or ""). `error` may also be an
+    object with a `type` (the 429 answer). Neither is ever logged."""
+    try:
+        body = json.loads(error.read(65536) or b"{}")
+        code = body.get("error")
+        code = code.get("type") if isinstance(code, dict) else code
+        description = body.get("error_description")
+        return (code if isinstance(code, str) else None), (description if isinstance(description, str) else "")
+    except Exception:
+        return None, ""
+
+
+def renewed_login(oauth, answer, refresh):
+    """(the claudeAiOauth fields a token answer changes, whether it is a complete renewal).
+
+    A complete one has an access token, a usable expires_in (else REFRESH_LIFE_FALLBACK is assumed) and, when it
+    names scopes, user:inference among them. An answer that is not complete but carries a new refresh token still
+    yields that token: the one sent is dead by now, so dropping it would sign the directory out. Raises ValueError
+    when the answer holds nothing worth storing."""
+    if not isinstance(answer, dict):
+        raise ValueError("token answer is not an object")
+    at = now()
+    fields = {}
+    rotated = answer.get("refresh_token")
+    if isinstance(rotated, str) and rotated and rotated != refresh:
+        fields["refreshToken"] = rotated
+        longevity = number(answer.get("refresh_token_expires_in"))
+        if longevity is not None and 0 < longevity < 10 ** 10:
+            fields["refreshTokenExpiresAt"] = int((at + longevity) * 1000)
+    access = answer.get("access_token")
+    scope = answer.get("scope")
+    scopes = scope.split() if isinstance(scope, str) and scope.split() else None
+    # Claude Code does not keep a login without inference access either; it would no longer be a Claude.ai login.
+    if isinstance(access, str) and access and "user:inference" in (scopes or oauth["scopes"]):
+        life = number(answer.get("expires_in"))
+        life = life if life is not None and 0 < life < 10 ** 9 else REFRESH_LIFE_FALLBACK
+        fields.update(accessToken=access, expiresAt=int((at + life) * 1000))
+        if scopes:
+            fields["scopes"] = scopes
+        if "refreshToken" not in fields:
+            longevity = number(answer.get("refresh_token_expires_in"))
+            if longevity is not None and 0 < longevity < 10 ** 10:
+                fields["refreshTokenExpiresAt"] = int((at + longevity) * 1000)
+        return fields, True
+    if "refreshToken" in fields:
+        return fields, False
+    raise ValueError("token answer without a usable access token")
+
+
+def write_renewed_login(acc, where, refresh, fields):
+    """Save `fields` over the stored login, compare-and-set on the refresh token that was sent, as Claude Code does.
+    Up to three attempts, each re-reading the store first; a read-back confirms the write. Returns "renewed",
+    "unverified" (written, but the read-back found no login), "unsaved" or "conflict" (the stored login changed
+    to one this renewal did not write, which a process that ignores Claude Code's locks could do)."""
+    outcome = "unsaved"
+    for pause in REFRESH_WRITE_PAUSES:
+        time.sleep(pause)
+        latest, current, _ = stored_claude_login(acc)
+        if current is None:
+            continue                                         # the store did not answer this time
+        if all(current.get(k) == v for k, v in fields.items()):
+            return "renewed"                                 # an earlier attempt landed after all
+        if current.get("refreshToken") != refresh:
+            return "conflict"
+        # everything else in the stored JSON (mcpOAuth, fields this code does not know) is kept as it is now.
+        text = json.dumps(dict(latest, claudeAiOauth=dict(current, **fields)), ensure_ascii=False, separators=(",", ":"))
+        try:
+            platform_compat.save_claude_login(where, text, run_local)
+        except Exception as e:
+            log_error("login-refresh-save", e, acc["key"])
+            continue
+        for wait in REFRESH_READBACK_PAUSES:
+            time.sleep(wait)
+            back = stored_claude_login(acc)[1]
+            if back is not None:
+                break
+        if back is None:
+            outcome = "unverified"
+            break
+        if all(back.get(k) == v for k, v in fields.items()):
+            return "renewed"
+    return outcome
+
+
+def finish_renewal(acc, outcome, error=None, text=None, dead=None, old=None, new=None):
+    """Record how a background renewal ended: the account's cooldown in cache.json, one line in decisions.log, and
+    for a failure one in hook-errors.log. Returns the outcome."""
+    shown = {"conflict": "unsaved"}.get(outcome, outcome)
+    with state_lock("cache"):
+        latest = load("cache.json", {})
+        c = latest.setdefault(acc["key"], {})
+        if shown in ("renewed", "adopted", "unverified"):
+            for field in ("refresh_failed", "refresh_retry_at", "refresh_dead"):
+                c.pop(field, None)
+            if old and new and c.get("token_sig") == fingerprint(old):
+                c["token_sig"] = fingerprint(new)            # the same login with a new token: its readings stay
+        elif shown != "off":
+            c["refresh_failed"] = shown
+            c["refresh_retry_at"] = now() + (REFRESH_IDLE_SEC if shown in REFRESH_IDLE_OUTCOMES else REFRESH_RETRY_SEC)
+            if shown == "dead" and dead:
+                c["refresh_dead"] = dead
+        save("cache.json", latest)
+    if error is not None:
+        log_error("login-refresh-save" if shown in ("unsaved", "unverified") else "login-refresh", error, acc["key"])
+    if text is None:
+        text = REFRESH_TEXT[shown]
+        status = getattr(error, "code", None) if isinstance(error, urllib.error.HTTPError) else None
+        if shown == "failed" and isinstance(status, int):
+            text += f", HTTP {status}"
+    mode = "refresh" if shown == "renewed" else "refresh-" + shown
+    log_decision("refresh", "claude", mode, account=acc["key"], text=text)
+    return outcome
+
+
 class BudgetTimeout(TimeoutError):
     """This dispatch ran out of time; it does not mean the usage service is down."""
 
@@ -532,6 +996,12 @@ def merge_cache(key, before, reading, owner=None):
             return current
         if any(current.get(field) and before.get(field) and current[field] != before[field]
                for field in ("token_sig", "account_sig")):
+            if owner and current.get("inflight_owner") == owner:
+                # this call's claim is released all the same, so the new login is read at once.
+                current.pop("inflight_until", None)
+                current.pop("inflight_owner", None)
+                latest[key] = current
+                save("cache.json", latest)
             return current
         patch = {k: v for k, v in reading.items() if k not in before or before[k] != v}
         older = fetched(reading) < fetched(current)
@@ -539,7 +1009,7 @@ def merge_cache(key, before, reading, owner=None):
             for k in ("usage", "fetched", "live", "credits", "error", "notes_extra", "allowed", "limit_reached", "reset_credits", "reset_checked", "extra_usage", "extra_usage_at"):
                 patch.pop(k, None)
         current = dict(current, **patch)
-        for k in ("error", "retry_at", "failures", "notes_extra", "no_login"):
+        for k in ("error", "retry_at", "failures", "notes_extra", "no_login", "refresh_failed", "refresh_retry_at", "refresh_dead"):
             if not older and k in before and k not in reading and current.get(k) == before[k]:
                 current.pop(k, None)
         if owner:
@@ -572,7 +1042,8 @@ def cached_reading(family, acc, cache, force=False):
             # a new login drops only this tool's old readings; fields added by other programs stay.
             for field in ("usage", "fetched", "email", "profile_at", "credits", "live", "error", "no_login",
                           "retry_at", "failures", "probe_at", "notes_extra", "inflight_until", "inflight_owner",
-                          "allowed", "limit_reached", "reset_credits", "reset_checked", "extra_usage", "extra_usage_at"):
+                          "allowed", "limit_reached", "reset_credits", "reset_checked", "extra_usage", "extra_usage_at",
+                          "refresh_failed", "refresh_retry_at", "refresh_dead"):
                 c.pop(field, None)
             c.update({identity_field: identity, "token_changed_at": changed_at})
         if sig:
@@ -601,7 +1072,11 @@ def cached_reading(family, acc, cache, force=False):
         return c
     before = copy.deepcopy(c)
     success = False
+    renewal = None
     try:
+        if family == "claude" and tok and exp and exp - now() < REFRESH_MARGIN_SEC:
+            # at most starts a background renewal; this reading goes on with the login as it is now.
+            renewal = start_renewal(acc, c)
         if not tok or (exp and exp < now()):
             raise ValueError(t("error.no_credentials"))
         if family == "claude":
@@ -652,7 +1127,9 @@ def cached_reading(family, acc, cache, force=False):
             if isinstance(e, urllib.error.HTTPError):
                 c["error"] = t("err.rate_limited") if e.code == 429 else t("err.http", code=e.code)
             elif not tok or (exp and exp < now()):
-                c["error"] = t("err.no_login") if not tok else t("err.expired")
+                c["error"] = t("err.no_login") if not tok else renewal_error(renewal)
+                if renewal == "started":
+                    c["notes_extra"] = t("note.refresh_started")
             else:
                 c["error"] = t("err.unreachable", error=type(e).__name__)
                 log_error("usage-query", e, key)
@@ -1479,11 +1956,13 @@ def log_reason(row):
     return ", ".join(bits)
 
 
-LOG_SOURCES = ("hook", "qr pick", "qr check", "probe", "qr launch")
+LOG_SOURCES = ("hook", "qr pick", "qr check", "probe", "qr launch", "refresh")
 LOG_DETAILS = re.compile("|".join((
     "kept the original account", "conversation location unknown", "named a directory that is not in the pool",
     "as specified", "as specified, although it is blocked", "dispatched with a warning",
     r"local log not updated for \d+\.\d h; probing once in the background",
+    # refresh (a Claude login renewed by quota-router), REFRESH_TEXT; a failure may name the HTTP status code
+    *(re.escape(text) for text in REFRESH_TEXT.values()), r"renewal failed, HTTP \d{3}",
     # qr launch
     "launched with a warning", "on paid overage", "no account can take it", "no account could be read",
     "no account is set up for sessions")))
@@ -1823,6 +2302,12 @@ def status(force=False, bars=False):
     lead_key, assumed = detect_lead()
     for fam in managed_families():
         raw = read_family(fam, force, lead_key)
+        if fam == "claude" and force and RENEWALS and interactive():
+            # a person asked for fresh numbers: wait for the logins this started renewing, then read again.
+            print(t("status.renewal_wait", keys=t("sep.list").join(sorted({key for key, _ in RENEWALS})),
+                    seconds=REFRESH_WAIT_SEC), file=sys.stderr, flush=True)
+            if wait_for_renewals():
+                raw = read_family(fam, False, lead_key)
         rows = score_rows(fam, raw, model="other")
         fable_rows = score_rows(fam, raw) if fam == "claude" and SCARCE else []
         print(f"\n[{fam}]")
@@ -1888,6 +2373,11 @@ def status(force=False, bars=False):
                         source=t("status.codex_live") if live else t("status.codex_local", hours=CODEX_STALE_H)))
 
     quiet_call(print_status_events)
+
+
+def interactive():
+    """True when a person is reading the output on a terminal. Separate so tests can replace it."""
+    return sys.stdout.isatty()
 
 
 def hookless_accounts():

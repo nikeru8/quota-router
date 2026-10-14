@@ -42,10 +42,12 @@ SETTINGS = [
     ("timing", "notice_ttl_hours", 6),
     ("events", "reset_drop_points", 3),
     ("families.claude", "scarce_model", "fable"),
+    ("families.claude", "refresh_logins", True),
     ("families.agy", "default_model", ""),
     ("launch", "route_print", False),
     ("endpoints", "claude_usage", "https://api.anthropic.com/api/oauth/usage"),
     ("endpoints", "claude_profile", "https://api.anthropic.com/api/oauth/profile"),
+    ("endpoints", "claude_token", "https://platform.claude.com/v1/oauth/token"),
     ("endpoints", "codex_usage", "https://chatgpt.com/backend-api/wham/usage"),
 ]
 # Sections `qr init` writes commented out: a config file should not pin these unless its owner means to.

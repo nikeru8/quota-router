@@ -110,7 +110,8 @@ The full rules, with every exception: [REFERENCE.md › How it decides](docs/REF
 
 ## What it reads, sends and changes
 
-- It reads each account's login token, read-only, and sends it only to that vendor's own usage endpoints. It never refreshes, rewrites or copies a token, and sends no telemetry.
+- It reads each account's login token and sends it only to that vendor's own endpoints. It sends no telemetry.
+- When a Claude account's login has expired (the account sat idle) and no Claude Code process runs on that directory, a background quota-router process renews the login with its refresh token, as Claude Code itself would, and writes it back to the keychain item or `.credentials.json` it came from. Otherwise an idle account could not be read and would never be picked. Nothing else about a token is ever written or copied. The renewed login normally reaches `security` on stdin; a login stored next to several MCP logins is too long for that and goes on its command line, as Claude Code does it, where other local users can see it while it runs. A login Windows keeps in the Credential Manager is not handled. `refresh_logins = false` under `[families.claude]` or `QR_NO_REFRESH=1` turns this off; details in [REFERENCE.md › Renewing an expired Claude login](docs/REFERENCE.md#renewing-an-expired-claude-login).
 - When a live Codex query fails and the local numbers are over two hours old, it starts one small `codex exec` in the background on that account to refresh them. `QR_NO_PROBE=1` turns that off.
 - The hook runs before every Bash command and can rewrite it. It only inserts an account prefix or blocks the command. Read `qr decisions` after your first few dispatches.
 - Outside its state directory it writes only the hook entry in each `settings.json` you install into and the `claude` launcher file.

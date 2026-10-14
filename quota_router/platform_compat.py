@@ -199,12 +199,20 @@ _windows_processes = None      # (monotonic time, result) of the last successful
 
 
 def list_processes(run):
-    """Processes as {pid: (parent pid, command line)}.
+    """Processes as {pid: (parent pid, command line)}; failure of any kind gives an empty dict, so nobody is
+    counted as busy. See read_processes()."""
+    return read_processes(run) or {}
+
+
+def read_processes(run):
+    """Processes as {pid: (parent pid, command line)}, or None when the list could not be read.
 
     `run(argv)` runs a command and returns a CompletedProcess, or None when it
     could not run or ran out of time (the caller supplies it so its time budget
-    applies). Failure of any kind gives an empty dict: nobody is counted as busy.
-    macOS/Linux: every process, from `ps`.
+    applies). Callers that must fail closed (the login renewal) treat None as
+    "a Claude Code process may be running anywhere".
+    macOS/Linux: every process, from `ps`. An empty list counts as unreadable:
+    `ps` always lists at least itself.
     Windows: the processes whose command line mentions claude or codex, from
     Get-CimInstance Win32_Process through PowerShell. Starting PowerShell costs
     roughly 0.5-2 s, so one successful answer is reused for a few seconds within
@@ -216,18 +224,24 @@ def list_processes(run):
             return dict(_windows_processes[1])
         result = run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PROCESS_QUERY])
         if result is None or result.returncode != 0:
-            return {}
+            return None
+        try:
+            if result.stdout.strip():
+                json.loads(result.stdout)
+        except ValueError:
+            return None                  # cut off or garbled: unreadable, not "no Claude process"
         procs = parse_windows_processes(result.stdout)
         _windows_processes = (time.monotonic(), procs)
         return dict(procs)
     result = run(["ps", "-axww", "-o", "pid=,ppid=,command="])
-    out = result.stdout if result else ""
+    if result is None or result.returncode != 0:
+        return None
     procs = {}
-    for line in out.splitlines():
+    for line in result.stdout.splitlines():
         m = re.match(r"\s*(\d+)\s+(\d+)\s+(.*)", line)
         if m:
             procs[int(m[1])] = (int(m[2]), m[3])
-    return procs
+    return procs or None
 
 
 def parse_windows_processes(text):
@@ -326,7 +340,7 @@ def directory_from_command_lines(pid, procs, variable):
 
 
 def spawn_detached(argv, env, stdout, stderr):
-    """Start a background process that outlives the caller.
+    """Start a background process that outlives the caller; returns its Popen.
 
     macOS/Linux: a new session. Windows: DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     (no console, not hit by the caller's Ctrl+C); the program is looked up on PATH
@@ -335,10 +349,9 @@ def spawn_detached(argv, env, stdout, stderr):
     if system() == "windows":
         flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         program = shutil.which(argv[0], path=(env or os.environ).get("PATH")) or argv[0]
-        subprocess.Popen([program, *argv[1:]], env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                         creationflags=flags, close_fds=True)
-        return
-    subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
+        return subprocess.Popen([program, *argv[1:]], env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                creationflags=flags, close_fds=True)
+    return subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
 
 
 # ---- paths ---------------------------------------------------------------------
@@ -380,10 +393,16 @@ def keychain_service(config_dir):
 
 
 def claude_credentials(config_dir, run):
-    """Raw JSON text of Claude Code's stored login for a config directory, or None.
+    """Raw JSON text of Claude Code's stored login for a config directory, or None. See claude_login()."""
+    return claude_login(config_dir, run)[0]
 
-    `config_dir` None means the default location. Read-only: nothing is refreshed
-    or written back. `run` is the same budget-aware runner as in list_processes().
+
+def claude_login(config_dir, run):
+    """(raw JSON text, where it came from) of Claude Code's stored login for a config directory, or (None, None).
+
+    `config_dir` None means the default location. Only reads. `where` is what save_claude_login() needs to
+    write a renewed login back to the same place: ("keychain", service, account) or ("file", path); the account
+    is None when the item was found by its service alone. `run` is the same budget-aware runner as in list_processes().
     macOS: the login keychain, through `security find-generic-password`. One service
     name can hold several items (one with the account "unknown" that has only MCP
     logins, one under the user's name with `claudeAiOauth`), and `security` returns
@@ -396,23 +415,175 @@ def claude_credentials(config_dir, run):
     found = []
     if system() == "darwin":
         service = keychain_service(config_dir)
-        queries = [["security", "find-generic-password", "-a", user, "-s", service, "-w"] for user in login_names()]
-        for argv in queries + [["security", "find-generic-password", "-s", service, "-w"]]:
+        queries = [(["security", "find-generic-password", "-a", user, "-s", service, "-w"], user) for user in login_names()]
+        for argv, user in queries + [(["security", "find-generic-password", "-s", service, "-w"], None)]:
             result = run(argv)
             if result is None:
                 break                    # no answer in time (or no `security`): asking again would only wait again
             if result.returncode == 0 and result.stdout.strip():
                 if has_claude_login(result.stdout):
-                    return result.stdout
-                found.append(result.stdout)
+                    return result.stdout, ("keychain", service, user)
+                found.append((result.stdout, ("keychain", service, user)))
+    path = credentials_file(config_dir)
     try:
-        with open(credentials_file(config_dir), encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             text = f.read()
         if has_claude_login(text) or not found:
-            return text
+            return text, ("file", path)
     except (OSError, ValueError):
         pass
-    return found[0] if found else None
+    return found[0] if found else (None, None)
+
+
+def keychain_account(service, run):
+    """The account attribute of the item `security find-generic-password -s <service>` finds, which is the one the
+    same query with -w read the login from; None when it cannot be told. Asks for the attributes only (without -w
+    or -g, `security` prints no secret)."""
+    result = run(["security", "find-generic-password", "-s", service])
+    if result is None or result.returncode != 0:
+        return None
+    m = re.search(r'"acct"<blob>="([^"\n]*)"', result.stdout)
+    return m[1] if m and m[1] else None
+
+
+KEYCHAIN_STDIN_LIMIT = 4032      # Claude Code's limit for one `security -i` command line; above it, it uses argv
+
+
+def save_claude_login(where, text, run):
+    """Write a renewed Claude Code login back to where claude_login() read it. Raises OSError when it was not written.
+
+    `text` must be the complete JSON (claudeAiOauth with every other top-level key of the stored one); it is
+    refused unless has_claude_login() accepts it, so a partial object is never written.
+    Keychain (macOS): `add-generic-password -U` on the same service and account, with the JSON hex-encoded (`-X`)
+    and the command fed to `security -i` on stdin. That is exactly how Claude Code 2.1.296 writes this item, and
+    it keeps the token off the command line as long as the command fits Claude Code's stdin limit (4032
+    characters). A longer one (a login with several MCP logins next to it) goes on argv instead, again like
+    Claude Code: then the hex-encoded login, refresh token included, is on `security`'s command line for as long
+    as it runs, where other local users can read it with `ps`. `run(argv, input=None)` is the budget-aware runner.
+    File (Linux, Windows, or a login read from the file): a temporary file with mode 0600 next to
+    .credentials.json, then renamed over it, so a reader sees the old file or the new one, never half of one.
+    Only an existing .credentials.json is replaced: a missing one means the login lives elsewhere (the keychain,
+    or on Windows possibly the Credential Manager, which quota-router cannot read), and creating the file would
+    put a second copy of it next to the live one.
+    """
+    if not has_claude_login(text):
+        raise ValueError("not a complete Claude login")
+    if where[0] == "keychain":
+        _, service, account = where
+        for value in (account, service):
+            if not value or '"' in value or "\n" in value:
+                raise OSError(errno.EINVAL, "unusable keychain item name")
+        payload = text.encode("utf-8").hex()
+        command = f'add-generic-password -U -a "{account}" -s "{service}" -X "{payload}"\n'
+        if len(command) <= KEYCHAIN_STDIN_LIMIT:
+            result = run(["security", "-i"], input=command)
+        else:
+            result = run(["security", "add-generic-password", "-U", "-a", account, "-s", service, "-X", payload])
+        if result is None or result.returncode != 0:
+            raise OSError(errno.EIO, "security add-generic-password failed")
+        return
+    path = where[1]
+    if not os.path.isfile(path):
+        raise OSError(errno.ENOENT, "no credentials file to replace")
+    folder = os.path.dirname(path)
+    tmp = os.path.join(folder, f".credentials.json.{os.getpid()}.{os.urandom(6).hex()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+# Claude Code's locks around its stored login, read from the 2.1.296 bundle. All three are proper-lockfile locks:
+# a directory created with mkdir, whose mtime its holder renews while it holds it (every stale/2), and which anyone
+# may take over once its mtime is older than the stale limit.
+# - `<config dir>/.oauth_refresh.lock`, around a token refresh; stale after 60 s.
+# - `<config dir, links resolved>.lock`, the older name of the same lock, still taken; stale after 60 s.
+# - `<config dir>/.storage-write.lock`, around every read-modify-write of the credential store (a refresh's save,
+#   an MCP login, a logout); stale after 15 s. Claude Code retries it 10 times over about 8 s, then gives up.
+# Holding all three while quota-router renews a login keeps every Claude Code process that honours them from
+# renewing or rewriting that login at the same time.
+CLAUDE_LOCK_STALE_SEC = 60
+CLAUDE_STORAGE_LOCK_STALE_SEC = 15
+CLAUDE_LOCK_BEAT_SEC = 5         # quota-router renews the mtime of the locks it holds this often (under 15 / 2)
+
+
+def claude_locks(config_dir):
+    """[(lock directory, stale limit in seconds)] in the order they are taken."""
+    base = config_dir or os.path.join(home(), ".claude")
+    return [(os.path.join(base, ".oauth_refresh.lock"), CLAUDE_LOCK_STALE_SEC),
+            (os.path.realpath(base) + ".lock", CLAUDE_LOCK_STALE_SEC),
+            (os.path.join(base, ".storage-write.lock"), CLAUDE_STORAGE_LOCK_STALE_SEC)]
+
+
+def claude_refresh_locks(config_dir):
+    return [path for path, _ in claude_locks(config_dir)]
+
+
+def take_claude_refresh_lock(config_dir):
+    """Take Claude Code's locks for a config directory (see claude_locks()). Returns the list of lock directories
+    to hand to release_claude_refresh_lock(), or None when Claude Code (or another quota-router) holds one; then
+    none is kept. A lock whose mtime is older than its stale limit is taken over, as Claude Code itself would."""
+    taken = []
+    for path, stale_after in claude_locks(config_dir):
+        try:
+            os.mkdir(path)
+        except FileExistsError:
+            try:
+                stale = time.time() - os.stat(path).st_mtime > stale_after
+                if stale:
+                    os.rmdir(path)
+                    os.mkdir(path)
+            except OSError:
+                stale = False
+            if not stale:
+                release_claude_refresh_lock(taken)
+                return None
+        except OSError:
+            release_claude_refresh_lock(taken)
+            return None
+        taken.append(path)
+    return taken
+
+
+def release_claude_refresh_lock(taken):
+    for path in reversed(taken or []):
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass
+
+
+class LockHeartbeat:
+    """Renews the mtime of the lock directories it is given every CLAUDE_LOCK_BEAT_SEC seconds, as proper-lockfile
+    does for its holder, so a renewal that waits up to 30 s for its answer is not taken for a dead holder."""
+
+    def __init__(self, paths):
+        self.paths, self.stop = list(paths or []), threading.Event()
+        self.thread = threading.Thread(target=self.run, name="quota-router-lock-beat", daemon=True)
+
+    def run(self):
+        while not self.stop.wait(CLAUDE_LOCK_BEAT_SEC):
+            for path in self.paths:
+                try:
+                    os.utime(path)
+                except OSError:
+                    pass
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        self.thread.join(1)
 
 
 def login_names():
