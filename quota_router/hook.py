@@ -124,6 +124,10 @@ PREFIX_OPTIONS = {
     "parallel": {"-j", "--jobs", "-S", "--sshlogin", "--joblog", "--results", "--colsep", "--delay", "--timeout", "--retries", "-a", "--arg-file", "--max-args", "-N", "-n", "--halt", "--wd", "--workdir"},
 }
 KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{"}
+# agy (Antigravity CLI, Go flags: one or two dashes, `--flag value` or `--flag=value`).
+AGY_VALUE_FLAGS = {"add-dir", "agent", "conversation", "effort", "input-format", "json-schema", "log-file", "mode",
+                   "model", "output-format", "print-timeout", "project"}
+AGY_PRINT = {"p", "print", "prompt"}
 CLAUDE_SUBCOMMANDS = {"mcp", "config", "update", "doctor", "plugin", "install", "auth", "setup-token", "daemon", "agents"}
 
 
@@ -186,10 +190,18 @@ def check_parse(limit):
 
 
 def cli_name(word):
-    """`claude`, `/opt/bin/claude`, `claude.exe`, `C:/Users/me/bin/codex.cmd` → `claude` / `codex`; anything else as it is."""
+    """`claude`, `/opt/bin/claude`, `claude.exe`, `C:/Users/me/bin/codex.cmd` → `claude` / `codex` / `agy`; anything else as it is."""
     name = os.path.basename(word)
     stem, dot, suffix = name.rpartition(".")
-    return stem.lower() if dot and suffix.lower() in ("exe", "cmd") and stem.lower() in ("claude", "codex") else name
+    return stem.lower() if dot and suffix.lower() in ("exe", "cmd") and stem.lower() in config.FAMILIES else name
+
+
+def agy_flag(word):
+    """`--model=x` / `-model` / `--print` → ("model", "x") / ("model", None) / ("print", None); None when it is no flag."""
+    if not word.startswith("-") or word in ("-", "--"):
+        return None
+    name, eq, value = word.lstrip("-").partition("=")
+    return name, value if eq else None
 
 
 def find_dispatches(cmd):
@@ -203,7 +215,7 @@ def find_dispatches(cmd):
         words, raws = [word for _, word in toks], None
         for idx, (p, t) in enumerate(toks):
             base = cli_name(t)
-            if base not in ("claude", "codex"):
+            if base not in config.FAMILIES:
                 continue
             check_parse(limit)
             if raws is None:
@@ -212,6 +224,21 @@ def find_dispatches(cmd):
                 continue
             rest = words[idx + 1:]
             if any(x in ("--help", "-h", "--version", "-V") for x in rest):
+                continue
+            if base == "agy":
+                # one-shot runs only (-p / --print / --prompt); `agy`, `agy -i …` and subcommands are sessions or tools.
+                # Go stops reading flags at the first plain word, so only the words before it are looked at.
+                printing, k = False, 0
+                while k < len(rest) and agy_flag(rest[k]):
+                    name, value = agy_flag(rest[k])
+                    if name in AGY_PRINT:
+                        printing = True
+                        k += 1 if value is not None else 2   # the prompt is the flag's value
+                        continue
+                    k += 2 if name in AGY_VALUE_FLAGS and value is None else 1
+                if printing:
+                    found.append({"fam": "agy", "pos": p, "seg": (s, e), "resume": None, "word_end": p + len(t)})
+                    break
                 continue
             if base == "claude":
                 k = 0
@@ -478,6 +505,8 @@ def dispatch_model(cmd, dispatch):
     """Option positions come from the masked words, values from the original; the prompt and heredocs are not options."""
     if dispatch["fam"] == "codex":
         return "other", True
+    if dispatch["fam"] == "agy":
+        return agy_model(cmd, dispatch)
     scan = opaque_substitutions(mask(cmd))
     ts = tokens(scan, dispatch["pos"], dispatch["seg"][1])
     value, written = None, False
@@ -509,12 +538,34 @@ def dispatch_model(cmd, dispatch):
     return (qr.model_class(None) if dynamic else qr.model_class(value)), written
 
 
+def agy_model(cmd, dispatch):
+    """(bucket, written) for an `agy -p` dispatch. dispatch["model_value"] keeps the model named, for the notes."""
+    scan = opaque_substitutions(mask(cmd))
+    ts = tokens(scan, dispatch["pos"], dispatch["seg"][1])
+    # `--model` anywhere in the dispatch counts as written, even after a redirection (`agy -p x < /dev/null --model y`):
+    # the prompt is quoted and masked, so a word here is a real one, and missing a written model is the worse mistake.
+    value, written = None, False
+    for i in range(1, len(ts)):
+        flag = agy_flag(ts[i][1])
+        if flag and flag[0] == "model":
+            written = True
+            value = (policy_word(cmd, ts[i]) or "").partition("=")[2] if flag[1] is not None else \
+                (policy_word(cmd, ts[i + 1]) if i + 1 < len(ts) else None)
+    dynamic = written and (not value or "$" in value or "`" in value)
+    dispatch["model_dynamic"] = False   # the scarce-model note is about Claude; agy says nothing about it
+    if not written and qr.AGY_MODEL:
+        value = qr.AGY_MODEL            # the model the hook will add decides the bucket
+    return qr.model_class(None if dynamic else value, "agy"), written
+
+
 def resolved_explicit(cmd, dispatch):
     """Keep explicit_account()'s result; the policy layer additionally recognises fully static concatenated paths.
     When the variable was cleared last (`unset`, `env -u VAR`, `env -i`), no account is named: None, and the
     dispatch is routed like any other. The one exception is `env -u CLAUDE_CONFIG_DIR claude …`: that is how the
     Claude account at the default location is spelled (`qr pick claude` prints it, and so does this hook), so it
     names that account."""
+    if dispatch["fam"] not in config.ENV_DIR:
+        return None   # agy: one account, no directory variable to name another one
     var = "CLAUDE_CONFIG_DIR" if dispatch["fam"] == "claude" else "CODEX_HOME"
     setting = policy_setting(cmd, dispatch["pos"], var, home=True)
     ex = explicit_account(cmd, dispatch["fam"], dispatch["pos"], dispatch["seg"], cleared=True)
@@ -685,7 +736,7 @@ def prepare_decision(cmd, cwd, lead_key, session):
             key = (d["fam"], model, d["allow_credits"])
             if key not in rows_cache:
                 rows_cache[key] = qr.score_rows(d["fam"], raw_cache[d["fam"]], model, d["allow_credits"])
-    for fam in ("claude", "codex"):
+    for fam in qr.managed_families():
         if fam not in raw_cache and qr.remaining() >= 1:
             try:
                 extra = qr.read_family(fam, lead_key=lead_key)
@@ -730,12 +781,12 @@ def decide_prepared(cmd, ds, lead_key, session, rows_cache, resumes, explicit, l
         return qr.find_row(rows_cache[(d["fam"], model, d["allow_credits"])], row["key"]) or row
 
     def context():
-        other = "codex" if primary["fam"] == "claude" else "claude"
-        orows = rows_cache.get(other)
+        others = {other: rows_cache[other] for other in qr.other_families(primary["fam"]) if rows_cache.get(other)}
         extras = []
-        # a failing extra line must not undo a deny that was already decided, nor suppress the other summary.
-        for render in (lambda: qr.cross_hint(primary["fam"], rows(primary), best=selected, orows=orows),
-                       lambda: qr.family_summary(other, orows) if orows else None):
+        # a failing extra line must not undo a deny that was already decided, nor suppress the other summaries.
+        renders = [lambda: qr.cross_hints(primary["fam"], rows(primary), best=selected, others=others)]
+        renders += [lambda other=other, orows=orows: qr.family_summary(other, orows) for other, orows in others.items()]
+        for render in renders:
             try:
                 item = render()
                 if item:
@@ -771,7 +822,7 @@ def decide_prepared(cmd, ds, lead_key, session, rows_cache, resumes, explicit, l
 
     for d in ds:
         fam = d["fam"]
-        label = "Claude" if fam == "claude" else "Codex"
+        label = qr.LABELS[fam]
         ex = explicit[d["pos"]]
         if fam == "claude" and not d["model_written"] and qr.SCARCE:
             notes.append(t("note.no_model", model=qr.SCARCE_LABEL) if not d["resume"] else t("note.resume_no_model", model=qr.SCARCE_LABEL))
@@ -849,8 +900,17 @@ def decide_prepared(cmd, ds, lead_key, session, rows_cache, resumes, explicit, l
         reserve(best["key"])
         if d is primary:
             selected = best
-        inserts.append((d["pos"], row_prefix(fam, best)))
-        notes.append(t("note.auto", reason=qr.reason(best)) + (f"\n{warn}" if warn else ""))
+        if fam == "agy":
+            # one account, nothing to select; a dispatch that names no model gets the configured one.
+            if not d["model_written"] and qr.AGY_MODEL:
+                inserts.append((d["word_end"], f" --model {qr.AGY_MODEL}"))
+                notes.append(t("note.agy_model_added", model=qr.AGY_MODEL))
+            elif not d["model_written"]:
+                notes.append(t("note.agy_no_model"))
+            notes.append(t("note.agy_auto", reason=qr.reason(best)) + (f"\n{warn}" if warn else ""))
+        else:
+            inserts.append((d["pos"], row_prefix(fam, best)))
+            notes.append(t("note.auto", reason=qr.reason(best)) + (f"\n{warn}" if warn else ""))
         records.append((fam, "auto", best, "dispatched with a warning" if warn else "", d["model"]))
     notes.extend(context())
     new = cmd
@@ -952,7 +1012,7 @@ def respond(data, started=None, watchdog=None):
     cmd = ti.get("command")
     cmd = cmd if isinstance(cmd, str) else ""
     lowered = cmd.lower()  # cli_name() accepts CLAUDE.EXE, so this first look must too.
-    if "claude" not in lowered and "codex" not in lowered:
+    if "claude" not in lowered and "codex" not in lowered and "agy" not in lowered:
         return
     # a missing or broken config must not get in the way: the command runs unchanged, with one line on stderr.
     try:

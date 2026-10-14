@@ -42,6 +42,9 @@ reset_drop_points = 5
 [families.claude]
 scarce_model = "Opus"
 
+[families.agy]
+default_model = "gemini-4-argon-high"
+
 [launch]
 route_print = true
 
@@ -94,7 +97,7 @@ def test_missing_file(home, monkeypatch):
     ('accounts = "claude"\n', "no accounts"),
     ('[[accounts]]\nkey = "a"\ndir = ""\n', 'accounts #1 is missing "family"'),
     ('[[accounts]]\nfamily = "claude"\ndir = ""\n', 'accounts #1 is missing "key"'),
-    ('[[accounts]]\nfamily = "gemini"\nkey = "a"\n', 'family must be "claude" or "codex"'),
+    ('[[accounts]]\nfamily = "gemini"\nkey = "a"\n', 'family must be "claude", "codex" or "agy"'),
     ('[[accounts]]\nfamily = "claude"\nkey = "a b"\n', "key may only contain"),
     ('[[accounts]]\nfamily = "claude"\nkey = "a"\ndir = 3\n', "dir must be a string"),
     ('[[accounts]]\nfamily = "claude"\nkey = "a"\ndir = "relative/path"\n', "dir must be absolute"),
@@ -209,7 +212,7 @@ def test_configure_applies_settings_to_the_router(write_config, home, monkeypatc
         assert (core.SCARCE, core.SCARCE_LABEL) == ("opus", "Opus")
         assert core.CLAUDE_ACCOUNTS == [{"key": "claude-main", "dir": None}, {"key": "claude-b", "dir": str(home / ".claude-b")}]
         assert core.CODEX_ACCOUNTS == [{"key": "codex-1", "dir": str(home / ".codex")}, {"key": "codex-2", "dir": str(home / ".codex-b")}]
-        assert core.DEFAULT_KEY == {"claude": "claude-main", "codex": "codex-1"}
+        assert core.DEFAULT_KEY == {"claude": "claude-main", "codex": "codex-1", "agy": None}
         assert core.STATE == str(home / "state") and os.path.isdir(core.STATE)
         assert i18n.language() == "zh-TW"
         assert core.model_class(None) == "opus" and core.model_class("claude-opus-5") == "opus"

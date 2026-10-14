@@ -758,7 +758,7 @@ def doctor(argv):
                 if second:
                     line(False, t("doctor.second_login", path=directory, raw=second))
         else:
-            credentials = os.path.join(directory, "auth.json")
+            credentials = os.path.join(directory, "antigravity-oauth-token" if account["family"] == "agy" else "auth.json")
             line(os.path.isfile(credentials), t("doctor.login_file", account=label, path=credentials)
                  if os.path.isfile(credentials) else t("doctor.login_missing", account=label, path=credentials))
     for directory in hook_dirs:

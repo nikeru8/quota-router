@@ -67,9 +67,12 @@ def show_config(argv):
     from . import launch
     not_ready = launch.readiness(cfg)
     for account in cfg.accounts:
-        variable = config.ENV_DIR[account["family"]]
-        where = (t("cli.unset", variable=variable) if account["dir"] is None
-                 else f"{variable}={account['dir']}" + (t("cli.is_default") if account["default"] else ""))
+        variable = config.ENV_DIR.get(account["family"])
+        if variable is None:   # agy: no directory variable, always its default location
+            where = account["dir"] + t("cli.is_default")
+        else:
+            where = (t("cli.unset", variable=variable) if account["dir"] is None
+                     else f"{variable}={account['dir']}" + (t("cli.is_default") if account["default"] else ""))
         if account["family"] == "claude" and not account["launch"]:
             where += t("cli.no_launch")
         elif account["family"] == "claude" and not_ready.get(account["key"]) == "no-hook":

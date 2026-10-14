@@ -15,7 +15,8 @@ STATE = config.state_dir()[0]
 # ---- settings: these are the defaults; configure() fills in the config file's values ----
 CLAUDE_ACCOUNTS = []           # {"key", "dir"}; dir=None is the default location (CLAUDE_CONFIG_DIR unset)
 CODEX_ACCOUNTS = []
-DEFAULT_KEY = {"claude": None, "codex": None}   # the account of each family that uses the default location
+AGY_ACCOUNTS = []              # at most one: agy has no directory variable, so only its default location exists
+DEFAULT_KEY = {"claude": None, "codex": None, "agy": None}   # the account of each family that uses the default location
 LAUNCH_OFF = set()             # Claude account keys with `launch = false` (no new sessions from `qr launch`)
 USAGE_CACHE_SEC = 180          # a usage reading is cached for 3 minutes
 PROFILE_CACHE_SEC = 86400      # the identity (email) is cached for a day; a changed token re-queries at once
@@ -41,6 +42,10 @@ RESET_DROP = 3                 # usage must drop this many points to count as a 
 ALLOW_CREDITS = False          # True: purchased credits may be spent without the QR_ALLOW_CREDITS=1 prefix
 SCARCE = "fable"               # the model with its own weekly bucket; None when there is none
 SCARCE_LABEL = "Fable"
+AGY_MODEL = ""                 # --model added to an `agy -p` dispatch that names none ("" = leave it alone)
+AGY_PROGRAM = "agy"            # the Antigravity CLI that is asked for its quota (`agy -p /usage`)
+LABELS = {"claude": "Claude", "codex": "Codex", "agy": "agy"}
+VERBS = {"claude": "claude -p", "codex": "codex exec", "agy": "agy -p"}
 # where the login tokens are sent; the config file can point these elsewhere for tests or a proxy.
 ENDPOINTS = {name.split(".", 1)[1]: url for name, url in config.DEFAULTS.items() if name.startswith("endpoints.")}
 
@@ -59,6 +64,8 @@ def configure(cfg):
     globals().update(
         CLAUDE_ACCOUNTS=[{"key": a["key"], "dir": a["dir"]} for a in cfg.family("claude")],
         CODEX_ACCOUNTS=[{"key": a["key"], "dir": a["dir"]} for a in cfg.family("codex")],
+        AGY_ACCOUNTS=[{"key": a["key"], "dir": a["dir"]} for a in cfg.family("agy")],
+        AGY_MODEL=cfg["families.agy.default_model"],
         LAUNCH_OFF={a["key"] for a in cfg.family("claude") if not a["launch"]},
         DEFAULT_KEY={family: next((a["key"] for a in cfg.family(family) if a["default"]), None)
                      for family in config.FAMILIES},
@@ -88,7 +95,16 @@ def configure(cfg):
 
 
 def accounts(family):
-    return CLAUDE_ACCOUNTS if family == "claude" else CODEX_ACCOUNTS
+    return {"claude": CLAUDE_ACCOUNTS, "codex": CODEX_ACCOUNTS, "agy": AGY_ACCOUNTS}.get(family, [])
+
+
+def managed_families():
+    """The families that have at least one account in the config file, in a fixed order."""
+    return [family for family in config.FAMILIES if accounts(family)]
+
+
+def other_families(family):
+    return [other for other in managed_families() if other != family]
 
 
 def windows():
@@ -849,11 +865,129 @@ def codex_log_reading(acc):
 
 
 # ---- busy detection ---------------------------------------------------------
+# ---- agy (Antigravity CLI) ---------------------------------------------------
+# `agy -p /usage` prints one tab-separated line per bucket and window, for example
+#   Gemini Models<TAB>Weekly Limit Remaining<TAB>100%<TAB>2026-10-18T13:04:19Z
+# Gemini models draw on one bucket; the Claude and GPT models agy also offers draw on another.
+AGY_BUCKETS = {"gemini models": "", "claude and gpt models": "partner_"}
+AGY_WINDOWS = {"weekly limit remaining": "seven_day", "five hour limit remaining": "five_hour"}
+AGY_QUERY_MIN_SEC = 4
+AGY_PARTNER_WINDOWS = ("partner_seven_day", "partner_five_hour")
+AGY_TOKEN_FILE = "antigravity-oauth-token"   # agy's login; only its fingerprint is kept, to notice a change of login
+
+
+def agy_identity(acc):
+    """Fingerprint of agy's login file, or None when there is none. A new login drops the old login's readings."""
+    try:
+        with open(os.path.join(acc["dir"] or config.default_dir("agy"), AGY_TOKEN_FILE), encoding="utf-8", errors="replace") as f:
+            return fingerprint(f.read().strip())
+    except OSError:
+        return None          # `agy -p /usage` takes about 2.5 s; it is not started with less time than this left
+
+
+def parse_agy_usage(text):
+    """The text of `agy -p /usage` → {"seven_day", "five_hour", "partner_seven_day", "partner_five_hour"}: used % and reset time.
+    Lines that do not have that shape are ignored, so a changed or extended output never yields a made-up number."""
+    usage = {}
+    for line in (text or "").splitlines():
+        parts = [part.strip() for part in line.split("\t")]
+        if len(parts) != 4:
+            continue
+        bucket, window = AGY_BUCKETS.get(parts[0].lower()), AGY_WINDOWS.get(parts[1].lower())
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*%", parts[2])
+        if bucket is None or window is None or not match:
+            continue
+        left = min(100.0, float(match.group(1)))
+        usage[bucket + window] = {"used": 100.0 - left, "reset": iso_to_ts(parts[3])}
+    return usage
+
+
+def agy_reading(acc, cache=None, force=False):
+    """agy's quota, cached like the other families. A query runs `agy -p /usage` once; with too little time left
+    in the budget, during a failure cooldown or while another process is already asking, the cached reading is used."""
+    cache = {} if cache is None else cache
+    key = acc["key"]
+    owner = uuid.uuid4().hex
+    with state_lock("cache"):
+        latest = load("cache.json", {})
+        c = copy.deepcopy(latest.get(key, cache.get(key, {})))
+        if "fetched" in c:
+            c["fetched"] = fetched(c)
+        sig = agy_identity(acc)
+        if sig and sig != c.get("account_sig"):
+            for field in ("usage", "fetched", "live", "error", "no_login", "retry_at", "failures",
+                          "inflight_until", "inflight_owner", "reset_checked"):
+                c.pop(field, None)
+            c.update(account_sig=sig, token_changed_at=now())
+        cooling = c.get("retry_at", 0) > now()
+        flying = c.get("inflight_until", 0) > now()
+        hot = c.get("usage") and now() - fetched(c) < USAGE_CACHE_SEC
+        due = reset_due(c)
+        query = not (cooling or flying or (hot and not force and not due) or remaining() < AGY_QUERY_MIN_SEC)
+        if query:
+            c.pop("no_login", None)   # a failure decides afresh whether this is a login problem
+            c.update(inflight_until=now() + 12, inflight_owner=owner)
+            if due:
+                c["reset_checked"] = dict(c.get("reset_checked") or {}, **due)
+            latest[key] = c
+            save("cache.json", latest)
+    if not query:
+        cache[key] = c
+        return c
+    before = copy.deepcopy(c)
+    success = False
+    try:
+        wait = max(1, min(10, remaining() - 1))
+        try:
+            result = subprocess.run([AGY_PROGRAM, "-p", "/usage", "--print-timeout", f"{int(wait)}s"],
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                    stdin=subprocess.DEVNULL, cwd=STATE, timeout=wait + 0.5)
+        except FileNotFoundError:
+            c["no_login"] = True
+            raise ValueError(t("err.agy_missing"))
+        usage = parse_agy_usage(result.stdout)
+        if not usage.get("seven_day") and not usage.get("five_hour"):
+            if re.search(r"log ?in|sign ?in|auth", (result.stdout or "") + (result.stderr or ""), re.I):
+                c["no_login"] = True
+                raise ValueError(t("err.no_login"))
+            raise ValueError(t("err.agy_no_windows"))
+        c.update(usage=usage, fetched=now(), live=True)
+        success = True
+        for field in ("error", "retry_at", "failures", "no_login"):
+            c.pop(field, None)
+    except Exception as e:
+        c["error"] = str(e) if isinstance(e, ValueError) else t("err.unreachable", error=type(e).__name__)
+        if not isinstance(e, ValueError):
+            log_error("usage-query", e, key)
+        c["live"] = False
+        if not c.get("no_login"):
+            cooldown(c, e)
+    # the login changed during the query: the result belongs to the old login and is not stored under the new one.
+    if agy_identity(acc) != sig:
+        failure = {k: c[k] for k in ("retry_at", "failures") if k in c} if not success else {}
+        c, success = dict(before, **failure), False
+    c = merge_cache(key, before, c, owner)
+    if success:
+        quiet_call(observe_reading, "agy", key, c)
+    cache[key] = c
+    return c
+
+
+def family_reading(family, acc, cache, force=False):
+    """One account's reading, whatever its family."""
+    if family == "claude":
+        return claude_reading(acc, cache, force)
+    if family == "agy":
+        return agy_reading(acc, cache, force)
+    return codex_reading(acc, cache, force)
+
+
 NOT_SUBAGENT = ("ChatGPT.app", "CodexCLI.app", "Codex Computer Use", "app-server", "exec-server", "code-mode-host",
                 "--chrome-native-host", "daemon run", "bg-pty-host", "bg-spare")
 
 
 SCRIPT_HOSTS = ("node", "bun")
+# one-shot agy runs are -p / --print / --prompt in any Go spelling (-p=x, -print, --prompt=x); -i is a session
 EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat", ".ps1")
 
 
@@ -919,6 +1053,9 @@ def classify_proc(cmd):
         return "claude"
     if exe == "codex" and "exec" in argv[1:4]:
         return "codex"
+    if exe in ("agy", "antigravity") and "/usage" not in argv[1:] and any(
+            a.startswith("-") and a.lstrip("-").partition("=")[0] in ("p", "print", "prompt") for a in argv[1:]):
+        return "agy"
     return None
 
 
@@ -965,6 +1102,11 @@ def count_processes(classify):
     counts = {}
     for pid, (fam, ppid) in hits.items():
         if ppid in hits:  # child of a wrapper that already counted; only the outermost counts
+            continue
+        if fam == "agy":
+            # agy has one account and no directory variable: every one-shot agy run is on it.
+            if AGY_ACCOUNTS:
+                counts[AGY_ACCOUNTS[0]["key"]] = counts.get(AGY_ACCOUNTS[0]["key"], 0) + 1
             continue
         variable = config.ENV_DIR[fam]
         env = platform_compat.process_environment(pid, procs[pid][1], run_local)
@@ -1050,7 +1192,7 @@ def read_family(family, force=False, lead_key=None):
     rows = []
     readings = {}
     for a in sorted(accs, key=lambda a: fetched(cache.get(a["key"], {}))):
-        readings[a["key"]] = claude_reading(a, cache, force) if family == "claude" else codex_reading(a, cache, force)
+        readings[a["key"]] = family_reading(family, a, cache, force)
     for a in accs:
         r = readings[a["key"]]
         # each row keeps the state of its own reading.
@@ -1071,6 +1213,9 @@ def read_family(family, force=False, lead_key=None):
 
 
 def model_class(model=None, family="claude"):
+    """Which quota bucket a dispatch draws on. agy: "partner" for the Claude and GPT models it offers, else Gemini ("other")."""
+    if family == "agy":
+        return "partner" if model and (model == "partner" or model.lower().startswith(("claude", "gpt"))) else "other"
     return SCARCE if SCARCE and family == "claude" and (model is None or SCARCE in model.lower()) else "other"
 
 
@@ -1082,7 +1227,7 @@ def reset_due(reading):
     """Each scheduled reset of each window is re-checked once; it is recorded only for a verified identity, and a cooldown still wins."""
     checked = reading.get("reset_checked") or {}
     return {name: win["reset"] for name, win in (reading.get("usage") or {}).items()
-            if name in windows() and win and win.get("reset")
+            if (name in windows() or name in AGY_PARTNER_WINDOWS) and win and win.get("reset")
             and fetched(reading) < win["reset"] <= now() and checked.get(name) != win["reset"]}
 
 
@@ -1173,6 +1318,8 @@ def score_rows(family, raw, model=None, allow_credits=None):
         row["busy"] = max(row["jobs"], row["n_lease"])
         row["busy_detail"] = t("busy.detail", jobs=row["jobs"], leases=row["n_lease"])
         u = row["usage"] or {}
+        if family == "agy" and category == "partner":
+            u = {name: u.get("partner_" + name) for name in ("seven_day", "five_hour")}
         wk = u.get("seven_day")
         if wk and wk.get("reset") and wk["reset"] <= now():
             row["notes"].append(t("note.reset_passed"))
@@ -1286,6 +1433,8 @@ def refresh_busy(rows, leases, pending=()):
 def prefix(family, row):
     """Shell text that selects an account; the directory is quoted, so use it with `eval` or paste it, see
     "Using `qr pick` in scripts" in docs/REFERENCE.md."""
+    if family == "agy":
+        return ""   # agy has one account and no directory variable: nothing to select
     if family == "claude":
         return ("env -u CLAUDE_CONFIG_DIR" if row["dir"] is None
                 else "CLAUDE_CONFIG_DIR=" + platform_compat.shell_quote(row["dir"]))
@@ -1366,7 +1515,7 @@ def log_decision(source, family, mode, row=None, text="", cmd="", lead=None, ses
         who_ = log_token(row["key"] if row else account)
         lead_, assumed = (lead[:-len(" (assumed)")], " (assumed)") if lead and lead.endswith(" (assumed)") else (lead, "")
         lead_ = (log_token(lead_) if lead_ else "?") + assumed
-        family_ = family if family in ("claude", "codex", "?") else "other"
+        family_ = family if family in config.FAMILIES + ("?",) else "other"
         # the first characters of a session id of the usual shape; one of any other shape only as a hash.
         session_ = session[:8] if LOG_TOKEN.fullmatch(session or "") else log_token(session)
         with open(os.path.join(STATE, "decisions.log"), "a", encoding="utf-8") as f:
@@ -1463,7 +1612,7 @@ def retry_blocked(family, raw, model=None, allow_credits=None, attempted=None):
             continue
         attempted.add(key)
         acc = next(a for a in accs if a["key"] == key)
-        r = claude_reading(acc, cache, True) if family == "claude" else codex_reading(acc, cache, True)
+        r = family_reading(family, acc, cache, True)
         target = find_row(raw, key)
         if family == "claude":
             r = dict(r, usage=remember_claude_payment(target, r.get("usage"), r.get("extra_usage_at") or fetched(r)))
@@ -1502,15 +1651,15 @@ def cross_hint(family, rows, force=False, best=None, orows=None):
     ok = [r for r in rows if not r["blocked"] and r["wk_left"] is not None]
     mine_row = best if best is not None else (max(ok, key=lambda r: r["wk_left"]) if ok else None)
     mine = max((r["wk_left"] for r in ok), default=0)
-    other = "codex" if family == "claude" else "claude"
     if orows is None:
         return None
     cand = [r for r in orows if not r["blocked"] and r["wk_left"] is not None]
     if not cand:
         return None
+    other = cand[0].get("family") or ("codex" if family == "claude" else "claude")
     top = max(cand, key=lambda r: (r["wk_left"], -r["busy"]))
-    me, them = "Claude" if family == "claude" else "Codex", "Codex" if other == "codex" else "Claude"
-    verb = "codex exec" if other == "codex" else "claude -p"
+    me, them = LABELS[family], LABELS[other]
+    verb = VERBS[other]
     if mine < CROSS_HINT_MINE and (top["wk_left"] >= CROSS_HINT_OTHER or top["wk_left"] >= 2 * mine):
         return t("hint.cross_low", me=me, mine=mine, them=them, who=who(top), left=top["wk_left"], verb=verb)
     expiry = quiet_call(expiring_hint, orows)
@@ -1528,9 +1677,21 @@ def cross_hint(family, rows, force=False, best=None, orows=None):
     return None
 
 
+def cross_hints(family, rows, best=None, others=None):
+    """The first cross-family hint among the other families, the roomiest family first. others: {family: scored rows}."""
+    def roomiest(item):
+        return max((r["wk_left"] for r in item[1] if not r["blocked"] and r["wk_left"] is not None), default=-1)
+    for _, orows in sorted((others or {}).items(), key=roomiest, reverse=True):
+        if orows:
+            hint = cross_hint(family, rows, best=best, orows=orows)
+            if hint:
+                return hint
+    return None
+
+
 def family_summary(family, rows):
-    """One-line summary of the other family, attached to every dispatch: account, weekly left, busy, and how old the numbers are."""
-    label = "Claude" if family == "claude" else "Codex"
+    """One-line summary of another family, attached to every dispatch: account, weekly left, busy, and how old the numbers are."""
+    label = LABELS[family]
     parts, ages = [], []
     for r in rows:
         shared = (r.get("usage") or {}).get("seven_day")
@@ -1556,11 +1717,12 @@ def pick(family, peek=False, env_only=False, force=False, model=None, strict=Tru
     raw = read_family(family, force, lead_key)
     raw = retry_blocked(family, raw, model, allow)
     rows = score_rows(family, raw, model, allow)
-    other = "codex" if family == "claude" else "claude"
-    try:
-        orows = evaluate(other, force, model="other")
-    except Exception:
-        orows = None
+    others = {}
+    for other in other_families(family):
+        try:
+            others[other] = evaluate(other, force, model="other")
+        except Exception:
+            pass
     with state_lock("leases"):
         leases = active_leases()
         refresh_busy(rows, leases)
@@ -1568,8 +1730,8 @@ def pick(family, peek=False, env_only=False, force=False, model=None, strict=Tru
         if best is not None and not peek:
             leases.append({"key": best["key"], "at": now(), "session": ""})
             save("leases.json", leases)
-    extras = [qrtext for qrtext in (cross_hint(family, rows, best=best, orows=orows),
-              family_summary(other, orows) if orows else None) if qrtext]
+    extras = [qrtext for qrtext in [cross_hints(family, rows, best=best, others=others)] +
+              [family_summary(other, orows) for other, orows in others.items() if orows] if qrtext]
     if family == "claude" and model is None and SCARCE:
         extras.insert(0, t("note.no_model", model=SCARCE_LABEL))
     notices = quiet_call(recent_notices, limit=3, default=[])
@@ -1605,7 +1767,7 @@ def account_key(family, value):
     for a in accs:
         if value == a["key"]:
             return a["key"]
-    if family == "codex" and value.isdigit():  # 1, 2, …: the n-th Codex account in the config file
+    if family in ("codex", "agy") and value.isdigit():  # 1, 2, …: the n-th account of the family in the config file
         return accs[int(value) - 1]["key"] if 0 < int(value) <= len(accs) else None
     if family == "claude":
         return dir_key(value.replace("${HOME}", HOME))
@@ -1659,7 +1821,7 @@ def status(force=False, bars=False):
     if failures:
         print(t("fail.recent", count=failures))
     lead_key, assumed = detect_lead()
-    for fam in ("claude", "codex"):
+    for fam in managed_families():
         raw = read_family(fam, force, lead_key)
         rows = score_rows(fam, raw, model="other")
         fable_rows = score_rows(fam, raw) if fam == "claude" and SCARCE else []
@@ -1693,6 +1855,11 @@ def status(force=False, bars=False):
             dirs = t("sep.plus").join(dir_label(d) for d in r.get("dirs", [r["dir"]]))
             if fam == "codex":
                 dirs = dir_label(r["dir"])
+            if fam == "agy":
+                dirs = "agy"
+                partner = (r.get("usage") or {}).get("partner_seven_day")
+                if partner:
+                    extra = t("sep.semicolon").join(filter(None, [extra, t("status.agy_partner", left=max(0, 100 - partner["used"]))]))
             name = who(r) + (t("status.lead_tag") if r.get("is_lead") else "")
             if not bars:
                 print(f"{name:<16}{dirs:<24}{wk:>6}{fmt_clock(r['wk_reset']):>14}{fh:>9}{rate:>10}{r['busy_detail']:>10}  {st}"
@@ -1702,7 +1869,7 @@ def status(force=False, bars=False):
             label = lambda text: "  " + pad(text, 9)
             print(f"\n{pad(name, 22)}{dirs}")
             print(label(t("status.bar.weekly")) + bar(r["wk_left"]) + "   " + t("status.bar.reset", clock=fmt_clock(r["wk_reset"])))
-            if fam == "claude":
+            if fam in ("claude", "agy"):
                 print(label(t("status.bar.five_hour")) + bar(r["fh_left"]))
                 if SCARCE:
                     fb = (r.get("usage") or {}).get(SCARCE)
@@ -1922,7 +2089,7 @@ def valid_event(event):
         if "display_name" in event and not isinstance(event["display_name"], str):
             return False
         return (isinstance(event, dict) and isinstance(event.get("id"), str)
-                and isinstance(event.get("key"), str) and event.get("family") in ("claude", "codex")
+                and isinstance(event.get("key"), str) and event.get("family") in config.FAMILIES
                 and event.get("kind") in EVENT_KINDS and event.get("window") in windows()
                 and observation_number(event.get("created_at"))
                 and valid_observation(event.get("before")) and valid_observation(event.get("after"))
@@ -2285,7 +2452,7 @@ def report(days=7):
     """Display only, no reservation; uses the normal query cooldown and time budget."""
     rows = []
     with budget(time.monotonic() + HOOK_BUDGET_SEC):
-        for family in ("claude", "codex"):
+        for family in managed_families():
             rows.extend(dict(row, family=family) for row in read_family(family))
     print(t("report.title", days=days))
     events = recent_events(days * 86400)
@@ -2360,9 +2527,9 @@ def main(argv):
             model = arg.split("=", 1)[1]
     if not argv or argv[0] in ("-h", "--help"):
         print(t("help"))
-    elif argv[0] == "pick" and len(argv) > 1 and argv[1] in ("claude", "codex"):
+    elif argv[0] == "pick" and len(argv) > 1 and argv[1] in config.FAMILIES:
         pick(argv[1], peek="--peek" in argv, env_only="--env" in argv, force=force, model=model)
-    elif argv[0] == "check" and len(argv) > 2 and argv[1] in ("claude", "codex"):
+    elif argv[0] == "check" and len(argv) > 2 and argv[1] in config.FAMILIES:
         check_account(argv[1], argv[2], model=model, peek="--peek" in argv, force=force)
     elif argv[0] == "watch" or argv[0] == "status" and len(argv) > 1 and argv[1] in ("watch", "bars"):
         # `qr watch [N]`, `qr status watch [N]` and `qr status bars`: the same as --watch / --bars, without the dashes

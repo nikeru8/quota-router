@@ -39,7 +39,7 @@ dir = "~/.codex-b"
 
 | Field | Default | Meaning |
 |---|---|---|
-| `family` | required | `claude` or `codex`. |
+| `family` | required | `claude`, `codex` or `agy` (the Antigravity CLI). |
 | `key` | required | A unique name of your choosing (letters, digits, `-`, `_`, `.`). It appears in messages and logs. |
 | `dir` | `""` | The directory you would pass as `CLAUDE_CONFIG_DIR` / `CODEX_HOME`. `~` and `$HOME` are expanded. Empty, or equal to `~/.claude` / `~/.codex`, means the CLI's default location; one account per family may use it. Exception, Claude on macOS: `dir = "~/.claude"` written out is a second, separate account (see [macOS: two logins in `~/.claude`](#macos-two-logins-in-claude)). |
 | `launch` | `true` | Claude accounts only. `false`: [`qr launch`](#sessions-and-the-claude-launcher) never starts a new session here. Even with `true`, a session only starts here once the hook is in this directory's `settings.json`. Dispatches from the hook still go to the account either way, and a conversation that lives there is still resumed there. |
@@ -88,6 +88,7 @@ On macOS Claude Code keeps each login in the keychain under an item named after 
 | `timing.notice_ttl_hours` | `6` | A reset notice is shown for this long. |
 | `events.reset_drop_points` | `3` | Usage must drop by this many points to count as a reset or refill. |
 | `families.claude.scarce_model` | `"fable"` | The Claude model that has its own weekly bucket. `""` turns the per-model check off. |
+| `families.agy.default_model` | `""` | The `--model` added to an `agy -p` dispatch that names none, e.g. `"gemini-4-argon-high"`. `""` adds nothing. |
 | `launch.route_print` | `false` | `true`: the [launcher](#sessions-and-the-claude-launcher) also chooses the account for `claude -p …` started outside Claude Code. By default those run as written. |
 | `endpoints.claude_usage` | `"https://api.anthropic.com/api/oauth/usage"` | Where Claude usage is queried. |
 | `endpoints.claude_profile` | `"https://api.anthropic.com/api/oauth/profile"` | Where a Claude account's email is queried. |
@@ -266,6 +267,7 @@ Not checked yet (see "Known issues" in [CHANGELOG.md](../CHANGELOG.md)): a `CLAU
 - **You named the account: it is used.** `CLAUDE_CONFIG_DIR=… claude -p …` and `CODEX_HOME=… codex exec …` run as written, with a warning if that account would have been skipped. See [What the hook recognises as a dispatch](#what-the-hook-recognises-as-a-dispatch) for how a named account is detected.
 - **The other family is a suggestion.** A dispatch gets a one-line summary of the other family when that family has accounts and could be read in time, and a 💡 line when it has clearly more room (thresholds: the `hints.*` settings). A command with several dispatches gets the summary for its first one. The lead decides.
 - **One model can have its own bucket.** With `scarce_model` set, a Claude dispatch that names that model, or names none, is also checked against that model's weekly bucket. A resumed conversation without `--model` keeps its account as long as the shared quota has room, but is checked against that bucket for paid overage. If the usage endpoint does not report the bucket, there is nothing to check.
+- **agy is a family of its own.** An `[[accounts]]` entry with `family = "agy"` (one only, `dir` empty: agy has no directory variable) makes `agy -p` / `--print` / `--prompt` a dispatch. Its quota is read by running `agy -p /usage` (about 2.5 s; cached like the others, skipped when less than 4 s of the hook's budget is left). Gemini models are checked against the Gemini bucket, `--model claude-…` / `gpt-…` against agy's Claude and GPT bucket. Nothing is inserted to select an account; a dispatch without `--model` gets `families.agy.default_model`. Interactive `agy` and `agy -i` are sessions and are left alone. agy appears in the other families' summary and hint lines, and they in its.
 - **Resets are read, not assumed.** When a live reading shows usage dropping by at least `reset_drop_points`, it is recorded as a reset or refill and the lead is told once per session. An ordinary five-hour rollover on schedule is not announced, and a reset date that merely moved is recorded for `qr report` without a notice.
 - **Fail open.** If quota-router itself breaks, the command runs as written. With a missing or broken config file the hook also lets every command through unchanged. The hook aims to answer within `hook_budget_seconds`; two seconds after that a watchdog ends it without a decision. The time Python takes to start is on top. See [Time limit](#time-limit).
 

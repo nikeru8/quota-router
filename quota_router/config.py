@@ -13,7 +13,8 @@ from . import platform_compat
 from .i18n import t
 
 LANGUAGES = ("en", "zh-TW")
-FAMILIES = ("claude", "codex")
+FAMILIES = ("claude", "codex", "agy")
+# agy (Antigravity CLI) has no directory variable: it always uses its default location, so it holds one account.
 ENV_DIR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
 
 # (section, key, default). Order is the order `qr config` prints; descriptions are i18n keys "setting.<section>.<key>".
@@ -41,6 +42,7 @@ SETTINGS = [
     ("timing", "notice_ttl_hours", 6),
     ("events", "reset_drop_points", 3),
     ("families.claude", "scarce_model", "fable"),
+    ("families.agy", "default_model", ""),
     ("launch", "route_print", False),
     ("endpoints", "claude_usage", "https://api.anthropic.com/api/oauth/usage"),
     ("endpoints", "claude_profile", "https://api.anthropic.com/api/oauth/profile"),
@@ -100,6 +102,8 @@ def state_dir():
 
 def default_dir(family):
     """Where the CLI keeps its data when its directory variable is unset."""
+    if family == "agy":
+        return os.path.join(platform_compat.home(), ".gemini", "antigravity-cli")
     return os.path.join(platform_compat.home(), ".claude" if family == "claude" else ".codex")
 
 
@@ -139,7 +143,7 @@ def _accounts(raw, warnings=None):
         family, key = item["family"], item["key"]
         where = f'account "{key}"'
         if family not in FAMILIES:
-            raise ValueError(f'{where}: family must be "claude" or "codex", got {family!r}')
+            raise ValueError(f'{where}: family must be "claude", "codex" or "agy", got {family!r}')
         if not all(c.isalnum() or c in "-_." for c in key):
             raise ValueError(f"{where}: key may only contain letters, digits, '-', '_' and '.'")
         if key in keys:
@@ -151,6 +155,8 @@ def _accounts(raw, warnings=None):
         if not isinstance(raw_dir, str):
             raise ValueError(f"{where}: dir must be a string (empty = the CLI's default location)")
         path = expand_dir(raw_dir) if raw_dir.strip() else None
+        if family == "agy" and path is not None and os.path.realpath(path) != os.path.realpath(default_dir("agy")):
+            raise ValueError(f'{where}: agy has no directory variable, so dir must be empty (its default location)')
         if path is not None and not os.path.isabs(path):
             raise ValueError(f"{where}: dir must be absolute or start with ~, got {raw_dir!r}")
         launch = item.get("launch", True)
@@ -217,6 +223,10 @@ def parse(data, path="<memory>"):
         if values["general.language"] not in LANGUAGES:
             raise ValueError(f"general.language must be one of {', '.join(LANGUAGES)}, got {values['general.language']!r}")
         values["families.claude.scarce_model"] = values["families.claude.scarce_model"].strip().lower()
+        values["families.agy.default_model"] = values["families.agy.default_model"].strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]*", values["families.agy.default_model"]):
+            raise ValueError(f"families.agy.default_model may only contain letters, digits, '.', '_' and '-', "
+                             f"got {values['families.agy.default_model']!r}")
         for name in DEFAULTS:
             # the login token is sent to these addresses, so nothing but a plain http(s) URL is accepted.
             if name.startswith("endpoints.") and not values[name].startswith(("https://", "http://")):
