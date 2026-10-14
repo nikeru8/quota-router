@@ -110,6 +110,10 @@ def main(argv=None):
         # the background login renewal a reading started; not a user command (see core.renewal_main).
         core.configure(load_or_exit())
         raise SystemExit(core.renewal_main(argv[1:]))
+    if command == "refresh-agy":
+        # the background agy usage query a reading started; not a user command (see core.agy_refresh_main).
+        core.configure(load_or_exit())
+        raise SystemExit(core.agy_refresh_main(argv[1:]))
     core.configure(load_or_exit())
     return core.main(argv)
 

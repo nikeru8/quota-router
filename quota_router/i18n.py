@@ -45,9 +45,10 @@ quota-router: ask "which account should this subagent use right now?"
   qr hook                   the Claude Code PreToolUse hook (reads the hook JSON on stdin)
 
 Login tokens are only sent to the vendor's own usage / profile endpoints. One
-exception: an expired Claude login is renewed in the background with its refresh
-token, as Claude Code would, and saved back where Claude Code keeps it
-([families.claude] refresh_logins = false or QR_NO_REFRESH=1 turns this off).""",
+exception, off unless you turn it on: with [families.claude] refresh_logins = true
+an expired Claude login is renewed in the background with its refresh token, as
+Claude Code would, and saved back where Claude Code keeps it (QR_NO_REFRESH=1
+turns it off again).""",
     # ---- cli / config ----
     "cli.no_config": 'quota-router: no config at {path}, run "qr init"',
     "cli.config_error": "quota-router: config error in {path}: {detail}",
@@ -101,7 +102,7 @@ token, as Claude Code would, and saved back where Claude Code keeps it
     "setting.launch.route_print": "true = `claude -p` started outside Claude Code also gets an account from the launcher (default: left as written)",
     "setting.families.claude.scarce_model": 'the Claude model with its own weekly bucket; commands without --model are assumed to use it ("" = none)',
     "setting.families.agy.default_model": 'the --model added to an `agy -p` dispatch that names none, e.g. "gemini-4-argon-high" ("" = add nothing)',
-    "setting.families.claude.refresh_logins": "renew an expired Claude login in the background with its refresh token and save it where Claude Code keeps it (QR_NO_REFRESH=1 also turns this off)",
+    "setting.families.claude.refresh_logins": "true: renew an expired Claude login in the background with its refresh token and save it where Claude Code keeps it (off by default; QR_NO_REFRESH=1 turns it off again)",
     "setting.endpoints.claude_usage": "where Claude usage is queried; the login token is sent there (tests / proxies only)",
     "setting.endpoints.claude_profile": "where the Claude account email is queried; the login token is sent there (tests / proxies only)",
     "setting.endpoints.claude_token": "where an expired Claude login is renewed; the refresh token is sent there (tests / proxies only)",
@@ -489,9 +490,9 @@ quota-router：派子代理前問「現在該用哪個帳號」。
   qr decisions [N]          最近 N 筆分流決定（預設 30）
   qr hook                   Claude Code 的 PreToolUse hook（從 stdin 讀 hook 的 JSON）
 
-登入憑證只送到原廠自己的用量／身分網址；Codex 另讀本機紀錄檔。唯一的例外：Claude 登入過期時，
-會像 Claude Code 一樣在背景用 refresh token 更新，再存回 Claude Code 存放登入的地方
-（[families.claude] 設 refresh_logins = false，或設 QR_NO_REFRESH=1 可關掉）。""",
+登入憑證只送到原廠自己的用量／身分網址；Codex 另讀本機紀錄檔。唯一的例外預設關閉：
+[families.claude] 設 refresh_logins = true 時，Claude 登入過期會像 Claude Code 一樣在背景用
+refresh token 更新，再存回 Claude Code 存放登入的地方（設 QR_NO_REFRESH=1 可再關掉）。""",
     "cli.no_config": "quota-router：找不到設定檔 {path}，請先執行 qr init",
     "cli.config_error": "quota-router：設定檔 {path} 有問題：{detail}",
     "cli.exists": "quota-router：{path} 已經存在；要覆寫請用 qr init --force",
@@ -544,7 +545,7 @@ quota-router：派子代理前問「現在該用哪個帳號」。
     "setting.launch.route_print": "true = 在 Claude Code 之外執行的 `claude -p` 也由啟動器挑帳號（預設：照原樣執行）",
     "setting.families.claude.scarce_model": "有專屬週額度的 Claude 模型；沒寫 --model 的指令當作用它（\"\" 表示沒有）",
     "setting.families.agy.default_model": "agy -p 沒寫 --model 時自動補上的模型，例如 \"gemini-4-argon-high\"（\"\" 表示不補）",
-    "setting.families.claude.refresh_logins": "Claude 登入過期時在背景用 refresh token 更新，並存回 Claude Code 存放登入的地方（設 QR_NO_REFRESH=1 也會關掉）",
+    "setting.families.claude.refresh_logins": "true：Claude 登入過期時在背景用 refresh token 更新，並存回 Claude Code 存放登入的地方（預設關閉；設 QR_NO_REFRESH=1 可再關掉）",
     "setting.endpoints.claude_usage": "查 Claude 用量的網址；登入 token 會送到這裡（只供測試或代理環境）",
     "setting.endpoints.claude_profile": "查 Claude 帳號 email 的網址；登入 token 會送到這裡（只供測試或代理環境）",
     "setting.endpoints.claude_token": "更新過期 Claude 登入的網址；refresh token 會送到這裡（只供測試或代理環境）",

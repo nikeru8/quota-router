@@ -57,7 +57,7 @@ def test_reading_runs_usage_once_then_uses_the_cache(router, write_config, monke
     with core.budget(time.monotonic() + 8):
         first = core.agy_reading(core.AGY_ACCOUNTS[0], {})
         second = core.agy_reading(core.AGY_ACCOUNTS[0], {})
-    assert calls == [["agy", "-p", "/usage", "--print-timeout", "6s"]]
+    assert calls == [["agy", "-p", "/usage", "--print-timeout", "120s"]]
     assert first["usage"]["seven_day"]["used"] == 27 and second["usage"] == first["usage"]
 
 
@@ -213,9 +213,11 @@ def test_a_timeout_after_a_missing_cli_still_cools_down(router, write_config, mo
         raise next(outcomes)
     monkeypatch.setattr(core.subprocess, "run", run)
     with core.budget(time.monotonic() + 8):
-        assert core.agy_reading(core.AGY_ACCOUNTS[0], {})["no_login"]
+        first = core.agy_reading(core.AGY_ACCOUNTS[0], {})
+        assert first["no_login"] and first["retry_at"] > core.now() and not first.get("failures")
+        seed(core, "agy-1", dict(first, retry_at=core.now() - 1))       # its short wait is over
         second = core.agy_reading(core.AGY_ACCOUNTS[0], {}, force=True)
-    assert not second.get("no_login") and second["retry_at"] > core.now()
+    assert not second.get("no_login") and second["retry_at"] > core.now() and second["failures"] == 1
 
 
 def test_an_expired_partner_window_triggers_a_requery(router):
@@ -237,3 +239,162 @@ def test_agy_readings_are_observed_for_reset_events(router, write_config, monkey
     with core.budget(time.monotonic() + 8):
         reading = core.agy_reading(core.AGY_ACCOUNTS[0], {})
     assert core.observation_identity("agy", reading)
+
+
+def reading_with(core, weekly_left, five_hour_left=100, age=0):
+    now = core.now()
+    return {"fetched": now - age, "usage": {"seven_day": {"used": 100 - weekly_left, "reset": now + 86400},
+                                            "five_hour": {"used": 100 - five_hour_left, "reset": now + 3600}}}
+
+
+@pytest.mark.parametrize("weekly, five_hour, seconds", [
+    (89, 97, 30 * 60), (50, 100, 30 * 60), (49, 100, 10 * 60), (90, 20, 10 * 60), (90, 19, 180), (5, 100, 180)])
+def test_the_more_quota_is_left_the_less_often_it_is_read(router, weekly, five_hour, seconds):
+    core = router.core
+    assert core.agy_refresh_interval(reading_with(core, weekly, five_hour)) == seconds
+
+
+def test_without_a_reading_or_with_a_past_reset_the_short_interval_applies(router):
+    core = router.core
+    assert core.agy_refresh_interval({}) == core.USAGE_CACHE_SEC
+    gone = reading_with(core, 10)
+    gone["usage"]["seven_day"]["reset"] = core.now() - 1     # only the five-hour window still counts: 100 % left
+    assert core.agy_refresh_interval(gone) == 30 * 60
+
+
+def seed(core, key, reading):
+    with core.state_lock("cache"):
+        cache = core.load("cache.json", {})
+        cache[key] = reading
+        core.save("cache.json", cache)
+
+
+def test_a_reading_never_waits_for_agy_and_starts_one_background_query(router, write_config, monkeypatch):
+    core = configured(router, write_config)
+    started = []
+    monkeypatch.setattr(core, "spawn_agy_refresh", lambda acc, owner: started.append(owner))
+    monkeypatch.setattr(core.subprocess, "run", lambda *a, **k: pytest.fail("a reading must not run agy itself"))
+    seed(core, "agy-1", reading_with(core, 89, 97, age=31 * 60))
+    first = core.agy_reading(core.AGY_ACCOUNTS[0], {})
+    second = core.agy_reading(core.AGY_ACCOUNTS[0], {}, force=True)
+    assert first["usage"]["seven_day"]["used"] == 11 and second["usage"] == first["usage"]   # the cached numbers
+    assert len(started) == 1                       # the second reading finds the first query still running
+
+
+def test_a_reading_within_its_interval_starts_nothing(router, write_config, monkeypatch):
+    core = configured(router, write_config)
+    started = []
+    monkeypatch.setattr(core, "spawn_agy_refresh", lambda acc, owner: started.append(owner))
+    seed(core, "agy-1", reading_with(core, 89, 97, age=29 * 60))
+    core.agy_reading(core.AGY_ACCOUNTS[0], {})
+    seed(core, "agy-1", reading_with(core, 30, 97, age=11 * 60))     # under 50 %: due after 10 minutes
+    core.agy_reading(core.AGY_ACCOUNTS[0], {})
+    assert len(started) == 1
+
+
+def test_a_failed_start_releases_the_claim(router, write_config, monkeypatch):
+    core = configured(router, write_config)
+
+    def broken(acc, owner):
+        raise OSError("no fork")
+    monkeypatch.setattr(core, "spawn_agy_refresh", broken)
+    core.agy_reading(core.AGY_ACCOUNTS[0], {})
+    assert "inflight_owner" not in core.load("cache.json", {})["agy-1"]
+    assert " | usage-query-start | OSError | " in (router.home / "state" / "hook-errors.log").read_text(encoding="utf-8")
+
+
+def test_a_query_whose_claim_was_taken_over_stores_nothing(router, write_config, monkeypatch):
+    core = configured(router, write_config)
+    monkeypatch.setattr(core.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, USAGE_TEXT, ""))
+    seed(core, "agy-1", dict(reading_with(core, 89), inflight_owner="someone-else", inflight_until=core.now() + 60))
+    core.agy_query(core.AGY_ACCOUNTS[0], "me")
+    assert core.load("cache.json", {})["agy-1"]["usage"]["seven_day"]["used"] == 11
+
+
+def test_qr_refresh_agy_runs_the_query_and_writes_one_line(router, write_config, monkeypatch, capsys):
+    from quota_router import cli
+    core = configured(router, write_config)
+    write_config(AGY)
+    monkeypatch.setattr(core.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, USAGE_TEXT, ""))
+    seed(core, "agy-1", {"inflight_owner": "me", "inflight_until": core.now() + 60})
+    with pytest.raises(SystemExit) as ended:
+        cli.main(["refresh-agy", "agy-1", "me"])
+    assert ended.value.code == 0
+    assert capsys.readouterr().out.rstrip().endswith(" ok")
+    entry = core.load("cache.json", {})["agy-1"]
+    assert entry["usage"]["seven_day"]["used"] == 27 and "inflight_owner" not in entry
+    assert core.agy_refresh_main(["no-such-account", "me"]) == 2
+
+
+def test_an_agy_reading_counts_as_current_for_its_whole_interval(router):
+    core = router.core
+    plenty = dict(reading_with(core, 89, 97, age=20 * 60), live=True)
+    assert core.reading_fresh(plenty, "agy") and not core.reading_fresh(plenty)
+    tight = dict(reading_with(core, 10, 97, age=5 * 60), live=True)
+    assert not core.reading_fresh(tight, "agy")              # under 20 % left the short interval applies again
+
+
+def test_a_query_back_after_its_claim_was_taken_over_and_released_stores_nothing(router, write_config, monkeypatch):
+    core = configured(router, write_config)
+    monkeypatch.setattr(core.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, USAGE_TEXT, ""))
+    newer = dict(reading_with(core, 0), live=True)               # B already stored 0 % and released its claim
+    seed(core, "agy-1", dict(newer, inflight_owner="A", inflight_until=core.now() + 60))
+    real_load, calls = core.load, []
+
+    def load(name, default):
+        value = real_load(name, default)
+        calls.append(name)
+        if name == "cache.json" and len(calls) == 2:             # while A's query runs, B finishes and releases
+            value["agy-1"] = dict(newer, fetched=core.now())
+        return value
+    monkeypatch.setattr(core, "load", load)
+    core.agy_query(core.AGY_ACCOUNTS[0], "A")
+    monkeypatch.setattr(core, "load", real_load)
+    assert core.load("cache.json", {})["agy-1"]["usage"]["seven_day"]["used"] == 100
+
+
+def test_a_reading_without_the_cache_lock_claims_and_starts_nothing(router, write_config, monkeypatch):
+    from contextlib import contextmanager
+    core = configured(router, write_config)
+    started = []
+    monkeypatch.setattr(core, "spawn_agy_refresh", lambda acc, owner: started.append(owner))
+
+    @contextmanager
+    def no_lock(name, timeout=2):
+        yield False
+    monkeypatch.setattr(core, "state_lock", no_lock)
+    core.agy_reading(core.AGY_ACCOUNTS[0], {})
+    assert started == [] and "agy-1" not in core.load("cache.json", {})
+
+
+def test_a_failed_start_after_a_reset_is_tried_again(router, write_config, monkeypatch):
+    core = configured(router, write_config)
+    reading = reading_with(core, 89, 97, age=60)
+    reading["usage"]["five_hour"]["reset"] = core.now() - 10      # the window reset after the reading was taken
+    seed(core, "agy-1", reading)
+    attempts = []
+
+    def spawn(acc, owner):
+        attempts.append(owner)
+        if len(attempts) == 1:
+            raise OSError("no fork")
+    monkeypatch.setattr(core, "spawn_agy_refresh", spawn)
+    core.agy_reading(core.AGY_ACCOUNTS[0], {})
+    core.agy_reading(core.AGY_ACCOUNTS[0], {})
+    assert len(attempts) == 2
+
+
+def test_without_agy_or_a_login_a_passed_reset_is_not_queried_on_every_reading(router, write_config, monkeypatch):
+    core = configured(router, write_config)
+    runs = []
+
+    def missing(argv, **kw):
+        runs.append(argv)
+        raise FileNotFoundError(argv[0])
+    monkeypatch.setattr(core.subprocess, "run", missing)
+    reading = reading_with(core, 89, 97, age=60)
+    reading["usage"]["five_hour"]["reset"] = core.now() - 10
+    seed(core, "agy-1", reading)
+    for _ in range(3):
+        core.agy_reading(core.AGY_ACCOUNTS[0], {})
+    assert len(runs) == 1

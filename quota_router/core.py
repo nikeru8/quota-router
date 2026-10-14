@@ -46,7 +46,7 @@ AGY_MODEL = ""                 # --model added to an `agy -p` dispatch that name
 AGY_PROGRAM = "agy"            # the Antigravity CLI that is asked for its quota (`agy -p /usage`)
 LABELS = {"claude": "Claude", "codex": "Codex", "agy": "agy"}
 VERBS = {"claude": "claude -p", "codex": "codex exec", "agy": "agy -p"}
-REFRESH_LOGINS = True          # renew an expired Claude login with its refresh token, as Claude Code would (QR_NO_REFRESH=1: never)
+REFRESH_LOGINS = False         # true: renew an expired Claude login with its refresh token, as Claude Code would (QR_NO_REFRESH=1: never)
 # where the login tokens are sent; the config file can point these elsewhere for tests or a proxy.
 ENDPOINTS = {name.split(".", 1)[1]: url for name, url in config.DEFAULTS.items() if name.startswith("endpoints.")}
 
@@ -987,12 +987,15 @@ def fetched(reading):
     return value if isinstance(value, (int, float)) and math.isfinite(value) else 0
 
 
-def merge_cache(key, before, reading, owner=None):
-    """Merge only what this call changed; older usage never overwrites newer, unknown fields are kept as they are."""
-    with state_lock("cache"):
+def merge_cache(key, before, reading, owner=None, strict=False):
+    """Merge only what this call changed; older usage never overwrites newer, unknown fields are kept as they are.
+    `strict`: only while `owner` still holds the claim (a released claim counts as lost), and only under the lock."""
+    with state_lock("cache", timeout=10 if strict else 2) as locked:
         latest = load("cache.json", {})
         current = latest.get(key, {})
-        if owner and current.get("inflight_owner") not in (None, owner):
+        if owner and current.get("inflight_owner") not in ((owner,) if strict else (None, owner)):
+            return current
+        if strict and not locked:
             return current
         if any(current.get(field) and before.get(field) and current[field] != before[field]
                for field in ("token_sig", "account_sig")):
@@ -1348,7 +1351,6 @@ def codex_log_reading(acc):
 # Gemini models draw on one bucket; the Claude and GPT models agy also offers draw on another.
 AGY_BUCKETS = {"gemini models": "", "claude and gpt models": "partner_"}
 AGY_WINDOWS = {"weekly limit remaining": "seven_day", "five hour limit remaining": "five_hour"}
-AGY_QUERY_MIN_SEC = 4
 AGY_PARTNER_WINDOWS = ("partner_seven_day", "partner_five_hour")
 AGY_TOKEN_FILE = "antigravity-oauth-token"   # agy's login; only its fingerprint is kept, to notice a change of login
 
@@ -1359,7 +1361,7 @@ def agy_identity(acc):
         with open(os.path.join(acc["dir"] or config.default_dir("agy"), AGY_TOKEN_FILE), encoding="utf-8", errors="replace") as f:
             return fingerprint(f.read().strip())
     except OSError:
-        return None          # `agy -p /usage` takes about 2.5 s; it is not started with less time than this left
+        return None
 
 
 def parse_agy_usage(text):
@@ -1379,13 +1381,33 @@ def parse_agy_usage(text):
     return usage
 
 
+AGY_QUERY_SEC = 120                # the background `agy -p /usage` may take this long (it has taken 15-64 s)
+# how long a reading stays fresh, by the lower of the Gemini weekly and five-hour % left: plenty left → refresh rarely.
+AGY_REFRESH_TIERS = ((50, 30 * 60), (20, 10 * 60))   # ≥50 % left: 30 min; ≥20 %: 10 min; below: USAGE_CACHE_SEC
+
+
+def agy_refresh_interval(reading):
+    """Seconds a reading stays fresh: longer the more quota is left. A window whose reset time has passed is not
+    counted (reset_due() asks for a new reading then anyway)."""
+    lefts = [100 - w["used"] for name in ("seven_day", "five_hour")
+             for w in [((reading.get("usage") or {}).get(name))] if w and not (w.get("reset") and w["reset"] <= now())]
+    if not lefts:
+        return USAGE_CACHE_SEC
+    for floor, seconds in AGY_REFRESH_TIERS:
+        if min(lefts) >= floor:
+            return seconds
+    return USAGE_CACHE_SEC
+
+
 def agy_reading(acc, cache=None, force=False):
-    """agy's quota, cached like the other families. A query runs `agy -p /usage` once; with too little time left
-    in the budget, during a failure cooldown or while another process is already asking, the cached reading is used."""
+    """agy's quota as cached. `agy -p /usage` takes far longer than a hook may wait, so it never runs here: when the
+    reading is older than agy_refresh_interval() (or a window has reset, or `force`), one background process is
+    started (`refresh-agy <key> <owner>`, see agy_refresh_main()) and the cached reading is returned at once. No
+    second one starts while one runs (inflight_until) or during a failure cooldown."""
     cache = {} if cache is None else cache
     key = acc["key"]
     owner = uuid.uuid4().hex
-    with state_lock("cache"):
+    with state_lock("cache") as locked:
         latest = load("cache.json", {})
         c = copy.deepcopy(latest.get(key, cache.get(key, {})))
         if "fetched" in c:
@@ -1398,27 +1420,75 @@ def agy_reading(acc, cache=None, force=False):
             c.update(account_sig=sig, token_changed_at=now())
         cooling = c.get("retry_at", 0) > now()
         flying = c.get("inflight_until", 0) > now()
-        hot = c.get("usage") and now() - fetched(c) < USAGE_CACHE_SEC
+        stale = not c.get("usage") or now() - fetched(c) >= agy_refresh_interval(c)
         due = reset_due(c)
-        query = not (cooling or flying or (hot and not force and not due) or remaining() < AGY_QUERY_MIN_SEC)
-        if query:
-            c.pop("no_login", None)   # a failure decides afresh whether this is a login problem
-            c.update(inflight_until=now() + 12, inflight_owner=owner)
-            if due:
-                c["reset_checked"] = dict(c.get("reset_checked") or {}, **due)
+        # without the lock another process may be claiming at the same moment: use the cached numbers, change nothing.
+        # A passed reset needs no marker of its own: a reading taken after it is not due any more, a failed one cools down.
+        start = locked and (force or stale or due) and not (cooling or flying)
+        if start:
+            c.update(inflight_until=now() + AGY_QUERY_SEC + 15, inflight_owner=owner)
+        if locked and (start or c != latest.get(key)):
             latest[key] = c
             save("cache.json", latest)
-    if not query:
-        cache[key] = c
+    if start:
+        try:
+            spawn_agy_refresh(acc, owner)
+        except Exception as e:
+            log_error("usage-query-start", e, key)
+            with state_lock("cache") as released:   # release the claim so the next reading can try again
+                latest = load("cache.json", {})
+                if released and latest.get(key, {}).get("inflight_owner") == owner:
+                    latest[key].pop("inflight_until", None)
+                    latest[key].pop("inflight_owner", None)
+                    save("cache.json", latest)
+        c = copy.deepcopy(load("cache.json", {}).get(key, c))
+        if "fetched" in c:
+            c["fetched"] = fetched(c)
+    cache[key] = c
+    return c
+
+
+def spawn_agy_refresh(acc, owner):
+    """Start `python -I -X utf8 <this package>/__main__.py refresh-agy <key> <owner>` detached, its output appended
+    to refresh-<key>.log in the state directory. Separate so tests can replace it."""
+    with open(os.path.join(STATE, f"refresh-{acc['key']}.log"), "a", encoding="utf-8") as log:
+        return platform_compat.spawn_detached([sys.executable, "-I", "-X", "utf8", ENTRY_FILE, "refresh-agy", acc["key"], owner],
+                                              env=dict(os.environ), stdout=log, stderr=log)
+
+
+def agy_refresh_main(argv):
+    """`qr refresh-agy <key> <owner>`: the background query agy_reading() started. Not a user command."""
+    acc = next((a for a in AGY_ACCOUNTS if argv and a["key"] == argv[0]), None)
+    if acc is None or len(argv) < 2:
+        return 2
+    try:
+        outcome = "ok" if agy_query(acc, argv[1]).get("live") else "failed"
+    except BaseException as e:            # anything at all: one structured line, never a traceback
+        log_error("usage-query", e, acc["key"])
+        outcome = "failed"
+    print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {outcome}", flush=True)
+    return 0
+
+
+def agy_query(acc, owner):
+    """Run `agy -p /usage` once for the claim `owner` holds and merge the result into the cache. A claim another
+    process took over in the meantime wins: this result is then dropped (merge_cache)."""
+    key = acc["key"]
+    with state_lock("cache", timeout=10) as locked:
+        c = copy.deepcopy(load("cache.json", {}).get(key, {}))
+    if "fetched" in c:
+        c["fetched"] = fetched(c)
+    if not locked or c.get("inflight_owner") != owner:
         return c
+    sig = c.get("account_sig")
     before = copy.deepcopy(c)
+    c.pop("no_login", None)   # a failure decides afresh whether this is a login problem
     success = False
     try:
-        wait = max(1, min(10, remaining() - 1))
         try:
-            result = subprocess.run([AGY_PROGRAM, "-p", "/usage", "--print-timeout", f"{int(wait)}s"],
+            result = subprocess.run([AGY_PROGRAM, "-p", "/usage", "--print-timeout", f"{AGY_QUERY_SEC}s"],
                                     capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                    stdin=subprocess.DEVNULL, cwd=STATE, timeout=wait + 0.5)
+                                    stdin=subprocess.DEVNULL, cwd=STATE, timeout=AGY_QUERY_SEC + 5)
         except FileNotFoundError:
             c["no_login"] = True
             raise ValueError(t("err.agy_missing"))
@@ -1437,16 +1507,19 @@ def agy_reading(acc, cache=None, force=False):
         if not isinstance(e, ValueError):
             log_error("usage-query", e, key)
         c["live"] = False
-        if not c.get("no_login"):
+        if c.get("no_login"):
+            # not a server failure, so no growing backoff; but not every reading either: a new login clears it at once.
+            c["retry_at"] = now() + USAGE_CACHE_SEC
+        else:
             cooldown(c, e)
     # the login changed during the query: the result belongs to the old login and is not stored under the new one.
     if agy_identity(acc) != sig:
         failure = {k: c[k] for k in ("retry_at", "failures") if k in c} if not success else {}
         c, success = dict(before, **failure), False
-    c = merge_cache(key, before, c, owner)
+    # strict: a query whose claim expired and was taken over (or already released) must not overwrite the newer one.
+    c = merge_cache(key, before, c, owner, strict=True)
     if success:
         quiet_call(observe_reading, "agy", key, c)
-    cache[key] = c
     return c
 
 
@@ -1696,8 +1769,11 @@ def model_class(model=None, family="claude"):
     return SCARCE if SCARCE and family == "claude" and (model is None or SCARCE in model.lower()) else "other"
 
 
-def reading_fresh(row):
-    return bool(row.get("live") and row.get("usage") and 0 <= now() - fetched(row) <= USAGE_CACHE_SEC)
+def reading_fresh(row, family=None):
+    """A live reading still within the time it counts as current: USAGE_CACHE_SEC, or for agy its refresh interval
+    (agy is read in the background and less often the more quota is left)."""
+    limit = agy_refresh_interval(row) if family == "agy" else USAGE_CACHE_SEC
+    return bool(row.get("live") and row.get("usage") and 0 <= now() - fetched(row) <= limit)
 
 
 def reset_due(reading):
@@ -1791,7 +1867,7 @@ def score_rows(family, raw, model=None, allow_credits=None):
     # and the tie goes to the account listed first in the config file instead of to whichever row the clock favoured.
     scored_at = now()
     for row in rows:
-        row.update(family=family, model=category, allow_credits=allow_credits, fresh=reading_fresh(row))
+        row.update(family=family, model=category, allow_credits=allow_credits, fresh=reading_fresh(row, family))
         row["busy"] = max(row["jobs"], row["n_lease"])
         row["busy_detail"] = t("busy.detail", jobs=row["jobs"], leases=row["n_lease"])
         u = row["usage"] or {}
@@ -2959,7 +3035,7 @@ def report(days=7):
             label = t("window.codex_weekly") if row["family"] == "codex" else window_name(name)
             win = (row.get("usage") or {}).get(name)
             hours = (now() - (win["reset"] - 7 * 86400)) / 3600 if win and win.get("reset") else 0
-            if not reading_fresh(row) or not 24 <= hours <= 168 or win["reset"] <= now():
+            if not reading_fresh(row, row["family"]) or not 24 <= hours <= 168 or win["reset"] <= now():
                 text = t("report.no_data")
             else:
                 projected = win["used"] / hours * 168

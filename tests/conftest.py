@@ -144,6 +144,8 @@ def router(home, write_config, monkeypatch):
     monkeypatch.setattr(core, "open_url", blocked)
     monkeypatch.setattr(core.urllib.request, "urlopen", blocked)
     monkeypatch.setattr(platform_compat, "spawn_detached", blocked)
+    # the background agy query runs in place, so a reading in a test has its result at once.
+    monkeypatch.setattr(core, "spawn_agy_refresh", lambda acc, owner: core.agy_query(acc, owner))
     yield types.SimpleNamespace(core=core, hook=hook, i18n=i18n, usage=usage, home=home, real_running_jobs=real_running_jobs)
     for name, value in previous.items():
         setattr(core, name, value)

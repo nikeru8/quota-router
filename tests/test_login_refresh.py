@@ -205,6 +205,8 @@ class Store:
 
 def make_store(router, write_config, monkeypatch, mode, extra=""):
     from quota_router import config
+    if "refresh_logins" not in extra:
+        extra += "[families.claude]\nrefresh_logins = true\n"   # off by default; these tests are about renewing
     write_config(extra + ENDPOINTS + CONFIG)
     router.core.configure(config.load())
     from quota_router import platform_compat

@@ -84,7 +84,7 @@ def test_accounts_only_file_uses_defaults(write_config):
     assert cfg["general.allow_credits"] is False
     assert (cfg["hints.home_low"], cfg["hints.other_high"], cfg["hints.other_idle"]) == (30, 50, 90)
     assert cfg["families.claude.scarce_model"] == "fable"
-    assert cfg["families.claude.refresh_logins"] is True
+    assert cfg["families.claude.refresh_logins"] is False     # it writes to the credential store: opt-in
 
 
 def test_missing_file(home, monkeypatch):

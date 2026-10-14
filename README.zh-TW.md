@@ -113,7 +113,7 @@ Homebrew、Debian 和多數發行版的 Python 會回 "externally-managed-enviro
 ## 它讀什麼、送什麼、改什麼
 
 - 它會讀每個帳號的登入 token，只送到該廠商自己的端點，也不送任何遙測資料。
-- Claude 帳號的登入過期了（帳號一直閒置）、而且那個目錄沒有在跑的 Claude Code 程序時，quota-router 會在背景另開一個程序，像 Claude Code 自己那樣用 refresh token 更新登入，再寫回原本讀出來的鑰匙圈項目或 `.credentials.json`。不這樣做的話，閒置帳號讀不到額度，就永遠不會被選到。除此之外，它不會寫入或複製任何 token。更新後的登入平常經由 stdin 交給 `security`；如果登入旁邊還存了好幾個 MCP 登入、長度超過上限，就會跟 Claude Code 一樣改放在命令列上，執行的那一下本機其他使用者看得到。Windows 存在認證管理員（Credential Manager）裡的登入不在處理範圍。在 `[families.claude]` 設 `refresh_logins = false`，或設 `QR_NO_REFRESH=1` 可以關掉；細節見 [REFERENCE.md › Renewing an expired Claude login](docs/REFERENCE.md#renewing-an-expired-claude-login)。
+- 只有在 `[families.claude]` 設 `refresh_logins = true` 時（預設關閉）：Claude 帳號的登入過期了（帳號一直閒置）、而且那個目錄沒有在跑的 Claude Code 程序時，quota-router 會在背景另開一個程序，像 Claude Code 自己那樣用 refresh token 更新登入，再寫回原本讀出來的鑰匙圈項目或 `.credentials.json`。不這樣做的話，閒置帳號讀不到額度，就永遠不會被選到。除此之外，它不會寫入或複製任何 token。更新後的登入平常經由 stdin 交給 `security`；如果登入旁邊還存了好幾個 MCP 登入、長度超過上限，就會跟 Claude Code 一樣改放在命令列上，執行的那一下本機其他使用者看得到。Windows 存在認證管理員（Credential Manager）裡的登入不在處理範圍。在 `[families.claude]` 設 `refresh_logins = false`，或設 `QR_NO_REFRESH=1` 可以關掉；細節見 [REFERENCE.md › Renewing an expired Claude login](docs/REFERENCE.md#renewing-an-expired-claude-login)。
 - 即時查 Codex 失敗、而且本機數字已經超過兩小時，它會在背景用那個帳號跑一次很小的 `codex exec` 來更新數字。設 `QR_NO_PROBE=1` 可以關掉。
 - hook 在每條 Bash 指令執行前都會跑，而且可以改寫指令。它只會加上帳號前綴，或擋下整條指令。前幾次派工之後，請看一下 `qr decisions`。
 - 在它自己的狀態目錄之外，它只寫兩樣東西：你安裝進去的每個 `settings.json` 裡的 hook 設定，和 `claude` 啟動器檔案。
