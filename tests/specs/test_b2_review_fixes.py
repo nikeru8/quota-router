@@ -317,7 +317,7 @@ with patch.object(qr,'detect_lead',return_value=('claude-main',True)):
     code,out,err = cli(['pick','claude','--peek'])
 check('R3-9 恢復主管假設提示', code == 0 and '沒有 session 資訊，假設主管在預設位置' in err)
 reset()
-code,out,err = cli(['status'])
+code,out,err = cli(['status','--table'])
 check('R3-10 括號無多餘分號', code == 0 and '（；Fable' not in out and '（Fable 專屬剩 80%）' in out)
 
 finish()

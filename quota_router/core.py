@@ -3097,8 +3097,8 @@ def main(argv):
         pick(argv[1], peek="--peek" in argv, env_only="--env" in argv, force=force, model=model)
     elif argv[0] == "check" and len(argv) > 2 and argv[1] in config.FAMILIES:
         check_account(argv[1], argv[2], model=model, peek="--peek" in argv, force=force)
-    elif argv[0] == "watch" or argv[0] == "status" and len(argv) > 1 and argv[1] in ("watch", "bars"):
-        # `qr watch [N]`, `qr status watch [N]` and `qr status bars`: the same as --watch / --bars, without the dashes
+    elif argv[0] == "watch" or argv[0] == "status" and len(argv) > 1 and argv[1] in ("watch", "bars", "table"):
+        # `qr watch [N]`, `qr status watch [N]`, `qr status bars` and `qr status table`: the same as --watch / --bars / --table, without the dashes
         main([argv[0] if argv[0] == "status" else "status", "--" + (argv[1] if argv[0] == "status" else "watch"),
               *(argv[2:] if argv[0] == "status" else argv[1:])])
     elif argv[0] == "status":
@@ -3115,7 +3115,8 @@ def main(argv):
                 raise SystemExit(2)
             watch_status(force, interval)
         else:
-            status(force, bars="--bars" in argv)
+            # bars are the default view; `--table` (or `qr status table`) prints the old one-row-per-account table
+            status(force, bars="--table" not in argv)
     elif argv[0] == "report":
         try:
             days = int(argv[argv.index("--days") + 1]) if "--days" in argv else 7

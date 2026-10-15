@@ -140,9 +140,11 @@ def test_status_bars(router, capsys):
     assert core.bar(0) == "\u25b1" * 20 + "  0/100%" and core.bar(100) == "\u25b0" * 20 + "  100/100%"
     assert core.bar(None) == "\u25b1" * 20 + "   ?/100%" and core.bar(250).startswith("\u25b0" * 20)
     assert core.display_width("ab") == 2 and core.display_width("中文a") == 5 and core.pad("中", 4) == "中  "
-    code, out, _ = run(["status"], capsys)
-    assert code == 0 and "/100%" not in out and "week reset" in out          # the table, unchanged
-    code, out, _ = run(["status", "--bars"], capsys)
+    code, out, _ = run(["status", "--table"], capsys)
+    assert code == 0 and "/100%" not in out and "week reset" in out          # the old table, on request
+    assert run(["status", "table"], capsys)[1] == out
+    code, out, _ = run(["status"], capsys)                                   # bars are the default
+    assert out == run(["status", "--bars"], capsys)[1]
     lines = out.splitlines()
     bars = [line for line in lines if "/100%" in line]
     assert code == 0 and "week reset" not in out and len(bars) >= 3

@@ -36,7 +36,7 @@ quota-router: ask "which account should this subagent use right now?"
                             --strict is accepted for compatibility and changes nothing
   qr check codex 2 --peek   check one account (key, number or directory) without reserving
   qr status                 table of every account
-  qr status --bars          the table with a bar per quota window under each account
+  qr status --table         the old one-row-per-account table (bars are the default)
   qr status --watch [N]     the table with bars, redrawn every N seconds (default 10) until Ctrl-C
   qr watch [N]              the same, shorter (also: qr status watch, qr status bars)
   qr report [--days N]      reset events, current pace and dispatch statistics (default 7 days)
@@ -482,7 +482,7 @@ quota-router：派子代理前問「現在該用哪個帳號」。
                          沒有帳號可派時結束碼 3、stdout 不輸出；--strict 只為相容而保留，沒有作用
   qr check codex 2 --peek   檢查指定帳號（key、第幾個或目錄），不預約
   qr status                 所有帳號完整表格
-  qr status --bars          表格每個帳號下面加各額度窗的長條
+  qr status --table         改看舊版表格（預設是每個帳號一張長條卡）
   qr status --watch [N]     含長條的表格每 N 秒重畫（預設 10），Ctrl-C 離開
   qr watch [N]              同上的短寫法（也可寫 qr status watch、qr status bars）
   qr report [--days N]      重置事件、目前步調與派工統計（預設 7 天）
