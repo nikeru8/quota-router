@@ -53,6 +53,7 @@ default_model = "gemini-4-argon-high"
 [notify]
 on_refresh_failed = "/bin/true"
 repeat_hours = 6
+failed_attempts = 3
 
 [launch]
 route_print = true
@@ -82,6 +83,7 @@ def test_full_file_overrides_every_default(write_config):
     assert cfg["families.claude.refresh_logins"] is False
     assert cfg["families.codex.refresh_logins"] is True and cfg["families.codex.refresh_before_hours"] == 24
     assert cfg["notify.on_refresh_failed"] == "/bin/true" and cfg["notify.repeat_hours"] == 6
+    assert cfg["notify.failed_attempts"] == 3
     assert cfg["launch.route_print"] is True
     assert [a["key"] for a in cfg.accounts] == ["claude-main", "claude-b", "codex-1", "codex-2"]
     assert cfg.warnings == []
@@ -97,7 +99,8 @@ def test_accounts_only_file_uses_defaults(write_config):
     assert cfg["families.claude.scarce_model"] == "fable"
     assert cfg["families.claude.refresh_logins"] is False     # it writes to the credential store: opt-in
     assert cfg["families.codex.refresh_logins"] is False      # so does the Codex one
-    assert cfg["families.codex.refresh_before_hours"] == 48 and cfg["notify.on_refresh_failed"] == ""
+    assert cfg["families.codex.refresh_before_hours"] == 72 and cfg["notify.on_refresh_failed"] == ""
+    assert cfg["notify.repeat_hours"] == 12 and cfg["notify.failed_attempts"] == 2
 
 
 def test_missing_file(home, monkeypatch):

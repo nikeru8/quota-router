@@ -82,7 +82,8 @@ class CodexStore:
         self.dir = self.acc["dir"]
         os.makedirs(self.dir, exist_ok=True)
         self.path = os.path.join(self.dir, "auth.json")
-        self.token_calls, self.starts, self.outcomes, self.alerts = [], [], [], []
+        self.token_calls, self.starts, self.outcomes, self.alerts, self.alert_envs = [], [], [], [], []
+        self.alert_context = []
         self.answer = answer()
         self.during_token = None
         self.procs, self.envs = {}, {}
@@ -113,7 +114,12 @@ class CodexStore:
         return None
 
     def notify(self, command, env, log):
+        import signal
         self.alerts.append({k: v for k, v in env.items() if k.startswith("QR_")})
+        self.alert_envs.append(dict(env))
+        # where it runs: the account's lock is free again and stop signals are not ignored any more
+        with self.core.state_lock("refresh-" + env["QR_KEY"], timeout=0) as free:
+            self.alert_context.append((free, signal.getsignal(signal.SIGTERM) is not signal.SIG_IGN))
         if isinstance(self.notify_code, BaseException):
             raise self.notify_code
         return self.notify_code
@@ -202,7 +208,7 @@ def test_a_login_expiring_within_the_margin_is_renewed_and_written_back(codex):
 
 
 def test_a_login_with_more_time_left_is_left_alone(codex):
-    codex.put(auth(hours=72))
+    codex.put(auth(hours=73))
     codex.read()
     assert codex.starts == [] and codex.token_calls == []
 
@@ -210,7 +216,7 @@ def test_a_login_with_more_time_left_is_left_alone(codex):
 def test_the_margin_is_a_setting(router, write_config, monkeypatch):
     codex = make_store(router, write_config, monkeypatch,
                        "[families.codex]\nrefresh_logins = true\nrefresh_before_hours = 100\n")
-    codex.put(auth(hours=72))
+    codex.put(auth(hours=90))
     codex.read()
     assert codex.outcomes == ["renewed"]
 
@@ -269,14 +275,30 @@ def test_someone_else_renewed_it_before_the_background_process_ran(codex):
 
 
 # ---- Codex processes ----------------------------------------------------------------------------------------------
-@pytest.mark.parametrize("cmd", [
+JOBS = [
     "codex exec --skip-git-repo-check hi",
     "/opt/homebrew/bin/codex",                                               # an interactive session
     "node /opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js exec hi",
-    "codex login",
-])
-def test_no_renewal_while_a_codex_job_runs_on_that_home(codex, cmd):
+]
+DESKTOP_APP_SERVER = ("/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex "
+                      "-c features.code_mode_host=true app-server --analytics-default-enabled")
+RESIDENTS = [DESKTOP_APP_SERVER, "codex app-server daemon pid-update-loop", "codex mcp-server"]
+
+
+@pytest.mark.parametrize("cmd", JOBS + RESIDENTS)
+def test_a_codex_process_on_that_home_does_not_block_a_renewal_well_before_the_expiry(codex, cmd):
+    """Codex renews on its own only within five minutes of the expiry (or after a 401, re-reading auth.json first)."""
     codex.put(auth(hours=24))
+    codex.run_on(cmd, codex.dir)
+    codex.read()
+    assert codex.outcomes == ["renewed"]
+
+
+@pytest.mark.parametrize("cmd", JOBS + RESIDENTS)
+@pytest.mark.parametrize("hours", [0.4, -0.1, -1, -240])
+def test_any_codex_process_on_that_home_blocks_it_close_to_or_after_the_expiry(codex, cmd, hours):
+    """Once the token has expired every use renews it (expires_at <= now + 5 min), however long ago it expired."""
+    codex.put(auth(hours=hours))
     codex.run_on(cmd, codex.dir)
     codex.read()
     assert codex.busy_in_reading()
@@ -286,10 +308,19 @@ def test_no_renewal_while_a_codex_job_runs_on_that_home(codex, cmd):
     assert codex.alerts == []                                                # busy is not a failure
 
 
-def test_a_codex_job_on_another_home_does_not_count(codex):
-    codex.put(auth(hours=24))
+@pytest.mark.parametrize("cmd", ["codex login", "codex logout", "codex -c x=y login --device-auth"])
+def test_codex_login_on_that_home_always_blocks_it(codex, cmd):
+    codex.put(auth(hours=60))
+    codex.run_on(cmd, codex.dir)
+    codex.read()
+    assert codex.busy_in_reading()
+
+
+def test_a_codex_process_on_another_home_does_not_count(codex):
+    codex.put(auth(hours=0.2))
     codex.run_on("codex exec hi", None)                                      # ~/.codex, codex-1
-    codex.run_on("codex exec hi", str(codex.home / "elsewhere"), pid=102)
+    codex.run_on("codex login", str(codex.home / "elsewhere"), pid=102)
+    codex.run_on(DESKTOP_APP_SERVER, None, pid=103)
     codex.read()
     assert codex.outcomes == ["renewed"]
 
@@ -300,34 +331,11 @@ def test_the_default_home_is_codex_1s(router, write_config, monkeypatch):
     codex.dir = codex.acc["dir"]
     os.makedirs(codex.dir, exist_ok=True)
     codex.path = os.path.join(codex.dir, "auth.json")
-    codex.put(auth(hours=24))
-    codex.run_on("codex exec hi", None)
+    codex.put(auth(hours=-2))
+    codex.run_on(DESKTOP_APP_SERVER, None)                                   # the desktop app, CODEX_HOME unset
     codex.read()
     assert codex.busy_in_reading()
 
-
-DESKTOP_APP_SERVER = ("/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex "
-                      "-c features.code_mode_host=true app-server --analytics-default-enabled")
-
-
-def test_the_desktop_apps_server_does_not_block_a_renewal_well_before_the_expiry(codex):
-    """It runs all day on its home and renews only when used within five minutes of the expiry."""
-    codex.put(auth(hours=24))
-    codex.run_on(DESKTOP_APP_SERVER, codex.dir)
-    codex.run_on("codex app-server daemon pid-update-loop", codex.dir, pid=102)
-    codex.read()
-    assert codex.outcomes == ["renewed"]
-
-
-def test_the_desktop_apps_server_blocks_it_close_to_the_expiry(codex):
-    codex.put(auth(hours=0.1))
-    codex.run_on(DESKTOP_APP_SERVER, codex.dir)
-    codex.read()
-    assert codex.busy_in_reading()
-    codex.end_cooldown()
-    codex.put(auth(hours=-0.1))                                             # just expired: still hot
-    codex.read()
-    assert codex.busy_in_reading()
 
 def test_an_unreadable_process_list_counts_as_busy(codex):
     codex.put(auth(hours=24))
@@ -338,9 +346,10 @@ def test_an_unreadable_process_list_counts_as_busy(codex):
 
 
 @pytest.mark.skipif(WINDOWS, reason="Windows never reads another process's environment")
-def test_a_codex_process_whose_environment_cannot_be_read_counts_as_busy(codex):
-    codex.put(auth(hours=24))
-    codex.procs = {101: (1, "codex exec hi")}
+@pytest.mark.parametrize("cmd,hours", [("codex exec hi", 0.2), ("codex login", 60)])
+def test_a_counting_codex_process_whose_environment_cannot_be_read_counts_as_busy(codex, cmd, hours):
+    codex.put(auth(hours=hours))
+    codex.procs = {101: (1, cmd)}
     codex.read()
     assert codex.starts == [] and codex.token_calls == []
 
@@ -350,7 +359,7 @@ def test_the_background_process_checks_the_processes_again(codex):
     real = codex.spawn
 
     def spawn(acc):
-        codex.run_on("codex exec hi", codex.dir)                             # started right after the reading
+        codex.run_on("codex login", codex.dir)                               # started right after the reading
         return real(acc)
     codex.core.spawn_renewal = spawn
     codex.read()
@@ -362,6 +371,7 @@ def test_the_classifier(router):
     assert classify("codex exec hi") == "job"
     assert classify("codex") == "job"
     assert classify("codex resume --last") == "job"
+    assert classify("codex login") == "login" and classify("codex logout") == "login"
     assert classify(DESKTOP_APP_SERVER) == "resident"
     assert classify("/x/codex app-server daemon pid-update-loop") == "resident"
     assert classify("codex mcp-server") == "resident"
@@ -378,6 +388,8 @@ def test_the_classifier(router):
     lambda: http_error(400, {"error": {"code": "refresh_token_reused"}}),
     lambda: http_error(400, {"code": "refresh_token_invalidated"}),
     lambda: http_error(401, {}),
+    lambda: http_error(403, {"error": {"code": "refresh_token_reused"}}),     # the code decides, not the status
+    lambda: http_error(500, {"code": "refresh_token_expired"}),
 ])
 def test_a_refused_refresh_token_asks_for_codex_login_and_alerts(codex, reply):
     codex.put(auth(hours=24))
@@ -398,6 +410,36 @@ def test_a_refused_refresh_token_asks_for_codex_login_and_alerts(codex, reply):
     assert "codex login" in codex.core.i18n.TABLES["zh-TW"]["err.codex_login_dead"]
 
 
+def test_a_refusal_after_codex_renewed_it_meanwhile_is_not_a_dead_login(codex):
+    """Codex renewed in the same second: the refusal is for the old token, the file already holds a working login."""
+    codex.put(auth(hours=24))
+    codex.during_token = lambda: codex.put(auth(hours=240, refresh="codex-renewed-it"))
+    codex.answer = lambda: http_error(401, {"error": {"code": "refresh_token_reused"}})
+    codex.read()
+    assert codex.outcomes == ["adopted"] and codex.alerts == []
+    assert "refresh_dead" not in codex.core.load("cache.json", {})["codex-2"]
+    assert codex.stored()["tokens"]["refresh_token"] == "codex-renewed-it"
+
+
+@pytest.mark.parametrize("same_access", [True, False])
+def test_logging_in_again_ends_the_dead_mark(codex, same_access):
+    """`codex login` again on the same account keeps account_id; a new refresh token (or a new access token) ends it."""
+    data = auth(hours=24)
+    codex.put(data)
+    codex.answer = lambda: http_error(401, {})
+    codex.read()
+    assert codex.core.load("cache.json", {})["codex-2"]["refresh_failed"] == "dead"
+    again = auth(hours=240, refresh="after-codex-login")
+    if same_access:
+        again["tokens"]["access_token"] = data["tokens"]["access_token"]
+    codex.put(again)
+    (codex.home / "state" / "refresh-codex-2.start").unlink(missing_ok=True)
+    reading = codex.read()
+    cached = codex.core.load("cache.json", {})["codex-2"]
+    assert not {"refresh_failed", "refresh_retry_at", "refresh_dead"} & set(cached)
+    assert codex.core.t("err.codex_login_dead") not in (reading.get("notes_extra") or "")
+
+
 @pytest.mark.parametrize("code", [429, 500, 503, 403])
 def test_other_error_answers_are_a_failure_with_a_cooldown(codex, code):
     codex.put(auth(hours=24))
@@ -405,7 +447,8 @@ def test_other_error_answers_are_a_failure_with_a_cooldown(codex, code):
     codex.read()
     assert codex.outcomes == ["failed"]
     assert f"| codex | refresh-failed | pick=codex-2 | renewal failed, HTTP {code} |" in codex.decisions()
-    assert codex.alerts[0]["QR_REASON"] == "failed"
+    assert codex.alerts == []                                                # one temporary failure is not told
+    assert "| codex | notify-skipped | pick=codex-2 | alert waits for another failure |" in codex.decisions()
     codex.read()                                                             # cooldown: not tried again
     assert len(codex.token_calls) == 1
 
@@ -504,35 +547,117 @@ def test_no_token_and_no_answer_reaches_a_log(codex):
 # ---- the [notify] command -----------------------------------------------------------------------------------------
 def test_an_alert_is_sent_once_per_account_and_reason_within_repeat_hours(codex, monkeypatch):
     codex.put(auth(hours=24))
-    codex.answer = lambda: http_error(503, {})
-    codex.read()
-    codex.again()
-    codex.read()
-    assert len(codex.token_calls) == 2 and [a["QR_REASON"] for a in codex.alerts] == ["failed"]
-    assert "| codex | notify-skipped | pick=codex-2 | alert already sent |" in codex.decisions()
-    # another reason is told at once
-    codex.again()
     codex.answer = lambda: http_error(401, {})
     codex.read()
-    assert [a["QR_REASON"] for a in codex.alerts] == ["failed", "dead"]
+    codex.again()
+    codex.read()
+    assert len(codex.token_calls) == 2 and [a["QR_REASON"] for a in codex.alerts] == ["dead"]
+    assert "| codex | notify-skipped | pick=codex-2 | alert already sent |" in codex.decisions()
+    # another reason is told at once
+    codex.core.notify_refresh_failed("codex", codex.acc, "unsaved", "renewed but could not be saved")
+    assert [a["QR_REASON"] for a in codex.alerts] == ["dead", "unsaved"]
     # after repeat_hours the same reason is told again
     real_now = codex.core.now
     monkeypatch.setattr(codex.core, "now", lambda: real_now() + 12 * HOUR + 60)
-    codex.core.notify_refresh_failed("codex", codex.acc, "failed", "renewal failed")
-    assert [a["QR_REASON"] for a in codex.alerts] == ["failed", "dead", "failed"]
+    codex.core.notify_refresh_failed("codex", codex.acc, "dead", "refresh token refused; run codex login there")
+    assert [a["QR_REASON"] for a in codex.alerts] == ["dead", "unsaved", "dead"]
+
+
+def test_a_temporary_failure_is_told_only_when_it_repeats(codex):
+    codex.put(auth(hours=24))
+    codex.answer = lambda: http_error(503, {})
+    codex.read()
+    assert codex.alerts == []
+    codex.again()
+    codex.read()
+    assert [a["QR_REASON"] for a in codex.alerts] == ["failed"]
+    codex.again()
+    codex.read()                                                             # the third within repeat_hours: not again
+    assert len(codex.alerts) == 1 and len(codex.token_calls) == 3
+
+
+def test_failed_renewed_failed_is_never_told(codex):
+    """Claude renews every eight hours; one 429 between two successes must not be a message each time."""
+    for _ in range(3):
+        codex.put(auth(hours=24))
+        codex.answer = lambda: http_error(429, {})
+        codex.read()
+        codex.again()
+        codex.answer = answer()
+        codex.read()
+        codex.again()
+    assert codex.outcomes == ["failed", "renewed"] * 3 and codex.alerts == []
+
+
+def test_the_number_of_failures_is_a_setting(router, write_config, monkeypatch):
+    codex = make_store(router, write_config, monkeypatch, '[families.codex]\nrefresh_logins = true\n'
+                       '[notify]\non_refresh_failed = "alert"\nfailed_attempts = 1\n')
+    codex.put(auth(hours=24))
+    codex.answer = lambda: http_error(503, {})
+    codex.read()
+    assert [a["QR_REASON"] for a in codex.alerts] == ["failed"]
 
 
 def test_a_successful_renewal_clears_the_alert_memory(codex):
     codex.put(auth(hours=24))
-    codex.answer = lambda: http_error(503, {})
+    codex.answer = lambda: http_error(401, {})
     codex.read()
+    codex.put(auth(hours=24, refresh="after-codex-login"))
     codex.again()
     codex.answer = answer()
     codex.read()
-    assert codex.outcomes == ["failed", "renewed"]
+    assert codex.outcomes == ["dead", "renewed"]
     assert codex.core.load("notify-state.json", {}) == {}
-    codex.core.notify_refresh_failed("codex", codex.acc, "failed", "renewal failed")
+    codex.core.notify_refresh_failed("codex", codex.acc, "dead", "refresh token refused; run codex login there")
     assert len(codex.alerts) == 2
+
+
+def test_without_the_state_lock_no_alert_runs(codex, monkeypatch):
+    from contextlib import contextmanager
+    real = codex.core.state_lock
+
+    @contextmanager
+    def lock(name, timeout=2):
+        if name == "notify":
+            yield False
+        else:
+            with real(name, timeout) as locked:
+                yield locked
+    monkeypatch.setattr(codex.core, "state_lock", lock)
+    assert codex.core.notify_refresh_failed("codex", codex.acc, "dead", "x") == "skipped"
+    assert codex.alerts == [] and "alert skipped, state lock busy" in codex.decisions()
+
+
+def test_a_claim_that_never_reported_back_counts_as_a_failed_run(codex):
+    """A run killed before it could record its outcome leaves {"ok": None}; it must not count as sent for 12 hours."""
+    slot = "codex:codex-2:dead"
+    codex.core.save("notify-state.json", {slot: {"at": time.time() - 2 * HOUR, "ok": None}})
+    assert codex.core.notify_refresh_failed("codex", codex.acc, "dead", "x") == "sent"
+    codex.core.save("notify-state.json", {slot: {"at": time.time() - 10 * 60, "ok": None}})
+    assert codex.core.notify_refresh_failed("codex", codex.acc, "dead", "x") == "skipped"   # failed: an hour
+    codex.core.save("notify-state.json", {slot: {"at": time.time() - 5, "ok": None}})
+    assert codex.core.notify_refresh_failed("codex", codex.acc, "dead", "x") == "skipped"   # still running
+
+
+def test_the_command_runs_after_the_lock_and_outside_the_signal_shield(codex):
+    codex.put(auth(hours=24))
+    codex.answer = lambda: http_error(401, {})
+    codex.read()
+    assert codex.alert_context == [(True, True)]
+
+
+def test_the_command_gets_only_a_few_variables_of_the_environment(codex, monkeypatch):
+    monkeypatch.setenv("SOME_SECRET_TOKEN", "do-not-pass")
+    monkeypatch.setenv("LC_ALL", "zh_TW.UTF-8")
+    monkeypatch.setenv("QR_CONFIG", "/elsewhere")
+    codex.put(auth(hours=24))
+    codex.answer = lambda: http_error(401, {})
+    codex.read()
+    env, = codex.alert_envs
+    assert "SOME_SECRET_TOKEN" not in env and "QR_CONFIG" not in env
+    assert env["LC_ALL"] == "zh_TW.UTF-8" and env["PATH"] == os.environ["PATH"] and env["HOME"] == os.environ["HOME"]
+    assert {k for k in env if k.startswith("QR_")} == {"QR_FAMILY", "QR_KEY", "QR_REASON", "QR_DETAIL", "QR_DIR",
+                                                       "QR_EMAIL", "QR_EXPIRES_AT"}
 
 
 @pytest.mark.parametrize("failure", [1, 127, OSError("no shell"), "timeout"])
@@ -606,3 +731,16 @@ def test_the_command_runs_through_the_shell_with_the_variables(router, write_con
     assert out.read_text() == "codex-2 dead codex\n"                        # once, not twice
     log = (home / "state" / "notify.log").read_text()
     assert "codex codex-2 dead" in log and "sent" in log and "exit 0" in log
+
+
+@posix_only
+def test_a_command_that_runs_too_long_is_ended_with_everything_it_started(router, monkeypatch, home):
+    late = home / "late.txt"
+    monkeypatch.setattr(router.core, "NOTIFY_TIMEOUT_SEC", 0.5)
+    monkeypatch.setattr(subprocess, "run", REAL_SUBPROCESS_RUN)
+    command = f"(sleep 1.5; echo late > {shlex.quote(str(late))}) & wait"
+    with open(home / "out.log", "w") as log:
+        with pytest.raises(subprocess.TimeoutExpired):
+            REAL_RUN_NOTIFY_COMMAND(command, {"PATH": os.environ["PATH"]}, log)
+    time.sleep(2)
+    assert not late.exists()                                                 # the grandchild was ended too
