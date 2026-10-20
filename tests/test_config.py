@@ -43,8 +43,16 @@ reset_drop_points = 5
 scarce_model = "Opus"
 refresh_logins = false
 
+[families.codex]
+refresh_logins = true
+refresh_before_hours = 24
+
 [families.agy]
 default_model = "gemini-4-argon-high"
+
+[notify]
+on_refresh_failed = "/bin/true"
+repeat_hours = 6
 
 [launch]
 route_print = true
@@ -54,6 +62,7 @@ claude_usage = "http://127.0.0.1:1/usage"
 claude_profile = "http://127.0.0.1:1/profile"
 claude_token = "http://127.0.0.1:1/token"
 codex_usage = "http://127.0.0.1:1/codex"
+codex_token = "http://127.0.0.1:1/codex-token"
 """ + CONFIG
 
 
@@ -71,6 +80,8 @@ def test_full_file_overrides_every_default(write_config):
     assert cfg["events.reset_drop_points"] == 5
     assert cfg["families.claude.scarce_model"] == "opus"   # compared case-insensitively
     assert cfg["families.claude.refresh_logins"] is False
+    assert cfg["families.codex.refresh_logins"] is True and cfg["families.codex.refresh_before_hours"] == 24
+    assert cfg["notify.on_refresh_failed"] == "/bin/true" and cfg["notify.repeat_hours"] == 6
     assert cfg["launch.route_print"] is True
     assert [a["key"] for a in cfg.accounts] == ["claude-main", "claude-b", "codex-1", "codex-2"]
     assert cfg.warnings == []
@@ -85,6 +96,8 @@ def test_accounts_only_file_uses_defaults(write_config):
     assert (cfg["hints.home_low"], cfg["hints.other_high"], cfg["hints.other_idle"]) == (30, 50, 90)
     assert cfg["families.claude.scarce_model"] == "fable"
     assert cfg["families.claude.refresh_logins"] is False     # it writes to the credential store: opt-in
+    assert cfg["families.codex.refresh_logins"] is False      # so does the Codex one
+    assert cfg["families.codex.refresh_before_hours"] == 48 and cfg["notify.on_refresh_failed"] == ""
 
 
 def test_missing_file(home, monkeypatch):
@@ -254,13 +267,15 @@ def test_endpoints_default_to_the_vendors_and_can_be_overridden(write_config):
     assert cfg["endpoints.claude_profile"] == "https://api.anthropic.com/api/oauth/profile"
     assert cfg["endpoints.claude_token"] == "https://platform.claude.com/v1/oauth/token"
     assert cfg["endpoints.codex_usage"] == "https://chatgpt.com/backend-api/wham/usage"
+    assert cfg["endpoints.codex_token"] == "https://auth.openai.com/oauth/token"
     previous = core.ENDPOINTS
     try:
         core.configure(config.load(write_config('[endpoints]\ncodex_usage = "http://127.0.0.1:9/u"\n' + CONFIG)))
         assert core.ENDPOINTS == {"claude_usage": "https://api.anthropic.com/api/oauth/usage",
                                   "claude_profile": "https://api.anthropic.com/api/oauth/profile",
                                   "claude_token": "https://platform.claude.com/v1/oauth/token",
-                                  "codex_usage": "http://127.0.0.1:9/u"}
+                                  "codex_usage": "http://127.0.0.1:9/u",
+                                  "codex_token": "https://auth.openai.com/oauth/token"}
     finally:
         core.ENDPOINTS = previous
 

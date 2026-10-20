@@ -43,12 +43,17 @@ SETTINGS = [
     ("events", "reset_drop_points", 3),
     ("families.claude", "scarce_model", "fable"),
     ("families.claude", "refresh_logins", False),
+    ("families.codex", "refresh_logins", False),
+    ("families.codex", "refresh_before_hours", 48),
     ("families.agy", "default_model", ""),
+    ("notify", "on_refresh_failed", ""),
+    ("notify", "repeat_hours", 12),
     ("launch", "route_print", False),
     ("endpoints", "claude_usage", "https://api.anthropic.com/api/oauth/usage"),
     ("endpoints", "claude_profile", "https://api.anthropic.com/api/oauth/profile"),
     ("endpoints", "claude_token", "https://platform.claude.com/v1/oauth/token"),
     ("endpoints", "codex_usage", "https://chatgpt.com/backend-api/wham/usage"),
+    ("endpoints", "codex_token", "https://auth.openai.com/oauth/token"),
 ]
 # Sections `qr init` writes commented out: a config file should not pin these unless its owner means to.
 OPTIONAL_SECTIONS = ("endpoints",)
@@ -215,7 +220,7 @@ def parse(data, path="<memory>"):
         for top in data:
             if top != "accounts" and top not in {section.split(".")[0] for section, *_ in SETTINGS}:
                 warnings.append(f"unknown section [{top}] (ignored)")
-        # a nested table no setting lives under ([families.codex], say) would otherwise vanish without a word.
+        # a nested table no setting lives under ([families.gemini], say) would otherwise vanish without a word.
         nested = {section for section, *_ in SETTINGS if "." in section}
         for section in nested:
             parent = section.split(".")[0]
