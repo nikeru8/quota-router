@@ -997,9 +997,14 @@ def notify_refresh_failed(family, acc, reason, detail):
             sent = load("notify-state.json", {})
             sent = sent if isinstance(sent, dict) else {}
             if reason == "failed":
+                # consecutive: a failure more than repeat_hours after the previous one starts the count again.
                 streak = f"{family}:{key}:failed-streak"
-                sent[streak] = int(number(sent.get(streak)) or 0) + 1
-                if sent[streak] < NOTIFY_FAILED_ATTEMPTS:
+                previous = sent.get(streak) if isinstance(sent.get(streak), dict) else {}
+                count = int(number(previous.get("count")) or 0)
+                if now() - (number(previous.get("at")) or 0) > NOTIFY_REPEAT_SEC:
+                    count = 0
+                sent[streak] = {"count": count + 1, "at": now()}
+                if count + 1 < NOTIFY_FAILED_ATTEMPTS:
                     save("notify-state.json", sent)
                     log_decision("refresh", family, "notify-skipped", account=key, text=NOTIFY_TEXT["waiting"])
                     return "waiting"
@@ -1126,11 +1131,19 @@ CODEX_HOT_SEC = 1800                   # from this long before the expiry on (an
 # the codes Codex treats as a dead refresh token whatever the status code; "invalid_grant" only with a 400.
 CODEX_DEAD_CODES = ("refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated")
 # Codex processes that stay up for hours: the app-server of the ChatGPT / Codex desktop app (also as a daemon),
-# exec-server and mcp-server. They are told apart from jobs only for the process classifier's tests and the docs;
-# both count the same way (codex_login_busy).
+# exec-server (mcp-server is not a subcommand of 0.160.1 / 0.163.0; kept for older and later versions). They are told
+# apart from jobs only for the process classifier's tests and the docs; both count the same way (codex_login_busy).
 CODEX_RESIDENT = ("app-server", "exec-server", "mcp-server", "code-mode-host")
 CODEX_JOB_WORDS = ("exec", "e", "resume")
 CODEX_LOGIN_WORDS = ("login", "logout")  # these write auth.json themselves, at any time
+# after a refusal, auth.json is read again after each of these pauses before the refresh token is called dead: Codex
+# may have renewed it meanwhile (its POST answered, its write still to come), and its in-place write can be caught
+# half done.
+CODEX_DEAD_RECHECK_PAUSES = (0.5, 2, 5)
+# Codex's top-level options that take a value (`-c key=value`, `--profile p`), skipped with it to find the subcommand.
+CODEX_VALUE_OPTIONS = ("-c", "--config", "-p", "--profile", "-C", "--cd", "-m", "--model", "--enable", "--disable",
+                       "-a", "--ask-for-approval", "-s", "--sandbox", "-i", "--image", "--add-dir", "--local-provider",
+                       "--remote", "--remote-auth-token-env")
 
 
 def jwt_claims(token):
@@ -1204,12 +1217,18 @@ def classify_codex_process(cmd):
         argv = argv[script:] if script else argv
     if exe != "codex":
         return None
-    for word in argv[1:8]:
-        if word in CODEX_LOGIN_WORDS:
+    # The subcommand comes after the top-level options. Options known to take a value are skipped with it; any other
+    # word that is not a known subcommand (the value of an option this list lacks, a prompt) is passed over, so that
+    # `codex --new-option x login` is still a login. Nothing after exec / resume is read: that is the prompt.
+    words = iter(argv[1:])
+    for word in words:
+        if word in CODEX_VALUE_OPTIONS:
+            next(words, None)
+        elif word in CODEX_LOGIN_WORDS:
             return "login"
-        if word in CODEX_JOB_WORDS:
+        elif word in CODEX_JOB_WORDS:
             return "job"
-        if word in CODEX_RESIDENT:
+        elif word in CODEX_RESIDENT:
             return "resident"
     return "job"
 
@@ -1220,7 +1239,8 @@ def codex_login_busy(acc, expiry):
     `codex login` / `codex logout` on that CODEX_HOME always count. Any other Codex process (a job, a session, the
     desktop app's app-server that runs all day on ~/.codex) counts from CODEX_HOT_SEC before the expiry on, and
     after it: Codex renews on its own when the token expires within five minutes (so on every use once it has
-    expired), and otherwise only after a 401 from its backend or when the desktop app asks it to, both of which
+    expired), and otherwise only after a 401 from its backend or when the desktop app asks it to (getAuthStatus or
+    account/read with a refresh flag), all of which
     re-read auth.json first and take over what was saved here. Fails closed: an unreadable process list, or a
     counting Codex process whose CODEX_HOME cannot be told, counts as busy."""
     procs = platform_compat.read_processes(run_local)
@@ -1278,10 +1298,16 @@ def renew_codex_locked(acc):
         except urllib.error.HTTPError as e:
             code = codex_error_code(e)
             if e.code == 401 or code in CODEX_DEAD_CODES or (e.code == 400 and code == "invalid_grant"):
-                current = stored_codex_login(acc)[1]
-                if current is not None and current.get("refresh_token") != refresh:
-                    # Codex (or a new login) replaced it meanwhile; the refusal was for the old one.
-                    return finish("adopted")
+                current = None
+                for pause in CODEX_DEAD_RECHECK_PAUSES:
+                    time.sleep(pause)
+                    current = stored_codex_login(acc)[1]
+                    if current is not None and current.get("refresh_token") != refresh:
+                        # Codex (or a new login) replaced it meanwhile; the refusal was for the old one.
+                        return finish("adopted")
+                if current is None:
+                    # the last read found no login: it may be mid-write; not called dead on that, tried again later.
+                    return finish("failed", error=e)
                 return finish("dead", error=e, dead=fingerprint(refresh))
             return finish("failed", error=e)                   # 429 and 5xx included: never retried here
         except Exception as e:

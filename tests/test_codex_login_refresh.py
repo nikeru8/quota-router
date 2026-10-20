@@ -92,6 +92,7 @@ class CodexStore:
         monkeypatch.setattr(self.core, "spawn_renewal", self.spawn)
         monkeypatch.setattr(self.core, "REFRESH_WRITE_PAUSES", (0, 0, 0))
         monkeypatch.setattr(self.core, "REFRESH_READBACK_PAUSES", (0, 0, 0))
+        monkeypatch.setattr(self.core, "CODEX_DEAD_RECHECK_PAUSES", (0, 0, 0))
         monkeypatch.setattr(self.core, "RENEWALS", [])
         monkeypatch.setattr(self.core, "run_notify_command", self.notify)
         monkeypatch.setattr(platform_compat, "read_processes", lambda run: None if self.procs is None else dict(self.procs))
@@ -213,6 +214,12 @@ def test_a_login_with_more_time_left_is_left_alone(codex):
     assert codex.starts == [] and codex.token_calls == []
 
 
+def test_a_login_just_inside_the_margin_is_renewed(codex):
+    codex.put(auth(hours=71))
+    codex.read()
+    assert codex.outcomes == ["renewed"]
+
+
 def test_the_margin_is_a_setting(router, write_config, monkeypatch):
     codex = make_store(router, write_config, monkeypatch,
                        "[families.codex]\nrefresh_logins = true\nrefresh_before_hours = 100\n")
@@ -308,7 +315,20 @@ def test_any_codex_process_on_that_home_blocks_it_close_to_or_after_the_expiry(c
     assert codex.alerts == []                                                # busy is not a failure
 
 
-@pytest.mark.parametrize("cmd", ["codex login", "codex logout", "codex -c x=y login --device-auth"])
+@pytest.mark.parametrize("minutes,busy", [(29, True), (31, False)])
+def test_the_window_starts_thirty_minutes_before_the_expiry(codex, minutes, busy):
+    codex.put(auth(hours=minutes / 60))
+    codex.run_on("codex exec hi", codex.dir)
+    codex.read()
+    if busy:
+        assert codex.busy_in_reading()
+    else:
+        assert codex.outcomes == ["renewed"]
+
+
+@pytest.mark.parametrize("cmd", ["codex login", "codex logout", "codex -c x=y login --device-auth",
+                                 "codex -c a=1 -c b=2 --profile p -C /d login",
+                                 "codex --model m --enable f --sandbox read-only -a never login --with-api-key"])
 def test_codex_login_on_that_home_always_blocks_it(codex, cmd):
     codex.put(auth(hours=60))
     codex.run_on(cmd, codex.dir)
@@ -372,6 +392,12 @@ def test_the_classifier(router):
     assert classify("codex") == "job"
     assert classify("codex resume --last") == "job"
     assert classify("codex login") == "login" and classify("codex logout") == "login"
+    assert classify("codex -c a=1 -c b=2 --profile p -C /d login") == "login"
+    assert classify("codex --config=a=1 --cd=/d --model m --enable x login") == "login"
+    assert classify("codex --some-new-option value login") == "login"         # an unknown option's value is passed over
+    assert classify("codex -c login=1 exec hi") == "job"                      # the value of -c is not a subcommand
+    assert classify("codex exec login") == "job" and classify("codex exec 'run app-server'") == "job"
+    assert classify("codex -c x=1 -p prof app-server --listen unix://") == "resident"
     assert classify(DESKTOP_APP_SERVER) == "resident"
     assert classify("/x/codex app-server daemon pid-update-loop") == "resident"
     assert classify("codex mcp-server") == "resident"
@@ -419,6 +445,52 @@ def test_a_refusal_after_codex_renewed_it_meanwhile_is_not_a_dead_login(codex):
     assert codex.outcomes == ["adopted"] and codex.alerts == []
     assert "refresh_dead" not in codex.core.load("cache.json", {})["codex-2"]
     assert codex.stored()["tokens"]["refresh_token"] == "codex-renewed-it"
+
+
+def test_a_login_that_cannot_be_read_after_a_refusal_is_a_failure_not_a_dead_one(codex):
+    """Codex writes auth.json in place; caught half done, it reads as nothing. That is no proof of a dead login."""
+    codex.put(auth(hours=24))
+
+    def half_written():
+        with open(codex.path, "w", encoding="utf-8") as f:
+            f.write('{"tokens": {"access')
+    codex.during_token = half_written
+    codex.answer = lambda: http_error(401, {"error": {"code": "refresh_token_reused"}})
+    codex.read()
+    assert codex.outcomes == ["failed"] and codex.alerts == []                # one temporary failure: not told
+    assert "refresh_dead" not in codex.core.load("cache.json", {})["codex-2"]
+    assert "| codex | refresh-failed | pick=codex-2 | renewal failed, HTTP 401 |" in codex.decisions()
+
+
+def test_codex_writing_its_renewal_after_the_first_re_read_is_adopted(codex, monkeypatch):
+    """Codex's own POST answered first, its write lands between two of our re-reads."""
+    codex.put(auth(hours=24))
+    refused = []
+    codex.during_token = lambda: refused.append(True)
+    codex.answer = lambda: http_error(401, {"error": {"code": "refresh_token_reused"}})
+    real = codex.core.stored_codex_login
+    reads = []
+
+    def stored(acc):
+        if refused:
+            reads.append(True)
+            if len(reads) == 2:
+                codex.put(auth(hours=240, refresh="codex-wrote-it-late"))
+        return real(acc)
+    monkeypatch.setattr(codex.core, "stored_codex_login", stored)
+    codex.read()
+    assert codex.outcomes == ["adopted"] and codex.alerts == []
+    assert len(reads) >= 2 and codex.stored()["tokens"]["refresh_token"] == "codex-wrote-it-late"
+
+
+def test_the_re_reads_wait_between_them(codex, monkeypatch):
+    monkeypatch.setattr(codex.core, "CODEX_DEAD_RECHECK_PAUSES", (0.5, 2, 5))
+    slept = []
+    monkeypatch.setattr(codex.core.time, "sleep", lambda seconds: slept.append(seconds))
+    codex.put(auth(hours=24))
+    codex.answer = lambda: http_error(401, {})
+    codex.read()
+    assert codex.outcomes == ["dead"] and [x for x in slept if x] == [0.5, 2, 5]
 
 
 @pytest.mark.parametrize("same_access", [True, False])
@@ -574,6 +646,16 @@ def test_a_temporary_failure_is_told_only_when_it_repeats(codex):
     codex.again()
     codex.read()                                                             # the third within repeat_hours: not again
     assert len(codex.alerts) == 1 and len(codex.token_calls) == 3
+
+
+def test_failures_far_apart_are_not_in_a_row(codex, monkeypatch):
+    real_now = codex.core.now
+    codex.core.notify_refresh_failed("codex", codex.acc, "failed", "renewal failed")
+    monkeypatch.setattr(codex.core, "now", lambda: real_now() + 12 * HOUR + 60)
+    assert codex.core.notify_refresh_failed("codex", codex.acc, "failed", "renewal failed") == "waiting"
+    assert codex.alerts == []
+    monkeypatch.setattr(codex.core, "now", lambda: real_now() + 13 * HOUR)
+    assert codex.core.notify_refresh_failed("codex", codex.acc, "failed", "renewal failed") == "sent"
 
 
 def test_failed_renewed_failed_is_never_told(codex):
