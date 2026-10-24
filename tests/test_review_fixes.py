@@ -237,7 +237,7 @@ def test_init_gives_colliding_directories_unique_keys(home, monkeypatch, capsys)
     cli.main(["init"])
     loaded = config.load()                                    # what was written loads
     keys = [a["key"] for a in loaded.accounts]
-    assert len(keys) == len(set(keys)) == 6
+    assert len(keys) == len(set(keys)) == 7
     assert [(a["key"], a["raw_dir"]) for a in loaded.family("claude")] == [
         ("claude-main", ""), ("claude-b-c", "~/.claude-b c"), ("claude-main-2", "~/.claude-main"), ("claude-main-2-2", "~/.claude-main-2")]
     assert "claude-main-2" in capsys.readouterr().out

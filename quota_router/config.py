@@ -8,14 +8,15 @@ import math
 import os
 import re
 import tomllib
+from urllib.parse import urlsplit
 
 from . import platform_compat
 from .i18n import t
 
 LANGUAGES = ("en", "zh-TW")
-FAMILIES = ("claude", "codex", "agy")
+FAMILIES = ("claude", "codex", "agy", "kimi")
 # agy (Antigravity CLI) has no directory variable: it always uses its default location, so it holds one account.
-ENV_DIR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
+ENV_DIR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME", "kimi": "KIMI_CODE_HOME"}
 
 # (section, key, default). Order is the order `qr config` prints; descriptions are i18n keys "setting.<section>.<key>".
 SETTINGS = [
@@ -44,11 +45,17 @@ SETTINGS = [
     ("families.claude", "scarce_model", "fable"),
     ("families.claude", "refresh_logins", False),
     ("families.agy", "default_model", ""),
+    ("families.kimi", "default_model", "kimi-code/k3.1-pro-highspeed"),
+    ("families.kimi", "refresh_logins", True),
     ("launch", "route_print", False),
     ("endpoints", "claude_usage", "https://api.anthropic.com/api/oauth/usage"),
     ("endpoints", "claude_profile", "https://api.anthropic.com/api/oauth/profile"),
     ("endpoints", "claude_token", "https://platform.claude.com/v1/oauth/token"),
     ("endpoints", "codex_usage", "https://chatgpt.com/backend-api/wham/usage"),
+    ("endpoints", "kimi_usage", "https://api.kimi.com/coding/v1/usages"),
+    ("endpoints", "kimi_profile", "https://api.kimi.com/coding/v1/me"),
+    ("endpoints", "kimi_token", "https://auth.kimi.com/api/oauth/token"),
+    ("endpoints", "kimi_token_fallback", "https://auth.kimi.ai/api/oauth/token"),
 ]
 # Sections `qr init` writes commented out: a config file should not pin these unless its owner means to.
 OPTIONAL_SECTIONS = ("endpoints",)
@@ -104,6 +111,8 @@ def state_dir():
 
 def default_dir(family):
     """Where the CLI keeps its data when its directory variable is unset."""
+    if family == "kimi":
+        return os.path.join(platform_compat.home(), ".kimi-code")
     if family == "agy":
         return os.path.join(platform_compat.home(), ".gemini", "antigravity-cli")
     return os.path.join(platform_compat.home(), ".claude" if family == "claude" else ".codex")
@@ -145,7 +154,7 @@ def _accounts(raw, warnings=None):
         family, key = item["family"], item["key"]
         where = f'account "{key}"'
         if family not in FAMILIES:
-            raise ValueError(f'{where}: family must be "claude", "codex" or "agy", got {family!r}')
+            raise ValueError(f'{where}: family must be "claude", "codex", "agy" or "kimi", got {family!r}')
         if not all(c.isalnum() or c in "-_." for c in key):
             raise ValueError(f"{where}: key may only contain letters, digits, '-', '_' and '.'")
         if key in keys:
@@ -191,6 +200,16 @@ def _accounts(raw, warnings=None):
     return accounts
 
 
+def validate_kimi_endpoint(url, token=False):
+    """Kimi credentials may only reach these exact vendor HTTPS hosts; no proxy override."""
+    parsed = urlsplit(url)
+    hosts = ("auth.kimi.com", "auth.kimi.ai") if token else ("api.kimi.com", "api.kimi.ai")
+    if (parsed.scheme != "https" or parsed.hostname not in hosts or parsed.port not in (None, 443)
+            or parsed.username is not None or parsed.password is not None or parsed.fragment or parsed.query):
+        raise ValueError("Kimi endpoints must use an approved Kimi HTTPS host without userinfo, query or fragment")
+    return url
+
+
 def parse(data, path="<memory>"):
     """Validate an already-parsed TOML document and fill in defaults."""
     try:
@@ -229,7 +248,12 @@ def parse(data, path="<memory>"):
         if not re.fullmatch(r"[A-Za-z0-9._-]*", values["families.agy.default_model"]):
             raise ValueError(f"families.agy.default_model may only contain letters, digits, '.', '_' and '-', "
                              f"got {values['families.agy.default_model']!r}")
+        values["families.kimi.default_model"] = values["families.kimi.default_model"].strip()
+        if not re.fullmatch(r"[A-Za-z0-9._/-]*", values["families.kimi.default_model"]):
+            raise ValueError("families.kimi.default_model may only contain letters, digits, '.', '_', '/', '-'")
         for name in DEFAULTS:
+            if name.startswith("endpoints.kimi_"):
+                validate_kimi_endpoint(values[name], token="token" in name)
             # the login token is sent to these addresses, so nothing but a plain http(s) URL is accepted.
             if name.startswith("endpoints.") and not values[name].startswith(("https://", "http://")):
                 raise ValueError(f"{name} must be an http:// or https:// URL, got {values[name]!r}")
@@ -264,7 +288,8 @@ def load(path=None):
 
 # ---- qr init -----------------------------------------------------------------
 MARKERS = {"claude": (".claude.json", ".credentials.json", "settings.json", "projects"),
-           "codex": ("auth.json", "config.toml", "sessions")}
+           "codex": ("auth.json", "config.toml", "sessions"),
+           "kimi": ("credentials/kimi-code.json", "config.toml", "sessions")}
 
 
 def detect_accounts(home=None):
@@ -290,8 +315,8 @@ def detect_accounts(home=None):
         keys.add(unique)
         found.append({"family": family, "key": unique, "dir": directory})
 
-    for family, stem in (("claude", ".claude"), ("codex", ".codex")):
-        add(family, "claude-main" if family == "claude" else "codex-1", "")
+    for family, stem in (("claude", ".claude"), ("codex", ".codex"), ("kimi", ".kimi-code")):
+        add(family, "claude-main" if family == "claude" else f"{family}-1", "")
         extra = 1
         for name in names:
             full = os.path.join(home, name)
@@ -300,7 +325,7 @@ def detect_accounts(home=None):
             if not any(os.path.exists(os.path.join(full, marker)) for marker in MARKERS[family]):
                 continue
             extra += 1
-            add(family, name[1:] if family == "claude" else f"codex-{extra}", "~/" + name)
+            add(family, name[1:] if family == "claude" else f"{family}-{extra}", "~/" + name)
     return found
 
 

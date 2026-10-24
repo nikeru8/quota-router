@@ -15,8 +15,11 @@ STATE = config.state_dir()[0]
 # ---- settings: these are the defaults; configure() fills in the config file's values ----
 CLAUDE_ACCOUNTS = []           # {"key", "dir"}; dir=None is the default location (CLAUDE_CONFIG_DIR unset)
 CODEX_ACCOUNTS = []
+KIMI_ACCOUNTS = []
+KIMI_MODEL = "kimi-code/k3.1-pro-highspeed"
+KIMI_REFRESH_LOGINS = True
 AGY_ACCOUNTS = []              # at most one: agy has no directory variable, so only its default location exists
-DEFAULT_KEY = {"claude": None, "codex": None, "agy": None}   # the account of each family that uses the default location
+DEFAULT_KEY = {"claude": None, "codex": None, "agy": None, "kimi": None}   # the account of each family that uses the default location
 LAUNCH_OFF = set()             # Claude account keys with `launch = false` (no new sessions from `qr launch`)
 USAGE_CACHE_SEC = 180          # a usage reading is cached for 3 minutes
 PROFILE_CACHE_SEC = 86400      # the identity (email) is cached for a day; a changed token re-queries at once
@@ -44,8 +47,8 @@ SCARCE = "fable"               # the model with its own weekly bucket; None when
 SCARCE_LABEL = "Fable"
 AGY_MODEL = ""                 # --model added to an `agy -p` dispatch that names none ("" = leave it alone)
 AGY_PROGRAM = "agy"            # the Antigravity CLI that is asked for its quota (`agy -p /usage`)
-LABELS = {"claude": "Claude", "codex": "Codex", "agy": "agy"}
-VERBS = {"claude": "claude -p", "codex": "codex exec", "agy": "agy -p"}
+LABELS = {"claude": "Claude", "codex": "Codex", "agy": "agy", "kimi": "Kimi"}
+VERBS = {"claude": "claude -p", "codex": "codex exec", "agy": "agy -p", "kimi": "kimi -p"}
 REFRESH_LOGINS = False         # true: renew an expired Claude login with its refresh token, as Claude Code would (QR_NO_REFRESH=1: never)
 # where the login tokens are sent; the config file can point these elsewhere for tests or a proxy.
 ENDPOINTS = {name.split(".", 1)[1]: url for name, url in config.DEFAULTS.items() if name.startswith("endpoints.")}
@@ -67,6 +70,9 @@ def configure(cfg):
         CODEX_ACCOUNTS=[{"key": a["key"], "dir": a["dir"]} for a in cfg.family("codex")],
         AGY_ACCOUNTS=[{"key": a["key"], "dir": a["dir"]} for a in cfg.family("agy")],
         AGY_MODEL=cfg["families.agy.default_model"],
+        KIMI_ACCOUNTS=[{"key": a["key"], "dir": a["dir"]} for a in cfg.family("kimi")],
+        KIMI_MODEL=cfg["families.kimi.default_model"],
+        KIMI_REFRESH_LOGINS=cfg["families.kimi.refresh_logins"],
         LAUNCH_OFF={a["key"] for a in cfg.family("claude") if not a["launch"]},
         DEFAULT_KEY={family: next((a["key"] for a in cfg.family(family) if a["default"]), None)
                      for family in config.FAMILIES},
@@ -97,7 +103,7 @@ def configure(cfg):
 
 
 def accounts(family):
-    return {"claude": CLAUDE_ACCOUNTS, "codex": CODEX_ACCOUNTS, "agy": AGY_ACCOUNTS}.get(family, [])
+    return {"claude": CLAUDE_ACCOUNTS, "codex": CODEX_ACCOUNTS, "agy": AGY_ACCOUNTS, "kimi": KIMI_ACCOUNTS}.get(family, [])
 
 
 def managed_families():
@@ -1523,10 +1529,22 @@ def agy_query(acc, owner):
     return c
 
 
+def parse_kimi_usage(payload):
+    from .kimi import parse_usage
+    return parse_usage(payload)
+
+
+def kimi_reading(acc, cache=None, force=False):
+    from .kimi import reading
+    return reading(acc, cache, force)
+
+
 def family_reading(family, acc, cache, force=False):
     """One account's reading, whatever its family."""
     if family == "claude":
         return claude_reading(acc, cache, force)
+    if family == "kimi":
+        return kimi_reading(acc, cache, force)
     if family == "agy":
         return agy_reading(acc, cache, force)
     return codex_reading(acc, cache, force)
@@ -1603,6 +1621,9 @@ def classify_proc(cmd):
         return "claude"
     if exe == "codex" and "exec" in argv[1:4]:
         return "codex"
+    if exe == "kimi":
+        from .hook import kimi_options
+        return "kimi" if kimi_options(argv[1:])[0] else None
     if exe in ("agy", "antigravity") and "/usage" not in argv[1:] and any(
             a.startswith("-") and a.lstrip("-").partition("=")[0] in ("p", "print", "prompt") for a in argv[1:]):
         return "agy"
@@ -1672,8 +1693,8 @@ def count_processes(classify):
             key = next((a["key"] for a in CLAUDE_ACCOUNTS
                         if (a["dir"] and platform_compat.canonical(a["dir"]) == d)), DEFAULT_KEY["claude"] if d is None else None)
         else:
-            d = d or platform_compat.canonical(config.default_dir("codex"))
-            key = next((a["key"] for a in CODEX_ACCOUNTS if platform_compat.canonical(a["dir"]) == d), None)
+            d = d or platform_compat.canonical(config.default_dir(fam))
+            key = next((a["key"] for a in accounts(fam) if platform_compat.canonical(a["dir"]) == d), None)
         if key:
             counts[key] = counts.get(key, 0) + 1
     return counts
@@ -1928,7 +1949,7 @@ def score_rows(family, raw, model=None, allow_credits=None):
             elif row["wk_left"] < LEAD_FLOOR:
                 row["blocked"] = t("blocked.lead_low", left=row["wk_left"])
         if row["wk_left"] is not None and row["wk_left"] <= 0 and not (row["paid"] and allow_credits):
-            row["blocked"] = t("blocked.scarce_out", model=SCARCE_LABEL) if row["wk_source"] != "shared" else t("blocked.weekly_out")
+            row["blocked"] = t("blocked.scarce_out", model=SCARCE_LABEL) if row["wk_source"] != "shared" else t("blocked.monthly_out" if family == "kimi" else "blocked.weekly_out")
         elif (not row.get("is_lead") and row["wk_left"] is not None and 0 < row["wk_left"] < SUB_FLOOR
               and not row["blocked"]):
             if row["paid"] and allow_credits:
@@ -1936,7 +1957,7 @@ def score_rows(family, raw, model=None, allow_credits=None):
                 row["rate"] = min(row["rate"] or 0.01, 0.01)
             else:
                 row["blocked"] = (t("blocked.low_no_credits", left=row["wk_left"]) if row["paid"] else
-                                  t("blocked.below_floor", left=row["wk_left"], floor=SUB_FLOOR))
+                                  t("blocked.monthly_below_floor" if family == "kimi" else "blocked.below_floor", left=row["wk_left"], floor=SUB_FLOOR))
         if row["paid"] and allow_credits and row["will_spend"] and not row["is_lead"]:
             row["blocked"] = None
             row["rate"] = min(row["rate"] or 0.01, 0.01)
@@ -1991,7 +2012,9 @@ def prefix(family, row):
     if family == "claude":
         return ("env -u CLAUDE_CONFIG_DIR" if row["dir"] is None
                 else "CLAUDE_CONFIG_DIR=" + platform_compat.shell_quote(row["dir"]))
-    return "CODEX_HOME=" + platform_compat.shell_quote(row["dir"])
+    if family == "kimi" and platform_compat.canonical(row["dir"]) == platform_compat.canonical(config.default_dir("kimi")):
+        return ""
+    return config.ENV_DIR[family] + "=" + platform_compat.shell_quote(row["dir"])
 
 
 def who(row):
@@ -2001,7 +2024,7 @@ def who(row):
 def reason(row):
     bits = []
     if row["wk_left"] is not None:
-        bits.append(t("reason.weekly", left=row["wk_left"], when=fmt_left(row["wk_reset"])))
+        bits.append(t("reason.monthly" if row.get("family") == "kimi" else "reason.weekly", left=row["wk_left"], when=fmt_left(row["wk_reset"])))
     if row["fh_left"] is not None:
         bits.append(t("reason.five_hour", left=row["fh_left"]))
     if row["busy"]:
@@ -2024,7 +2047,7 @@ def log_reason(row):
     """The numbers behind a decision, always in English; notes are left out because they follow the display language."""
     bits = []
     if row.get("wk_left") is not None:
-        bits.append(f"weekly {row['wk_left']:.0f}% left")
+        bits.append(f"{'monthly' if row.get('family') == 'kimi' else 'weekly'} {row['wk_left']:.0f}% left")
     if row.get("fh_left") is not None:
         bits.append(f"five-hour {row['fh_left']:.0f}% left")
     if row.get("busy"):
@@ -2100,7 +2123,7 @@ def reset_options(rows):
         if fh_block and r.get("fh_reset") and r["fh_reset"] > now():
             cands.append((r["fh_reset"], t("window.five_hour")))
         if (wk_block or not fh_block) and r.get("wk_reset") and r["wk_reset"] > now():
-            cands.append((r["wk_reset"], t("window.scarce_weekly", model=SCARCE_LABEL) if r.get("wk_source", "shared") != "shared" else t("window.shared_weekly")))
+            cands.append((r["wk_reset"], t("window.scarce_weekly", model=SCARCE_LABEL) if r.get("wk_source", "shared") != "shared" else t("window.monthly" if r.get("family") == "kimi" else "window.shared_weekly")))
         if cands:
             ts, window = max(cands)
             items.append((ts, r["key"], window))
@@ -2226,7 +2249,7 @@ def cross_hint(family, rows, force=False, best=None, orows=None):
     if mine_row is not None and idle and \
             (mine_row["busy"] >= CROSS_BUSY_MINE or (mine_row["wk_left"] or 0) <= top["wk_left"] / 2):
         why = (t("hint.why_busy", busy=mine_row["busy"]) if mine_row["busy"] >= CROSS_BUSY_MINE else
-               t("hint.why_unknown") if mine_row["wk_left"] is None else t("hint.why_low", left=mine_row["wk_left"]))
+               t("hint.why_unknown_monthly" if family == "kimi" else "hint.why_unknown") if mine_row["wk_left"] is None else t("hint.why_low", left=mine_row["wk_left"]))
         return t("hint.cross_idle", them=them, who=who(top), left=top["wk_left"], me=me, mine_who=who(mine_row),
                  why=why, verb=verb)
     return None
@@ -2256,7 +2279,7 @@ def family_summary(family, rows):
         countdown = ((t("summary.reset_passed") if reset <= now() else t("summary.reset_in", when=fmt_left(reset)))
                      if reset else t("summary.reset_unknown"))
         flag = t("summary.maybe_reset") if any(t("marker.maybe_reset") in n for n in r["notes"]) else ""
-        parts.append(t("summary.account", who=who(r), left=wk, countdown=countdown, flag=flag, jobs=r["jobs"]))
+        parts.append(t("summary.kimi_account" if family == "kimi" else "summary.account", who=who(r), left=wk, countdown=countdown, flag=flag, jobs=r["jobs"]))
         if r.get("age_h") is not None:
             ages.append(r["age_h"])
     age = max(ages) if ages else None
@@ -2322,7 +2345,7 @@ def account_key(family, value):
     for a in accs:
         if value == a["key"]:
             return a["key"]
-    if family in ("codex", "agy") and value.isdigit():  # 1, 2, …: the n-th account of the family in the config file
+    if family in ("codex", "agy", "kimi") and value.isdigit():  # 1, 2, …: the n-th account of the family in the config file
         return accs[int(value) - 1]["key"] if 0 < int(value) <= len(accs) else None
     if family == "claude":
         return dir_key(value.replace("${HOME}", HOME))
@@ -2392,7 +2415,7 @@ def status(force=False, bars=False):
             ld = next((a["dir"] for a in CLAUDE_ACCOUNTS if a["key"] == lead_key), None)
             print(t("status.lead", who=who(lr) if lr else lead_key or "?", dir=dir_label(ld),
                     assumed=t("status.assumed") if assumed else "", floor=LEAD_FLOOR, floor_fh=LEAD_FH_FLOOR))
-        col = lambda name: t("status.col." + name)
+        col = lambda name: t("status.col." + ({"weekly": "monthly", "weekly_reset": "monthly_reset"}.get(name, name) if fam == "kimi" else name))
         if not bars:
             print(f"{col('account'):<16}{col('dir'):<24}{col('weekly'):>6}{col('weekly_reset'):>14}{col('five_hour'):>9}"
                   f"{col('rate'):>10}{col('busy'):>10}  {col('state')}")
@@ -2421,6 +2444,10 @@ def status(force=False, bars=False):
                 partner = (r.get("usage") or {}).get("partner_seven_day")
                 if partner:
                     extra = t("sep.semicolon").join(filter(None, [extra, t("status.agy_partner", left=max(0, 100 - partner["used"]))]))
+            if fam == "kimi":
+                code = (r.get("usage") or {}).get("month_code")
+                if code:
+                    extra = t("sep.semicolon").join(filter(None, [extra, t("status.kimi_code", left=max(0, 100 - code["used"]))]))
             name = who(r) + (t("status.lead_tag") if r.get("is_lead") else "")
             if not bars:
                 print(f"{name:<16}{dirs:<24}{wk:>6}{fmt_clock(r['wk_reset']):>14}{fh:>9}{rate:>10}{r['busy_detail']:>10}  {st}"
@@ -2429,10 +2456,10 @@ def status(force=False, bars=False):
             # card layout: one bar per line, CJK-aware alignment, fits 80 columns
             label = lambda text: "  " + pad(text, 9)
             print(f"\n{pad(name, 22)}{dirs}")
-            print(label(t("status.bar.weekly")) + bar(r["wk_left"]) + "   " + t("status.bar.reset", clock=fmt_clock(r["wk_reset"])))
-            if fam in ("claude", "agy"):
+            print(label(t("status.bar.monthly" if fam == "kimi" else "status.bar.weekly")) + bar(r["wk_left"]) + "   " + t("status.bar.reset", clock=fmt_clock(r["wk_reset"])))
+            if fam in ("claude", "agy", "kimi"):
                 print(label(t("status.bar.five_hour")) + bar(r["fh_left"]))
-                if SCARCE:
+                if SCARCE and fam != "kimi":
                     fb = (r.get("usage") or {}).get(SCARCE)
                     print(label(SCARCE_LABEL) + bar(max(0, 100 - fb["used"]) if fb else None))
             card_extra = t("sep.semicolon").join(r["notes"]) if fam == "claude" else extra   # the bar already shows the bucket
@@ -2835,6 +2862,8 @@ def event_timing(event):
 
 
 def window_label(event):
+    if event["family"] == "kimi" and event["window"] == "seven_day":
+        return t("window.monthly")
     return t("window.codex_weekly") if event["family"] == "codex" and event["window"] == "seven_day" else window_name(event["window"])
 
 
@@ -2851,9 +2880,11 @@ def notice_text(event):
         win = usage.get(name)
         if not win:
             continue  # this account has no such window (Codex has no five-hour window, say) or it was not read this time
-        label = t("window.codex_weekly") if event["family"] == "codex" and name == "seven_day" else window_name(name)
+        label = window_label(dict(event, window=name))
         text += t("notice.other_window", window=label, left=100 - win["used"])
-    if event["family"] == "codex":
+    if event["family"] == "kimi":
+        text += t("notice.tail_weekly_plain")
+    elif event["family"] == "codex":
         text += t("notice.tail_codex")
     elif event["window"] == SCARCE:
         text += t("notice.tail_scarce", model=SCARCE_LABEL)
@@ -3032,8 +3063,14 @@ def report(days=7):
     print("\n" + t("report.pace"))
     for row in rows:
         for name in weekly_windows(row["family"]):
-            label = t("window.codex_weekly") if row["family"] == "codex" else window_name(name)
+            label = window_label({"family": row["family"], "window": name})
             win = (row.get("usage") or {}).get(name)
+            if row["family"] == "kimi":
+                # Kimi supplies a monthly reset but no cycle start. Never apply the seven-day pace formula.
+                text = (t("reason.monthly", left=max(0, 100 - win["used"]), when=fmt_left(win.get("reset")))
+                        + t("report.kimi_no_start")) if win and reading_fresh(row, "kimi") else t("report.no_data")
+                print(t("report.row", who=who(row), window=label, text=text))
+                continue
             hours = (now() - (win["reset"] - 7 * 86400)) / 3600 if win and win.get("reset") else 0
             if not reading_fresh(row, row["family"]) or not 24 <= hours <= 168 or win["reset"] <= now():
                 text = t("report.no_data")

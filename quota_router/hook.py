@@ -196,6 +196,31 @@ def cli_name(word):
     return stem.lower() if dot and suffix.lower() in ("exe", "cmd") and stem.lower() in config.FAMILIES else name
 
 
+KIMI_VALUE_FLAGS = {"-m", "--model", "-p", "--prompt", "--work-dir", "--session", "--config", "--config-file",
+                    "--skills-dir", "--agent", "--agent-file", "--add-dir", "--thinking", "--output-format", "--input-format", "--max-steps-per-turn", "--max-retries-per-step"}
+
+
+def kimi_options(words):
+    """Recognise prompt/model options, skipping their values (which may themselves look like flags)."""
+    printing, model, i = False, False, 0
+    while i < len(words):
+        word = words[i]
+        if word == "--" or word in ("--help", "-h", "--version", "-V"):
+            return False, model
+        name, sep, _ = word.partition("=")
+        if not name.startswith("-"):
+            break  # a subcommand, not a one-shot invocation
+        if name in ("-p", "--prompt"):
+            printing = True
+        if name in ("-m", "--model") or (word.startswith("-m") and not word.startswith("--") and len(word) > 2):
+            model = True
+        if name in KIMI_VALUE_FLAGS and not sep:
+            i += 2
+        else:
+            i += 1
+    return printing, model
+
+
 def agy_flag(word):
     """`--model=x` / `-model` / `--print` → ("model", "x") / ("model", None) / ("print", None); None when it is no flag."""
     if not word.startswith("-") or word in ("-", "--"):
@@ -224,6 +249,11 @@ def find_dispatches(cmd):
                 continue
             rest = words[idx + 1:]
             if any(x in ("--help", "-h", "--version", "-V") for x in rest):
+                continue
+            if base == "kimi":
+                if kimi_options(rest)[0]:
+                    found.append({"fam": "kimi", "pos": p, "seg": (s, e), "resume": None, "word_end": p + len(t)})
+                    break
                 continue
             if base == "agy":
                 # one-shot runs only (-p / --print / --prompt); `agy`, `agy -i …` and subcommands are sessions or tools.
@@ -330,9 +360,9 @@ UNSET_BY_ENV = ("unset by env", None)  # the variable was removed by `env -u VAR
 def explicit_account(cmd, fam, pos, seg, cleared=False):
     """Find where an effective assignment sits in the masked text, then read the quoted value from the original.
     cleared=True reports a variable that was removed last as CLEARED / UNSET_BY_ENV instead of as the default account."""
-    var = "CLAUDE_CONFIG_DIR" if fam == "claude" else "CODEX_HOME"
+    var = config.ENV_DIR[fam]
     before = visible_scope(opaque_substitutions(mask(cmd)), pos)
-    default = (qr.DEFAULT_KEY[fam] or "?", t("label.main_account") if fam == "claude" else "~/.codex")
+    default = (qr.DEFAULT_KEY[fam] or "?", t("label.main_account") if fam == "claude" else ("~/.kimi-code" if fam == "kimi" else "~/.codex"))
     events = []
     exported_state = False
     for start, end in segments(before):
@@ -505,6 +535,20 @@ def dispatch_model(cmd, dispatch):
     """Option positions come from the masked words, values from the original; the prompt and heredocs are not options."""
     if dispatch["fam"] == "codex":
         return "other", True
+    if dispatch["fam"] == "kimi":
+        ts = tokens(opaque_substitutions(mask(cmd)), dispatch["pos"], dispatch["seg"][1])
+        dispatch["model_dynamic"] = False
+        # Skip redirection operands, so an explicit model after a redirect is still recognised.
+        words, skip = [], False
+        for _, word in ts[1:]:
+            if skip:
+                skip = False
+                continue
+            if word in ("<", ">", ">>", "2>", "2>>"):
+                skip = True
+                continue
+            words.append(word)
+        return "other", kimi_options(words)[1]
     if dispatch["fam"] == "agy":
         return agy_model(cmd, dispatch)
     scan = opaque_substitutions(mask(cmd))
@@ -566,9 +610,14 @@ def resolved_explicit(cmd, dispatch):
     names that account."""
     if dispatch["fam"] not in config.ENV_DIR:
         return None   # agy: one account, no directory variable to name another one
-    var = "CLAUDE_CONFIG_DIR" if dispatch["fam"] == "claude" else "CODEX_HOME"
+    var = config.ENV_DIR[dispatch["fam"]]
     setting = policy_setting(cmd, dispatch["pos"], var, home=True)
     ex = explicit_account(cmd, dispatch["fam"], dispatch["pos"], dispatch["seg"], cleared=True)
+    if dispatch["fam"] == "kimi" and ex is None and setting is None and os.environ.get("KIMI_CODE_HOME"):
+        # An inherited Kimi home is already an account selection. In particular,
+        # an unprefixed default dispatch must not accidentally run on that home.
+        value = os.environ["KIMI_CODE_HOME"]
+        return qr.account_key("kimi", value) or "?", value
     if ex == UNSET_BY_ENV and dispatch["fam"] == "claude":
         return qr.DEFAULT_KEY["claude"] or "?", t("label.main_account")
     if ex in (CLEARED, UNSET_BY_ENV) or setting and setting[0] == "default":
@@ -656,6 +705,8 @@ def resume_account(fam, res, cwd):
 def dir_prefix(fam, directory):
     """The environment prefix inserted before a dispatch. The directory comes from the config file, so it is quoted as
     one shell word (forward slashes on Windows, which Git Bash accepts): a space or a `;` in it stays part of the path."""
+    if fam == "kimi" and platform_compat.canonical(directory) == platform_compat.canonical(config.default_dir("kimi")):
+        return ""
     if fam == "claude" and directory is None:
         return "env -u CLAUDE_CONFIG_DIR "
     return f"env {config.ENV_DIR[fam]}={platform_compat.shell_quote(directory)} "
@@ -824,6 +875,9 @@ def decide_prepared(cmd, ds, lead_key, session, rows_cache, resumes, explicit, l
         fam = d["fam"]
         label = qr.LABELS[fam]
         ex = explicit[d["pos"]]
+        if fam == "kimi" and not d["model_written"] and qr.KIMI_MODEL:
+            inserts.append((d["word_end"], f" -m {qr.KIMI_MODEL}"))
+            notes.append(t("note.kimi_model_added", model=qr.KIMI_MODEL))
         if fam == "claude" and not d["model_written"] and qr.SCARCE:
             notes.append(t("note.no_model", model=qr.SCARCE_LABEL) if not d["resume"] else t("note.resume_no_model", model=qr.SCARCE_LABEL))
         if d.get("model_dynamic") and qr.SCARCE:
@@ -1012,7 +1066,7 @@ def respond(data, started=None, watchdog=None):
     cmd = ti.get("command")
     cmd = cmd if isinstance(cmd, str) else ""
     lowered = cmd.lower()  # cli_name() accepts CLAUDE.EXE, so this first look must too.
-    if "claude" not in lowered and "codex" not in lowered and "agy" not in lowered:
+    if not any(family in lowered for family in config.FAMILIES):
         return
     # a missing or broken config must not get in the way: the command runs unchanged, with one line on stderr.
     try:

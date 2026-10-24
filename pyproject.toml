@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "quota-router"
 version = "0.1.0"
-description = "Claude Code PreToolUse hook that routes subagent commands (claude -p / codex exec) to the subscription account with the most quota left"
+description = "Claude Code PreToolUse hook that routes subagent commands (claude / codex / agy / kimi) to the subscription account with the most quota left"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

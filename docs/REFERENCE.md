@@ -39,7 +39,7 @@ dir = "~/.codex-b"
 
 | Field | Default | Meaning |
 |---|---|---|
-| `family` | required | `claude`, `codex` or `agy` (the Antigravity CLI). |
+| `family` | required | `claude`, `codex`, `agy` (Antigravity CLI), or `kimi` (Kimi Code CLI). |
 | `key` | required | A unique name of your choosing (letters, digits, `-`, `_`, `.`). It appears in messages and logs. |
 | `dir` | `""` | The directory you would pass as `CLAUDE_CONFIG_DIR` / `CODEX_HOME`. `~` and `$HOME` are expanded. Empty, or equal to `~/.claude` / `~/.codex`, means the CLI's default location; one account per family may use it. Exception, Claude on macOS: `dir = "~/.claude"` written out is a second, separate account (see [macOS: two logins in `~/.claude`](#macos-two-logins-in-claude)). |
 | `launch` | `true` | Claude accounts only. `false`: [`qr launch`](#sessions-and-the-claude-launcher) never starts a new session here. Even with `true`, a session only starts here once the hook is in this directory's `settings.json`. Dispatches from the hook still go to the account either way, and a conversation that lives there is still resumed there. |
@@ -90,11 +90,15 @@ On macOS Claude Code keeps each login in the keychain under an item named after 
 | `families.claude.scarce_model` | `"fable"` | The Claude model that has its own weekly bucket. `""` turns the per-model check off. |
 | `families.agy.default_model` | `""` | The `--model` added to an `agy -p` dispatch that names none, e.g. `"gemini-4-argon-high"`. `""` adds nothing. |
 | `families.claude.refresh_logins` | `false` | `true`: renew an expired Claude login with its refresh token, in a background process, and save it where Claude Code keeps it, so an idle account keeps live numbers. `false` (or `QR_NO_REFRESH=1`): never; an idle account then shows "login token expired" until Claude Code is used there. See [Renewing an expired Claude login](#renewing-an-expired-claude-login). |
+| `families.kimi.default_model` | `"kimi-code/k3.1-pro-highspeed"` | Model added to `kimi -p` / `--prompt` when `-m` / `--model` is absent; empty disables injection. |
+| `families.kimi.refresh_logins` | `true` | Renew expiring Kimi credentials; `QR_NO_REFRESH=1` disables this. |
 | `launch.route_print` | `false` | `true`: the [launcher](#sessions-and-the-claude-launcher) also chooses the account for `claude -p …` started outside Claude Code. By default those run as written. |
 | `endpoints.claude_usage` | `"https://api.anthropic.com/api/oauth/usage"` | Where Claude usage is queried. |
 | `endpoints.claude_profile` | `"https://api.anthropic.com/api/oauth/profile"` | Where a Claude account's email is queried. |
 | `endpoints.claude_token` | `"https://platform.claude.com/v1/oauth/token"` | Where an expired Claude login is renewed. The refresh token is sent here. |
 | `endpoints.codex_usage` | `"https://chatgpt.com/backend-api/wham/usage"` | Where Codex usage is queried. |
+
+Kimi endpoint overrides are an exception: only approved Kimi HTTPS hosts are accepted, never arbitrary proxies. See [Kimi Code family](#kimi-code-family).
 
 `[endpoints]` exists for tests and for networks that reach the vendors through a proxy. **Your login token, and for `claude_token` the refresh token, is sent to whatever these point at**; keep the defaults unless you need one of those two cases. `qr init` writes them commented out, so that a later change of the default addresses is not pinned by old config files.
 
@@ -108,7 +112,7 @@ On macOS Claude Code keeps each login in the keychain under an item named after 
 | `launch` on a Codex account | Warning; it only applies to Claude accounts and is ignored. |
 | `general.language` other than `en` / `zh-TW` | Error. |
 | `endpoints.*` not starting with `http://` or `https://` | Error. |
-| No `[[accounts]]`, an account without `family` or `key`, `family` other than `claude` / `codex`, a key with characters outside letters, digits, `-`, `_`, `.`, a duplicate key | Error. |
+| No `[[accounts]]`, an account without `family` or `key`, `family` other than `claude` / `codex` / `agy` / `kimi`, a key with characters outside letters, digits, `-`, `_`, `.`, a duplicate key | Error. |
 | `dir` that is not absolute after expansion | Error. |
 | Two accounts of one family at the default location (`dir = ""`, or a `dir` that resolves to `~/.claude` / `~/.codex`; on macOS a Claude `dir = "~/.claude"` is a separate account instead) | Error. |
 | Two accounts of one family with the same directory | Error. |
@@ -197,7 +201,7 @@ eval "env $account codex exec \"\$prompt\""
 
 ### `qr init`
 
-Lists the default location of each family first, whether or not anything exists there, then every `~/.claude-*` and `~/.codex-*` directory that contains one of these marker files or directories: `.claude.json`, `.credentials.json`, `settings.json`, `projects` (Claude); `auth.json`, `config.toml`, `sessions` (Codex). It checks that they exist and reads none of them. Keys: the directory name without the dot for Claude (`.claude-b` → `claude-b`), `codex-2`, `codex-3`, … for Codex; a key that would collide or hold an invalid character is adjusted (`claude-main-2`). `[endpoints]` is written commented out.
+Lists the default location of each family first, whether or not anything exists there, then every `~/.claude-*`, `~/.codex-*`, and `~/.kimi-code-*` directory that contains one of these marker files or directories: `.claude.json`, `.credentials.json`, `settings.json`, `projects` (Claude); `auth.json`, `config.toml`, `sessions` (Codex); `credentials/kimi-code.json`, `config.toml`, `sessions` (Kimi). It checks that they exist and reads none of them. Keys: the directory name without the dot for Claude (`.claude-b` → `claude-b`), `codex-2`, `codex-3`, … for Codex, `kimi-2`, `kimi-3`, … for Kimi; a key that would collide or hold an invalid character is adjusted (`claude-main-2`). `[endpoints]` is written commented out.
 
 ### `qr install` and ownership of the hook entry
 
@@ -681,7 +685,7 @@ One line per decision, nine fields separated by ` | `:
 | source | `hook`, `qr pick`, `qr check`, `probe`, `qr launch` or `refresh` |
 | `lead=` | key of the account the dispatching session runs on, with ` (assumed)` when it was not detected; `?` when unknown; `-` for `qr launch`, which starts a session and has no lead |
 | `sess=` | first 8 characters of Claude Code's session id; a hash when the id has an unusual shape; `-` when there is none |
-| family | `claude`, `codex` or `?` |
+| family | `claude`, `codex`, `agy`, `kimi` or `?` |
 | kind | `auto` (routed), `explicit` (account named in the command), `explicit-unknown` (named directory not in the config), `resume`, `resume-unknown`, `deny`, `fail`, `pick`, `check`, `probe`; for `qr launch`: `launch` (a new session routed), `launch-resume` (a resumed conversation kept on its account), `launch-default` (started on the default account; `pick=` is the key of the account at the default location, or `-`), `fail`; for `refresh` (an expired Claude login, `pick=` the account): `refresh-started` (a background renewal was started), `refresh` (renewed and saved), `refresh-adopted` (someone else had renewed it meanwhile), `refresh-busy` (Claude Code uses the directory or holds its lock), `refresh-none` (nothing to renew with), `refresh-failed`, `refresh-dead` (the refresh token was refused or has expired), `refresh-on-hold`, `refresh-unsaved` (renewed, but the write failed), `refresh-unverified` (written, but could not be read back). A pass-through (`--help`, a subcommand, `CLAUDE_CONFIG_DIR` already set, inside a session) is not logged. |
 | `pick=` | account key; `-` when there is none |
 | detail | `; `-separated: a fixed phrase, the numbers behind the choice (`weekly N% left`, `five-hour N% left`, `N running, N reserved`), `model <class>`, `credits allowed`. The phrases `qr launch` adds: `launched with a warning`, `on paid overage`, `no account can take it`, `no account could be read`, `no account is set up for sessions`, and `conversation location unknown` / `kept the original account` as for the hook. For `refresh`: `renewal started in the background`, `login renewed`, `already renewed elsewhere`, `Claude Code may be using that directory`, `Claude Code holds its lock`, `another renewal is running`, `nothing to renew with`, `renewal failed` (with `, HTTP <code>` after an error answer), `odd answer; new refresh token kept`, `refresh token refused; run claude login there`, `account on hold`, `renewed but could not be saved`, `renewed and saved; read-back failed`. For `deny` only the category: `blocked: credits`, `paid overage`, `lead protection`, `five-hour window`, `weekly quota`, `wrong account for resume`, `no account available`, `other`. For `fail` the exception class name. |
@@ -779,3 +783,27 @@ A test in `tests/test_specs.py` scans the spec sources and fails if the Windows 
 #### What the fresh-machine test does and does not show
 
 It creates a virtual environment, installs the package from a copy of the source, runs `qr init`, `qr install`, `qr doctor`, feeds the installed hook command a real `PreToolUse` event against a local stand-in for the usage endpoints, checks the rewritten command and the logs, runs `claude` through the installed launcher (a stand-in prints the account it was started on), and uninstalls. It launches the hook command itself, exactly as written into `settings.json`. It does not run Claude Code, so it does not show that a given Claude Code version accepts the exec-form entry (`command` plus `args`).
+
+
+## Kimi Code family
+
+The fourth family is `kimi`; it selects subscriptions within Kimi only. See the README for the account and model configuration. `dir = ""` resolves to `~/.kimi-code`; other directories are selected with `KIMI_CODE_HOME`. The default location adds no directory prefix. An inherited `KIMI_CODE_HOME` is treated as an explicit account selection so an unprefixed command cannot accidentally use a different account. CLI executable basenames `kimi`, `kimi.exe`, and `kimi.cmd` are supported, including paths. Only `-p` / `--prompt` runs are dispatches. Model options are preserved, and no permission flags (`--auto`, `-y`) are added. Session/configuration files are not copied or edited.
+
+Usage comes from `GET /coding/v1/usages`. `usages.limit_5h.used_ratio * 100` is five-hour usage, `limit_month_total` is monthly usage, and `limit_month_code` is separately shown as the code monthly remainder. Internally the monthly total uses the common `seven_day` key so selection, reservations, reset history and scoring use the same machinery. Every Kimi long-window display is labelled monthly, including status bars/table, pick reasons, summaries, and report events. `weekly_floor`, `tight_warning`, and long-window hint thresholds apply to this **monthly** window. `usage_cache_seconds` controls freshness; a passed reset also requests a fresh reading. The existing three families' scores are unchanged. `qr report` shows the monthly remainder and reset; it does not apply the weekly pace formula because the API supplies no monthly cycle start.
+
+| Endpoint setting | Default |
+|---|---|
+| `endpoints.kimi_usage` | `https://api.kimi.com/coding/v1/usages` |
+| `endpoints.kimi_profile` | `https://api.kimi.com/coding/v1/me` |
+| `endpoints.kimi_token` | `https://auth.kimi.com/api/oauth/token` |
+| `endpoints.kimi_token_fallback` | `https://auth.kimi.ai/api/oauth/token` |
+
+Usage/profile tokens can only go to exact `api.kimi.com` or `api.kimi.ai` HTTPS hosts; refresh tokens only to exact `auth.kimi.com` or `auth.kimi.ai`. Port 443 only, no URL credentials, query or fragment, and no redirects. Tests replace the transport with fake responses and never weaken this validation. `KIMI_CODE_OAUTH_HOST`, then `KIMI_OAUTH_HOST`, overrides the primary OAuth host subject to the same validation. `.com` is the default irrespective of the region file; a failed primary can try the configured fallback once. A successful POST whose answer cannot be saved is never repeated against the fallback.
+
+`GET /coding/v1/me` provides email and `user_level_name`. Usage and account identity are checked against the current credential fingerprint before caching; a changed login invalidates old data. Tokens and response/error bodies are never logged. Only token fingerprints are cached.
+
+`[families.kimi] refresh_logins = true` is the default because access tokens last about 15 minutes. A reading that needs a token within 30 seconds of expiry sends a form POST with `grant_type=refresh_token`, the stored refresh token, and CLI client ID `17e5f671-d194-4dfb-9706-5516cb48c098`. New token fields and expiry are merged into `<dir>/credentials/kimi-code.json`, retaining other CLI fields. A temporary mode-600 file is flushed, fsynced and renamed; stored credentials are compared before replacement and checked afterwards. The empty `<dir>/oauth/kimi-code` sentinel is not read as a credential.
+
+The installed Kimi Code 2.3.0 bundle uses a proper-lockfile directory `<dir>/oauth/kimi-code.lock` around refresh, with a five-second stale limit. On macOS/Linux the router takes the same lock, updates its timestamp every second, and releases it only if it still owns it. It also holds its own lock per credential path. On Windows Kimi disables its cross-process OAuth lock, so the router only has its own lock and credential comparisons; the CLI can still race it in the final comparison/replacement interval. Forced process termination and programs that ignore the lock cannot be made fully safe.
+
+The hook and time-budgeted reports start `refresh-kimi <key> <owner>` detached when renewal is required; their current reading is unknown and can still be dispatched. Normal manual queries perform renewal directly. A worker's result is accepted only while it owns the cache claim; repeated callers do not start duplicates. Failure enters a cooldown, clears quota to unknown, and leaves an existing login eligible for selection. A directory with neither access nor refresh token is not eligible. `QR_NO_REFRESH=1` or `refresh_logins = false` prevents refresh. `~/.kimi-code/config.toml` is never touched.

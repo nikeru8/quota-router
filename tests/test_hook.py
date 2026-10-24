@@ -238,7 +238,7 @@ def test_no_account_at_the_default_location(router, write_config):
     now = router.usage["claude-b"]["fetched"]
     for key, used in (("x", 30), ("y", 10)):
         router.usage[key] = {"email": "", "live": True, "fetched": now, "usage": {"seven_day": {"used": used, "reset": now + 86400}}}
-    assert router.core.DEFAULT_KEY == {"claude": None, "codex": None, "agy": None}
+    assert router.core.DEFAULT_KEY == {"claude": None, "codex": None, "agy": None, "kimi": None}
     assert router.core.detect_lead() == (None, True)              # the lead is on an account outside the pool
     routed = router.hook.decide("claude -p x --model opus", "/tmp")
     assert routed["command"] == f"env CLAUDE_CONFIG_DIR={as_word(router.home / '.claude-c')} claude -p x --model opus"

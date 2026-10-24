@@ -13,11 +13,35 @@ import os
 LANGUAGES = ("en", "zh-TW")
 
 EN = {
+    # ---- Kimi Code ----
+    "report.kimi_no_start": "; cycle start not provided, so monthly pace is not estimated",
+    'setting.families.kimi.default_model': 'the -m added to a kimi -p / --prompt dispatch without -m / --model (empty = add nothing)',
+    'setting.families.kimi.refresh_logins': 'renew expiring Kimi logins and atomically save the CLI credentials; QR_NO_REFRESH=1 disables this',
+    'setting.endpoints.kimi_usage': 'Kimi usage URL (approved Kimi HTTPS hosts only)',
+    'setting.endpoints.kimi_profile': 'Kimi profile URL (approved Kimi HTTPS hosts only)',
+    'setting.endpoints.kimi_token': 'Kimi OAuth token URL, tried first (approved Kimi HTTPS hosts only)',
+    'setting.endpoints.kimi_token_fallback': 'Kimi OAuth token URL used if the first host fails',
+    'err.kimi_refresh': 'Kimi login renewal failed or disabled; quota unknown',
+    'err.kimi_usage': 'Kimi usage query failed; quota unknown',
+    'err.kimi_changed': 'Kimi login changed during the query; quota unknown',
+    'note.kimi_refresh_started': 'Kimi login renewal is running in the background; quota is temporarily unknown',
+    'note.kimi_model_added': '[quota-router] This Kimi dispatch named no model; added -m {model}.',
+    'reason.monthly': 'monthly {left:.0f}% left (resets {when})',
+    'blocked.monthly_out': 'monthly quota used up',
+    'blocked.monthly_below_floor': 'Only {left:.0f}% of monthly quota remains, below the {floor}% minimum',
+    'window.monthly': 'monthly quota',
+    'status.col.monthly': 'month',
+    'status.col.monthly_reset': 'month reset',
+    'status.bar.monthly': 'month',
+    'status.kimi_code': 'Kimi code monthly quota: {left:.0f}% left',
+    'summary.kimi_account': '{who} monthly {left}{countdown}{flag}, {jobs} running',
+    'hint.why_unknown_monthly': 'has unknown monthly quota',
+
     # ---- help ----
     "help": """\
 quota-router: ask "which account should this subagent use right now?"
 
-  qr init [--force]         write an example config (pre-filled from ~/.claude* and ~/.codex*)
+  qr init [--force]         write an example config (pre-filled from ~/.claude*, ~/.codex* and ~/.kimi-code*)
   qr config                 print the resolved settings and where each value came from
   qr install [--config-dir DIR] [--no-launcher]
                             add the hook to Claude Code's settings.json (default ~/.claude), with a backup,
@@ -29,6 +53,7 @@ quota-router: ask "which account should this subagent use right now?"
   qr doctor                 check Python, the config file, account directories, the hook and platform support
   qr pick claude            one line: account prefix  # reason (and reserve that account)
   qr pick codex             same, for a Codex account
+  qr pick kimi              same, for a Kimi Code account (monthly + five-hour quota)
   qr pick claude --env      print only the prefix, ready for $(...)
   qr pick claude --peek     look without reserving
   qr pick claude --model opus   score for that model
@@ -44,11 +69,11 @@ quota-router: ask "which account should this subagent use right now?"
   qr decisions [N]          the last N routing decisions (default 30)
   qr hook                   the Claude Code PreToolUse hook (reads the hook JSON on stdin)
 
-Login tokens are only sent to the vendor's own usage / profile endpoints. One
-exception, off unless you turn it on: with [families.claude] refresh_logins = true
+Login tokens are only sent to the vendor's own usage / profile endpoints. Claude renewal is off unless enabled: with [families.claude] refresh_logins = true
 an expired Claude login is renewed in the background with its refresh token, as
 Claude Code would, and saved back where Claude Code keeps it (QR_NO_REFRESH=1
-turns it off again).""",
+turns it off again). Kimi renewal is ON by default; it only uses Kimi HTTPS
+endpoints, saves credentials atomically, and also respects QR_NO_REFRESH=1.""",
     # ---- cli / config ----
     "cli.no_config": 'quota-router: no config at {path}, run "qr init"',
     "cli.config_error": "quota-router: config error in {path}: {detail}",
@@ -72,11 +97,12 @@ turns it off again).""",
 # quota-router config. Every value in [general], [hints], [limits], [timing],
 # [events] and [families.*] is optional; what you see here are the defaults.
 # [endpoints] is for tests and proxies only and is left commented out; the login
-# tokens are sent to these URLs, and to claude_token the refresh token as well.
+# tokens are sent to these URLs, and token endpoints receive refresh tokens.
+# Kimi endpoints only accept approved Kimi HTTPS hosts (no proxy override).
 # `qr config` prints the resolved values and where each one came from.""",
     "init.accounts": """\
-# One [[accounts]] table per login. family: claude | codex. key: any unique name.
-# dir: the directory you pass as CLAUDE_CONFIG_DIR / CODEX_HOME; "" = the CLI's default location.""",
+# One [[accounts]] table per login. family: claude | codex | agy | kimi. key: any unique name.
+# dir: the directory you pass as CLAUDE_CONFIG_DIR / CODEX_HOME / KIMI_CODE_HOME; "" = the CLI's default location.""",
     "setting.general.language": "message language: en | zh-TW (QR_LANG overrides)",
     "setting.general.protect_threshold": "the lead's own account takes no subagents once its weekly window is below this %",
     "setting.general.protect_five_hour": "...nor once its five-hour window, after the jobs already running, is below this %",
@@ -313,7 +339,7 @@ turns it off again).""",
     "re.overage": r"will incur paid overage|paid overage is enabled",
     "re.lead": r"lead account.*reserved for the lead",
     "re.five_hour": r"five-hour window (?:has only|used up)",
-    "re.weekly": r"weekly quota used up|of weekly quota remains|weekly has only",
+    "re.weekly": r"(?:weekly|monthly) quota used up|of (?:weekly|monthly) quota remains|weekly has only",
     "re.no_context": r"would lose the context",
     "stats.account": "{account}: auto {auto}, explicit {explicit}, resumed {resume}",
     "stats.blocked": "Blocked {count} time(s); top three reasons: {reasons}",
@@ -460,11 +486,35 @@ turns it off again).""",
 }
 
 ZH_TW = {
+    # ---- Kimi Code ----
+    "report.kimi_no_start": "；未提供月窗起點，不推估消耗速度",
+    'setting.families.kimi.default_model': 'kimi -p／--prompt 沒寫 -m／--model 時補上的模型（空字串表示不補）',
+    'setting.families.kimi.refresh_logins': '續期即將到期的 Kimi 登入並原子寫回 CLI 憑證；QR_NO_REFRESH=1 可關閉',
+    'setting.endpoints.kimi_usage': 'Kimi 用量網址（限 Kimi 自家 HTTPS 主機）',
+    'setting.endpoints.kimi_profile': 'Kimi 帳號資料網址（限 Kimi 自家 HTTPS 主機）',
+    'setting.endpoints.kimi_token': '優先使用的 Kimi 登入續期網址（限 Kimi 自家 HTTPS 主機）',
+    'setting.endpoints.kimi_token_fallback': '第一個主機失敗時使用的 Kimi 登入續期網址',
+    'err.kimi_refresh': 'Kimi 登入續期失敗或已關閉，額度未知',
+    'err.kimi_usage': 'Kimi 用量查詢失敗，額度未知',
+    'err.kimi_changed': '查詢期間 Kimi 登入已變更，額度未知',
+    'note.kimi_refresh_started': 'Kimi 正在背景續期登入，額度暫時未知',
+    'note.kimi_model_added': '[帳號分流] 這條 Kimi 沒寫模型，已補上 -m {model}。',
+    'reason.monthly': '月剩 {left:.0f}%（{when}重置）',
+    'blocked.monthly_out': '月額度用完',
+    'blocked.monthly_below_floor': '月剩只剩 {left:.0f}%，低於 {floor}% 底線不派',
+    'window.monthly': '月額度',
+    'status.col.monthly': '月剩',
+    'status.col.monthly_reset': '月重置',
+    'status.bar.monthly': '月剩',
+    'status.kimi_code': 'Kimi 程式碼月剩 {left:.0f}%',
+    'summary.kimi_account': '{who} 月剩 {left}{countdown}{flag} 跑 {jobs}',
+    'hint.why_unknown_monthly': '月額度未知',
+
     "help": """\
 quota-router：派子代理前問「現在該用哪個帳號」。
 
 用法：
-  qr init [--force]         產生範例設定檔（依既有的 ~/.claude*、~/.codex* 目錄預填）
+  qr init [--force]         產生範例設定檔（依既有的 ~/.claude*、~/.codex*、~/.kimi-code* 目錄預填）
   qr config                 印出解析後的設定與每個值的來源
   qr install [--config-dir 目錄] [--no-launcher]
                             把 hook 加進 Claude Code 的 settings.json（預設 ~/.claude），會先備份；
@@ -476,6 +526,7 @@ quota-router：派子代理前問「現在該用哪個帳號」。
   qr doctor                 檢查 Python、設定檔、帳號目錄、hook 與平台功能
   qr pick claude            回一行：帳號環境變數前綴  # 理由（並預約該帳號 30 分鐘，忙碌只計前 5 分鐘）
   qr pick codex             同上，Codex 帳號
+  qr pick kimi              同上，Kimi Code 帳號（月額度與五小時窗）
   qr pick claude --env      只印前綴，方便 $(...) 直接接指令
   qr pick claude --peek     只看不預約
   qr pick claude --model opus  依模型挑選
@@ -490,9 +541,10 @@ quota-router：派子代理前問「現在該用哪個帳號」。
   qr decisions [N]          最近 N 筆分流決定（預設 30）
   qr hook                   Claude Code 的 PreToolUse hook（從 stdin 讀 hook 的 JSON）
 
-登入憑證只送到原廠自己的用量／身分網址；Codex 另讀本機紀錄檔。唯一的例外預設關閉：
+登入憑證只送到原廠自己的用量／身分／續期網址；Codex 另讀本機紀錄檔。Claude 續期預設關閉：
 [families.claude] 設 refresh_logins = true 時，Claude 登入過期會像 Claude Code 一樣在背景用
-refresh token 更新，再存回 Claude Code 存放登入的地方（設 QR_NO_REFRESH=1 可再關掉）。""",
+refresh token 更新，再存回 Claude Code 存放登入的地方。Kimi 續期預設開啟，只連 Kimi 自家
+HTTPS 網址並原子寫回憑證。設 QR_NO_REFRESH=1 可關閉兩家的續期。""",
     "cli.no_config": "quota-router：找不到設定檔 {path}，請先執行 qr init",
     "cli.config_error": "quota-router：設定檔 {path} 有問題：{detail}",
     "cli.exists": "quota-router：{path} 已經存在；要覆寫請用 qr init --force",
@@ -515,10 +567,10 @@ refresh token 更新，再存回 Claude Code 存放登入的地方（設 QR_NO_R
 # quota-router 設定檔。[general]、[hints]、[limits]、[timing]、[events]、[families.*]
 # 裡的值都可以不寫；這裡列的就是預設值。
 # [endpoints] 只供測試或代理環境使用，預設是註解掉的；登入 token 會送到這些網址，
-# claude_token 還會收到 refresh token。
+# token 續期端點還會收到 refresh token；Kimi 端點限 Kimi 自家 HTTPS 主機，不可改成代理。
 # qr config 會印出解析後的值與每個值的來源。""",
     "init.accounts": """\
-# 每個登入帳號一個 [[accounts]]。family：claude | codex。key：任意不重複的名稱。
+# 每個登入帳號一個 [[accounts]]。family：claude | codex | agy | kimi。key：任意不重複的名稱。
 # dir：你平常寫在 CLAUDE_CONFIG_DIR／CODEX_HOME 的目錄；"" 表示 CLI 的預設位置。""",
     "setting.general.language": "訊息語言：en | zh-TW（QR_LANG 優先）",
     "setting.general.protect_threshold": "主管自己的帳號週剩低於這個 % 就不接子代理",
@@ -743,7 +795,7 @@ refresh token 更新，再存回 Claude Code 存放登入的地方（設 QR_NO_R
     "re.overage": r"會產生付費超額|付費超額已開",
     "re.lead": r"主管帳號.*保留給主管",
     "re.five_hour": r"五小時窗(?:只剩|用完)",
-    "re.weekly": r"週額(?:度)?用完|週剩只剩",
+    "re.weekly": r"[週月]額(?:度)?用完|[週月]剩只剩",
     "re.no_context": r"換帳號接續會找不到前文",
     "stats.account": "{account}：自動 {auto}、指定 {explicit}、接續 {resume}",
     "stats.blocked": "被擋 {count} 次；前三種原因：{reasons}",
