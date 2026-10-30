@@ -462,8 +462,11 @@ def test_an_upper_case_executable_name_is_routed(router, monkeypatch, capsys):
 
 def test_unknown_account_fields_and_family_sections_are_reported():
     from quota_router import config
-    text = CONFIG.replace('key = "claude-b"', 'key = "claude-b"\nlabel = "team"') + '\n[families.codex]\nscarce_model = "x"\n'
+    text = CONFIG.replace('key = "claude-b"', 'key = "claude-b"\nlabel = "team"') + '\n[families.gemini]\nscarce_model = "x"\n'
     warnings = config.parse_text(text).warnings
     assert 'unknown field "label" in account "claude-b" (ignored)' in warnings
-    assert "unknown section [families.codex] (ignored)" in warnings
+    assert "unknown section [families.gemini] (ignored)" in warnings
+    # [families.codex] exists (refresh_logins), so a setting it does not have is named as such.
+    warnings = config.parse_text(CONFIG + '\n[families.codex]\nscarce_model = "x"\n').warnings
+    assert "unknown setting families.codex.scarce_model (ignored)" in warnings
     assert config.parse_text(CONFIG).warnings == []

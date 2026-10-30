@@ -797,10 +797,16 @@ def test_an_account_on_hold_has_its_own_message_and_is_retried_later(file_store)
 
 
 def test_an_expired_refresh_token_is_not_sent(file_store):
+    """It is not sent anywhere; the first reading that finds it starts one background run all the same, which records
+    refresh-dead (and runs the [notify] command). Later readings start nothing."""
     file_store.put(login(refreshTokenExpiresAt=int((time.time() - 60) * 1000)))
     reading = file_store.read()
-    assert file_store.starts == [] and file_store.token_calls == []
+    assert file_store.token_calls == [] and file_store.starts == ["claude-b"] and file_store.outcomes == ["dead"]
     assert reading["error"] == file_store.core.t("err.login_dead")
+    assert "| claude | refresh-dead | pick=claude-b |" in (file_store.home / "state" / "decisions.log").read_text()
+    file_store.end_cooldown()
+    assert file_store.read()["error"] == file_store.core.t("err.login_dead")
+    assert file_store.starts == ["claude-b"] and file_store.token_calls == []
 
 
 def test_qr_status_says_a_dead_login_needs_claude_login(file_store, monkeypatch, capsys):

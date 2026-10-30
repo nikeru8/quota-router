@@ -44,11 +44,16 @@ SETTINGS = [
     ("events", "reset_drop_points", 3),
     ("families.claude", "scarce_model", "fable"),
     ("families.claude", "refresh_logins", False),
+    ("families.codex", "refresh_logins", False),
+    ("families.codex", "refresh_before_hours", 72),
     ("families.agy", "default_model", ""),
     ("families.kimi", "default_model", "kimi-code/k3.1-pro-highspeed"),
     ("families.kimi", "refresh_logins", True),
     ("families.grok", "default_model", ""),
     ("families.grok", "refresh_logins", False),
+    ("notify", "on_refresh_failed", ""),
+    ("notify", "repeat_hours", 12),
+    ("notify", "failed_attempts", 2),
     ("launch", "route_print", False),
     ("endpoints", "claude_usage", "https://api.anthropic.com/api/oauth/usage"),
     ("endpoints", "claude_profile", "https://api.anthropic.com/api/oauth/profile"),
@@ -59,6 +64,7 @@ SETTINGS = [
     ("endpoints", "kimi_token", "https://auth.kimi.com/api/oauth/token"),
     ("endpoints", "kimi_token_fallback", "https://auth.kimi.ai/api/oauth/token"),
     ("endpoints", "grok_billing", "https://cli-chat-proxy.grok.com/v1/billing?format=credits"),
+    ("endpoints", "codex_token", "https://auth.openai.com/oauth/token"),
 ]
 # Sections `qr init` writes commented out: a config file should not pin these unless its owner means to.
 OPTIONAL_SECTIONS = ("endpoints",)
@@ -248,7 +254,7 @@ def parse(data, path="<memory>"):
         for top in data:
             if top != "accounts" and top not in {section.split(".")[0] for section, *_ in SETTINGS}:
                 warnings.append(f"unknown section [{top}] (ignored)")
-        # a nested table no setting lives under ([families.codex], say) would otherwise vanish without a word.
+        # a nested table no setting lives under ([families.gemini], say) would otherwise vanish without a word.
         nested = {section for section, *_ in SETTINGS if "." in section}
         for section in nested:
             parent = section.split(".")[0]

@@ -85,14 +85,16 @@ quota-router: ask "which account should this subagent use right now?"
   qr decisions [N]          the last N routing decisions (default 30)
   qr hook                   the Claude Code PreToolUse hook (reads the hook JSON on stdin)
 
-Login tokens are only sent to the vendor's own usage / profile endpoints. Claude renewal is off unless enabled: with [families.claude] refresh_logins = true
-an expired Claude login is renewed in the background with its refresh token, as
-Claude Code would, and saved back where Claude Code keeps it (QR_NO_REFRESH=1
-turns it off again). Kimi renewal is ON by default; it only uses Kimi HTTPS
-endpoints, saves credentials atomically, and also respects QR_NO_REFRESH=1.
-quota-router never renews a Grok login itself; with [families.grok]
-refresh_logins = true an expired one makes it run `grok models`, and the CLI
-renews it.""",
+Login tokens are only sent to the vendor's own usage / profile endpoints. One
+exception, off unless you turn it on: with refresh_logins = true under
+[families.claude] or [families.codex] an expiring login is renewed in the
+background with its refresh token, as the CLI would, and saved back where the
+CLI keeps it (QR_NO_REFRESH=1 turns it off again). [notify] on_refresh_failed
+names a command that is run when such a renewal fails. Kimi renewal is ON by
+default; it only uses Kimi HTTPS endpoints, saves credentials atomically, and
+also respects QR_NO_REFRESH=1. quota-router never renews a Grok login itself;
+with [families.grok] refresh_logins = true an expired one makes it run
+`grok models`, and the CLI renews it.""",
     # ---- cli / config ----
     "cli.no_config": 'quota-router: no config at {path}, run "qr init"',
     "cli.config_error": "quota-router: config error in {path}: {detail}",
@@ -149,10 +151,16 @@ renews it.""",
     "setting.families.claude.scarce_model": 'the Claude model with its own weekly bucket; commands without --model are assumed to use it ("" = none)',
     "setting.families.agy.default_model": 'the --model added to an `agy -p` dispatch that names none, e.g. "gemini-4-argon-high" ("" = add nothing)',
     "setting.families.claude.refresh_logins": "true: renew an expired Claude login in the background with its refresh token and save it where Claude Code keeps it (off by default; QR_NO_REFRESH=1 turns it off again)",
+    "setting.families.codex.refresh_logins": "true: renew a Codex login in the background with its refresh token before it expires and save it in auth.json (off by default; QR_NO_REFRESH=1 turns it off again)",
+    "setting.families.codex.refresh_before_hours": "a Codex login is renewed once its access token (about ten days) expires within this many hours",
+    "setting.notify.on_refresh_failed": 'shell command run when a login renewal fails; it gets QR_FAMILY, QR_KEY, QR_REASON, QR_DETAIL, QR_DIR, QR_EMAIL, QR_EXPIRES_AT ("" = none)',
+    "setting.notify.repeat_hours": "the same account and reason runs the command at most once in this many hours",
+    "setting.notify.failed_attempts": "a temporary failure runs the command only after this many in a row (a dead login: at once)",
     "setting.endpoints.claude_usage": "where Claude usage is queried; the login token is sent there (tests / proxies only)",
     "setting.endpoints.claude_profile": "where the Claude account email is queried; the login token is sent there (tests / proxies only)",
     "setting.endpoints.claude_token": "where an expired Claude login is renewed; the refresh token is sent there (tests / proxies only)",
     "setting.endpoints.codex_usage": "where Codex usage is queried; the login token is sent there (tests / proxies only)",
+    "setting.endpoints.codex_token": "where a Codex login is renewed; the refresh token is sent there (tests / proxies only)",
     "usage.model": "usage: --model <name>",
     "usage.report": "usage: qr report [--days <positive integer>]",
     "usage.watch": "usage: qr status --watch [<seconds, a positive integer; default 10>]",
@@ -193,6 +201,8 @@ renews it.""",
     "err.login_dead": "login can no longer be renewed: run `claude login` with this account's directory",
     "err.refresh_unsaved": "the login was renewed but could not be saved; if this account stops working, run `claude login` with its directory",
     "err.login_on_hold": "the account is on hold, so its login is not renewed; see claude.ai, then run `claude login` with its directory",
+    "err.codex_login_dead": "login can no longer be renewed: run `codex login` with CODEX_HOME set to this account's directory",
+    "err.codex_refresh_unsaved": "the login was renewed but could not be saved; if this account stops working, run `codex login` with CODEX_HOME set to its directory",
     "err.unreachable": "cannot reach the usage endpoint ({error})",
     "err.codex_live_failed": "live query failed ({error}); using the latest local numbers",
     "err.agy_missing": "the agy command was not found",
@@ -577,12 +587,12 @@ quota-router：派子代理前問「現在該用哪個帳號」。
   qr decisions [N]          最近 N 筆分流決定（預設 30）
   qr hook                   Claude Code 的 PreToolUse hook（從 stdin 讀 hook 的 JSON）
 
-登入憑證只送到原廠自己的用量／身分／續期網址；Codex 另讀本機紀錄檔。Claude 續期預設關閉：
-[families.claude] 設 refresh_logins = true 時，Claude 登入過期會像 Claude Code 一樣在背景用
-refresh token 更新，再存回 Claude Code 存放登入的地方。Kimi 續期預設開啟，只連 Kimi 自家
-HTTPS 網址並原子寫回憑證。設 QR_NO_REFRESH=1 可關閉兩家的續期。
-quota-router 不自己續期 Grok 登入；[families.grok] 設 refresh_logins = true 時，
-登入過期會在背景跑 `grok models`，由 CLI 自己續期。""",
+登入憑證只送到原廠自己的用量／身分／續期網址；Codex 另讀本機紀錄檔。Claude 與 Codex 續期預設關閉：
+[families.claude] 或 [families.codex] 設 refresh_logins = true 時，快過期的登入會像 CLI
+自己一樣在背景用 refresh token 更新，再存回 CLI 存放登入的地方。[notify] on_refresh_failed
+指定更新失敗時要執行的指令。Kimi 續期預設開啟，只連 Kimi 自家 HTTPS 網址並原子寫回憑證。
+設 QR_NO_REFRESH=1 可關閉所有續期。quota-router 不自己續期 Grok 登入；[families.grok]
+設 refresh_logins = true 時，登入過期會在背景跑 `grok models`，由 CLI 自己續期。""",
     "cli.no_config": "quota-router：找不到設定檔 {path}，請先執行 qr init",
     "cli.config_error": "quota-router：設定檔 {path} 有問題：{detail}",
     "cli.exists": "quota-router：{path} 已經存在；要覆寫請用 qr init --force",
@@ -637,10 +647,16 @@ quota-router 不自己續期 Grok 登入；[families.grok] 設 refresh_logins = 
     "setting.families.claude.scarce_model": "有專屬週額度的 Claude 模型；沒寫 --model 的指令當作用它（\"\" 表示沒有）",
     "setting.families.agy.default_model": "agy -p 沒寫 --model 時自動補上的模型，例如 \"gemini-4-argon-high\"（\"\" 表示不補）",
     "setting.families.claude.refresh_logins": "true：Claude 登入過期時在背景用 refresh token 更新，並存回 Claude Code 存放登入的地方（預設關閉；設 QR_NO_REFRESH=1 可再關掉）",
+    "setting.families.codex.refresh_logins": "true：Codex 登入到期前在背景用 refresh token 更新，並存回 auth.json（預設關閉；設 QR_NO_REFRESH=1 可再關掉）",
+    "setting.families.codex.refresh_before_hours": "Codex 的 access token（約十天）剩不到這麼多小時就更新",
+    "setting.notify.on_refresh_failed": "登入更新失敗時執行的 shell 指令；會收到 QR_FAMILY、QR_KEY、QR_REASON、QR_DETAIL、QR_DIR、QR_EMAIL、QR_EXPIRES_AT（\"\" 表示不執行）",
+    "setting.notify.repeat_hours": "同一個帳號、同一個原因，這麼多小時內只執行一次",
+    "setting.notify.failed_attempts": "暫時性的失敗要連續這麼多次才執行（登入已失效則立刻執行）",
     "setting.endpoints.claude_usage": "查 Claude 用量的網址；登入 token 會送到這裡（只供測試或代理環境）",
     "setting.endpoints.claude_profile": "查 Claude 帳號 email 的網址；登入 token 會送到這裡（只供測試或代理環境）",
     "setting.endpoints.claude_token": "更新過期 Claude 登入的網址；refresh token 會送到這裡（只供測試或代理環境）",
     "setting.endpoints.codex_usage": "查 Codex 用量的網址；登入 token 會送到這裡（只供測試或代理環境）",
+    "setting.endpoints.codex_token": "更新 Codex 登入的網址；refresh token 會送到這裡（只供測試或代理環境）",
     "usage.model": "用法：--model <名稱>",
     "usage.report": "用法：qr report [--days 正整數]",
     "usage.watch": "用法：qr status --watch [秒數，正整數，預設 10]",
@@ -676,6 +692,8 @@ quota-router 不自己續期 Grok 登入；[families.grok] 設 refresh_logins = 
     "err.expired": "登入憑證過期（閒置帳號常見，下次使用時會自動更新）",
     "err.login_dead": "登入已無法更新：請用這個帳號的目錄執行 `claude login`",
     "err.refresh_unsaved": "登入已更新但存不回去；這個帳號如果不能用了，請用它的目錄執行 `claude login`",
+    "err.codex_login_dead": "登入已無法更新：請把 CODEX_HOME 設成這個帳號的目錄，再執行 `codex login`",
+    "err.codex_refresh_unsaved": "登入已更新但存不回去；這個帳號如果不能用了，請把 CODEX_HOME 設成它的目錄再執行 `codex login`",
     "err.login_on_hold": "帳號被暫停（on hold），所以登入不會更新；請到 claude.ai 查看，再用它的目錄執行 `claude login`",
     "err.unreachable": "連不上用量網址（{error}）",
     "err.codex_live_failed": "即時查詢失敗（{error}），改用最近一筆本機數字",

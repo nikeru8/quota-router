@@ -1,5 +1,5 @@
 """Quota readings, scoring and account selection, plus the qr subcommands. The usage text is the i18n key "help"."""
-import json, os, re, subprocess, sys, time, urllib.request, urllib.error, statistics, hashlib
+import json, os, re, subprocess, sys, time, urllib.request, urllib.error, statistics, hashlib, base64
 import uuid, copy, math, shlex, traceback
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -53,7 +53,11 @@ AGY_MODEL = ""                 # --model added to an `agy -p` dispatch that name
 AGY_PROGRAM = "agy"            # the Antigravity CLI that is asked for its quota (`agy -p /usage`)
 LABELS = {"claude": "Claude", "codex": "Codex", "agy": "agy", "kimi": "Kimi", "grok": "Grok"}
 VERBS = {"claude": "claude -p", "codex": "codex exec", "agy": "agy -p", "kimi": "kimi -p", "grok": "grok -p"}
-REFRESH_LOGINS = False         # true: renew an expired Claude login with its refresh token, as Claude Code would (QR_NO_REFRESH=1: never)
+REFRESH_LOGINS = {"claude": False, "codex": False}   # per family, true: renew an expiring login with its refresh token (QR_NO_REFRESH=1: never)
+CODEX_REFRESH_BEFORE_SEC = 72 * 3600   # a Codex login is renewed once its access token expires within this long
+NOTIFY_COMMAND = ""            # [notify] on_refresh_failed: shell command run when a login renewal fails ("" = none)
+NOTIFY_REPEAT_SEC = 12 * 3600  # the same account and reason runs it at most once in this long
+NOTIFY_FAILED_ATTEMPTS = 2     # a temporary failure ("failed") runs it only after this many in a row
 # where the login tokens are sent; the config file can point these elsewhere for tests or a proxy.
 ENDPOINTS = {name.split(".", 1)[1]: url for name, url in config.DEFAULTS.items() if name.startswith("endpoints.")}
 
@@ -104,7 +108,11 @@ def configure(cfg):
         NOTICE_TTL=cfg["timing.notice_ttl_hours"] * 3600,
         RESET_DROP=cfg["events.reset_drop_points"],
         ALLOW_CREDITS=cfg["general.allow_credits"],
-        REFRESH_LOGINS=cfg["families.claude.refresh_logins"],
+        REFRESH_LOGINS={"claude": cfg["families.claude.refresh_logins"], "codex": cfg["families.codex.refresh_logins"]},
+        CODEX_REFRESH_BEFORE_SEC=cfg["families.codex.refresh_before_hours"] * 3600,
+        NOTIFY_COMMAND=cfg["notify.on_refresh_failed"].strip(),
+        NOTIFY_REPEAT_SEC=cfg["notify.repeat_hours"] * 3600,
+        NOTIFY_FAILED_ATTEMPTS=cfg["notify.failed_attempts"],
         ENDPOINTS={name: cfg["endpoints." + name] for name in ENDPOINTS},
         SCARCE=scarce, SCARCE_LABEL=scarce.capitalize() if scarce else "")
 
@@ -523,6 +531,9 @@ REFRESH_TEXT = {
     "unverified": "renewed and saved; read-back failed",
     "off": "renewal turned off",
 }
+# the same outcomes of a Codex renewal; only the phrases that name the program differ.
+CODEX_REFRESH_TEXT = dict(REFRESH_TEXT, busy="Codex may be using that directory",
+                          dead="refresh token refused; run codex login there")
 
 
 def classify_claude_process(cmd):
@@ -587,8 +598,8 @@ def number(value):
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
 
 
-def refresh_disabled():
-    return not REFRESH_LOGINS or bool(os.environ.get("QR_NO_REFRESH"))
+def refresh_disabled(family="claude"):
+    return not REFRESH_LOGINS.get(family) or bool(os.environ.get("QR_NO_REFRESH"))
 
 
 def renewal_blocker(oauth, c):
@@ -618,13 +629,14 @@ def renewal_error(state):
               "unsaved": "err.refresh_unsaved"}.get(state, "err.expired"))
 
 
-def start_renewal(acc, c):
-    """Called by a reading (the hook, qr status / pick / check / launch) that finds a Claude login expired or about to
-    expire. It never contacts the token endpoint itself: when the login may be renewed it starts one background
-    process (`renew-login <key>`, see renewal_main()) and returns "started". Otherwise it returns why not: "off",
-    "budget", the outcome of the last attempt while its cooldown runs, "busy", "none", "dead" or "running" (one was
-    started less than REFRESH_GAP_SEC ago). `c` is the account's cache entry; the cooldown lives there."""
-    if refresh_disabled():
+def start_renewal(acc, c, family="claude"):
+    """Called by a reading (the hook, qr status / pick / check / launch) that finds a login about to expire: a Claude
+    one within five minutes, a Codex one within refresh_before_hours. It never contacts the token endpoint itself:
+    when the login may be renewed it starts one background process (`renew-login <key>`, see renewal_main()) and
+    returns "started". Otherwise it returns why not: "off", "budget", the outcome of the last attempt while its
+    cooldown runs, "adopted" (no longer due), "busy", "none", "dead" or "running" (one was started less than
+    REFRESH_GAP_SEC ago). `c` is the account's cache entry; the cooldown lives there."""
+    if refresh_disabled(family):
         return "off"
     if c.get("refresh_retry_at", 0) > now():
         return c.get("refresh_failed", "failed")
@@ -632,17 +644,17 @@ def start_renewal(acc, c):
         c.pop(field, None)
     if remaining() < REFRESH_START_SEC:
         return "budget"
-    _, oauth, where = stored_claude_login(acc)
-    if oauth is None or where is None:
-        state = "none"
-    elif login_expiry(oauth) - now() >= REFRESH_MARGIN_SEC:
-        return "adopted"
-    else:
-        state = renewal_blocker(oauth, c) or ("busy" if login_busy(acc) else None)
+    known_dead = c.get("refresh_dead")
+    state = renewal_state(acc, c, family)
+    if state == "adopted":
+        return state
     if state:
         c["refresh_failed"] = state
         c["refresh_retry_at"] = now() + (REFRESH_IDLE_SEC if state in REFRESH_IDLE_OUTCOMES else REFRESH_RETRY_SEC)
-        return state
+        # a refresh token found dead here for the first time (its stored expiry has passed) is not sent anywhere, but
+        # it still gets one background run, which records the outcome and runs the [notify] command.
+        if state != "dead" or c.get("refresh_dead") == known_dead:
+            return state
     marker = os.path.join(STATE, f"refresh-{acc['key']}.start")
     try:
         # removing an old marker and claiming a new one with O_EXCL both happen under the cache lock, like the Codex probe's.
@@ -655,15 +667,34 @@ def start_renewal(acc, c):
             try:
                 os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
             except FileExistsError:
-                return "running"
+                return state or "running"
         process = spawn_renewal(acc)
     except Exception as e:
         log_error("login-refresh-start", e, acc["key"])
-        return "failed"
+        return state or "failed"
     if process is not None:
         RENEWALS.append((acc["key"], process))
-    log_decision("refresh", "claude", "refresh-started", account=acc["key"], text=REFRESH_TEXT["started"])
-    return "started"
+    log_decision("refresh", family, "refresh-started", account=acc["key"], text=REFRESH_TEXT["started"])
+    return state or "started"
+
+
+def renewal_state(acc, c, family):
+    """Whether a stored login is to be renewed now: None when it is, "adopted" when it is not due (any more), or why
+    not ("none", "dead", "busy"). `c` is the account's cache entry."""
+    if family == "codex":
+        data, tokens = stored_codex_login(acc)
+        expiry = codex_expiry(data, tokens) if tokens else None
+        if expiry is None:
+            return "none"
+        if expiry - now() >= CODEX_REFRESH_BEFORE_SEC:
+            return "adopted"
+        return codex_renewal_blocker(data, tokens, c) or ("busy" if codex_login_busy(acc, expiry) else None)
+    _, oauth, where = stored_claude_login(acc)
+    if oauth is None or where is None:
+        return "none"
+    if login_expiry(oauth) - now() >= REFRESH_MARGIN_SEC:
+        return "adopted"
+    return renewal_blocker(oauth, c) or ("busy" if login_busy(acc) else None)
 
 
 def spawn_renewal(acc):
@@ -697,13 +728,14 @@ def renewal_main(argv):
     TerminateProcess, as Task Manager or `taskkill /F` do, cannot be refused). Every outcome is one line in
     decisions.log and one in refresh-<key>.log; a failure also one in hook-errors.log, with the HTTP status code when
     there was one. No token, no answer body and no error_description is written anywhere but the credential store."""
-    acc = next((a for a in CLAUDE_ACCOUNTS if argv and a["key"] == argv[0]), None)
+    family = next((f for f in ("claude", "codex") for a in accounts(f) if argv and a["key"] == argv[0]), None)
+    acc = next((a for a in accounts(family) if a["key"] == argv[0]), None) if family else None
     if acc is None:
         return 2
     try:
-        outcome = renew_login(acc)
+        outcome = renew_codex_login(acc) if family == "codex" else renew_login(acc)
     except BaseException as e:            # anything at all: one structured line, never a traceback
-        outcome = finish_renewal(acc, "failed", error=e)
+        outcome = finish_renewal(acc, "failed", error=e, family=family)
     print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {outcome}", flush=True)
     return 0
 
@@ -711,7 +743,7 @@ def renewal_main(argv):
 def renew_login(acc):
     if refresh_disabled():
         return "off"
-    with state_lock("refresh-" + acc["key"], timeout=0) as locked:
+    with deferred_alerts(), state_lock("refresh-" + acc["key"], timeout=0) as locked:
         if not locked:
             return finish_renewal(acc, "busy", text=REFRESH_TEXT["running"])
         held = platform_compat.take_claude_refresh_lock(acc["dir"])
@@ -796,9 +828,9 @@ def interruption_shield():
                 pass
 
 
-def post_token(body):
+def post_token(body, endpoint="claude_token"):
     """The one POST to the token endpoint; redirects are never followed (NoRedirect)."""
-    req = urllib.request.Request(ENDPOINTS["claude_token"], data=body, method="POST",
+    req = urllib.request.Request(ENDPOINTS[endpoint], data=body, method="POST",
                                  headers={"Content-Type": "application/json", "Accept": "application/json",
                                           "User-Agent": USER_AGENT})
 
@@ -893,9 +925,9 @@ def write_renewed_login(acc, where, refresh, fields):
     return outcome
 
 
-def finish_renewal(acc, outcome, error=None, text=None, dead=None, old=None, new=None):
+def finish_renewal(acc, outcome, error=None, text=None, dead=None, old=None, new=None, family="claude"):
     """Record how a background renewal ended: the account's cooldown in cache.json, one line in decisions.log, and
-    for a failure one in hook-errors.log. Returns the outcome."""
+    for a failure one in hook-errors.log and a run of the [notify] command. Returns the outcome."""
     shown = {"conflict": "unsaved"}.get(outcome, outcome)
     with state_lock("cache"):
         latest = load("cache.json", {})
@@ -914,13 +946,490 @@ def finish_renewal(acc, outcome, error=None, text=None, dead=None, old=None, new
     if error is not None:
         log_error("login-refresh-save" if shown in ("unsaved", "unverified") else "login-refresh", error, acc["key"])
     if text is None:
-        text = REFRESH_TEXT[shown]
+        text = (CODEX_REFRESH_TEXT if family == "codex" else REFRESH_TEXT)[shown]
         status = getattr(error, "code", None) if isinstance(error, urllib.error.HTTPError) else None
         if shown == "failed" and isinstance(status, int):
             text += f", HTTP {status}"
     mode = "refresh" if shown == "renewed" else "refresh-" + shown
-    log_decision("refresh", "claude", mode, account=acc["key"], text=text)
+    log_decision("refresh", family, mode, account=acc["key"], text=text)
+    if shown in NOTIFY_OUTCOMES:
+        pending = ALERTS.get()
+        if pending is not None:
+            pending.append((family, acc, shown, text))      # run once the locks and the signal shield are left
+        else:
+            notify_refresh_failed(family, acc, shown, text)
+    elif shown in ("renewed", "adopted"):
+        forget_alerts(family, acc["key"])
     return outcome
+
+
+# ---- telling someone that a renewal failed -------------------------------------
+# [notify] on_refresh_failed is a shell command. It runs in the background renewal, after the outcome has been
+# recorded, the account's locks released and the signal shield left, with QR_FAMILY, QR_KEY, QR_REASON (one of
+# NOTIFY_OUTCOMES), QR_DETAIL (the decisions.log phrase), QR_DIR and, when known, QR_EMAIL and QR_EXPIRES_AT (the
+# access token's expiry, ISO 8601 local time); of quota-router's own environment it gets only NOTIFY_ENV. The same
+# account and reason runs it at most once per repeat_hours (an hour, when the command itself failed); "failed" (a
+# temporary failure) only after failed_attempts of them in a row. A renewal that succeeds clears both, so the next
+# failure is told as if it were the first. Its output goes to notify.log; it never changes the renewal.
+NOTIFY_OUTCOMES = ("failed", "dead", "on-hold", "unsaved")
+NOTIFY_TIMEOUT_SEC = 30
+NOTIFY_RETRY_SEC = 3600
+NOTIFY_TEXT = {"sent": "alert command ran", "failed": "alert command failed", "skipped": "alert already sent",
+               "waiting": "alert waits for another failure", "locked": "alert skipped, state lock busy"}
+# the variables of quota-router's environment the command gets (and LC_*); the second half is what cmd.exe needs.
+NOTIFY_ENV = ("PATH", "HOME", "LANG", "TMPDIR", "SYSTEMROOT", "COMSPEC", "PATHEXT", "TEMP", "TMP", "USERPROFILE")
+ALERTS = ContextVar("quota_alerts", default=None)
+
+
+@contextmanager
+def deferred_alerts():
+    """Alerts of the renewal inside the block run when the block is left: after the account's locks are released and
+    outside interruption_shield(), so a slow command holds up neither."""
+    token = ALERTS.set([])
+    try:
+        yield
+    finally:
+        pending = ALERTS.get() or []
+        ALERTS.reset(token)
+        for args in pending:
+            notify_refresh_failed(*args)
+
+
+def notify_refresh_failed(family, acc, reason, detail):
+    """Run the [notify] command for one failed renewal, unless it already ran for this account and reason recently.
+    Returns "sent", "failed", "skipped", "waiting" (a "failed" not yet repeated failed_attempts times) or None (no
+    command configured). Without the state lock nothing runs (rather one alert too few than one too many). Never
+    raises."""
+    if not NOTIFY_COMMAND:
+        return None
+    key = acc["key"]
+    slot = f"{family}:{key}:{reason}"
+    try:
+        with state_lock("notify", timeout=5) as locked:
+            if not locked:
+                log_decision("refresh", family, "notify-skipped", account=key, text=NOTIFY_TEXT["locked"])
+                return "skipped"
+            sent = load("notify-state.json", {})
+            sent = sent if isinstance(sent, dict) else {}
+            if reason == "failed":
+                # consecutive: a failure more than repeat_hours after the previous one starts the count again.
+                streak = f"{family}:{key}:failed-streak"
+                previous = sent.get(streak) if isinstance(sent.get(streak), dict) else {}
+                count = int(number(previous.get("count")) or 0)
+                if now() - (number(previous.get("at")) or 0) > NOTIFY_REPEAT_SEC:
+                    count = 0
+                sent[streak] = {"count": count + 1, "at": now()}
+                if count + 1 < NOTIFY_FAILED_ATTEMPTS:
+                    save("notify-state.json", sent)
+                    log_decision("refresh", family, "notify-skipped", account=key, text=NOTIFY_TEXT["waiting"])
+                    return "waiting"
+            last = sent.get(slot) if isinstance(sent.get(slot), dict) else {}
+            at, ok = number(last.get("at")) or 0, last.get("ok")
+            if ok is None and last and now() - at > NOTIFY_TIMEOUT_SEC + 30:
+                ok = False                                     # claimed, but the run never reported back (killed)
+            wait = NOTIFY_RETRY_SEC if ok is False else NOTIFY_REPEAT_SEC
+            if now() - at < wait:
+                save("notify-state.json", sent)
+                log_decision("refresh", family, "notify-skipped", account=key, text=NOTIFY_TEXT["skipped"])
+                return "skipped"
+            stamp = now()
+            sent[slot] = {"at": stamp, "ok": None}             # claimed before it runs: a second failure meanwhile waits
+            save("notify-state.json", sent)
+        ok = run_notify(family, acc, reason, detail)
+        with state_lock("notify", timeout=5) as locked:
+            sent = load("notify-state.json", {}) if locked else None
+            if isinstance(sent, dict) and isinstance(sent.get(slot), dict) and sent[slot].get("at") == stamp:
+                sent[slot]["ok"] = ok
+                save("notify-state.json", sent)
+        outcome = "sent" if ok else "failed"
+        log_decision("refresh", family, "notify" if ok else "notify-failed", account=key, text=NOTIFY_TEXT[outcome])
+        return outcome
+    except Exception as e:
+        log_error("notify", e, key)
+        return "failed"
+
+
+def forget_alerts(family, key):
+    """A renewal succeeded: the next failure of this account is told as if it were the first."""
+    try:
+        with state_lock("notify", timeout=5) as locked:
+            sent = load("notify-state.json", {}) if locked else None
+            if not isinstance(sent, dict):
+                return
+            stale = [slot for slot in sent if slot.startswith(f"{family}:{key}:")]
+            if stale:
+                for slot in stale:
+                    sent.pop(slot)
+                save("notify-state.json", sent)
+    except Exception as e:
+        log_error("notify", e, key)
+
+
+def login_facts(family, acc):
+    """(directory, email or None, access token expiry or None) of an account, for the [notify] command."""
+    if family == "codex":
+        data, tokens = stored_codex_login(acc)
+        if not tokens:
+            return acc["dir"], None, None
+        return acc["dir"], codex_email(tokens), codex_expiry(data, tokens)
+    email = (load("cache.json", {}).get(acc["key"]) or {}).get("email")
+    expiry = quiet_call(lambda: login_expiry(stored_claude_login(acc)[1] or {}))
+    return acc["dir"] or os.path.join(HOME, ".claude"), email if isinstance(email, str) else None, expiry or None
+
+
+def run_notify(family, acc, reason, detail):
+    """Run NOTIFY_COMMAND once through the shell. True when it exited with status 0 within NOTIFY_TIMEOUT_SEC."""
+    directory, email, expiry = quiet_call(login_facts, family, acc, default=(acc["dir"], None, None))
+    env = {name: value for name, value in os.environ.items() if name in NOTIFY_ENV or name.startswith("LC_")}
+    env.update(QR_FAMILY=family, QR_KEY=acc["key"], QR_REASON=reason, QR_DETAIL=detail, QR_DIR=directory or "")
+    if email:
+        env["QR_EMAIL"] = email
+    if expiry:
+        env["QR_EXPIRES_AT"] = datetime.fromtimestamp(expiry).astimezone().isoformat(timespec="seconds")
+    with open(os.path.join(STATE, "notify.log"), "a", encoding="utf-8") as log:
+        log.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {log_token(family)} {log_token(acc['key'])} {log_token(reason)}\n")
+        log.flush()
+        try:
+            code = run_notify_command(NOTIFY_COMMAND, env, log)
+        except subprocess.TimeoutExpired:
+            code = "timeout"
+        except OSError as e:
+            code = type(e).__name__
+        log.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} exit {code}\n")
+    return code == 0
+
+
+def run_notify_command(command, env, log):
+    """Separate so tests can replace it. The command's output is appended to notify.log. On macOS and Linux it runs in
+    a session of its own, and a timeout ends that whole process group (the shell and whatever it started, a curl
+    say), not only the shell."""
+    import signal
+    posix = platform_compat.system() != "windows"
+    process = subprocess.Popen(command, shell=True, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                               start_new_session=posix)
+    try:
+        return process.wait(timeout=NOTIFY_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        try:
+            if posix:
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+
+
+# ---- renewing a Codex login ------------------------------------------------------
+# What Codex 0.160.1 does (openai/codex, codex-rs/login/src/auth/manager.rs and oauth/client.rs, tag rust-v0.160.1):
+# it renews when the access token (a JWT; `exp`) expires within five minutes, or, when that cannot be read, when
+# last_refresh is over eight days old; and after a 401 from the backend, which first re-reads auth.json and uses
+# what another process saved there. The request is one JSON POST to https://auth.openai.com/oauth/token (override:
+# CODEX_REFRESH_TOKEN_URL_OVERRIDE) with {"client_id": "app_EMoamEEZ73f0CkXaXp7hrann", "grant_type": "refresh_token",
+# "refresh_token": ...}. The answer may hold id_token, access_token and refresh_token; Codex stores those present
+# into tokens, sets last_refresh to now and rewrites auth.json in place (mode 600). Any 401, a 400 with
+# "invalid_grant", or the codes refresh_token_expired / _reused / _invalidated ("error", "error.code" or "code") are
+# permanent: "Please log out and sign in again". Codex takes no lock on auth.json other processes could see.
+# quota-router assumes the refresh token is rotated (the answer carries a new one and the old one is dead from then
+# on), so the answer is written back with the same care as a Claude login: three compare-and-set attempts on the
+# refresh token that was sent, each followed by a read-back, and no stop signal between the POST and that write.
+# Unlike Claude's eight-hour token, Codex's access token lasts about ten days and the readings that start a
+# renewal may come once a day (and not on Sundays here), so it is renewed refresh_before_hours (default 72) before it
+# expires.
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_FALLBACK_LIFE_SEC = 8 * 86400    # no readable `exp`: Codex renews eight days after last_refresh
+CODEX_HOT_SEC = 1800                   # from this long before the expiry on (and after it) any Codex process may renew it
+# the codes Codex treats as a dead refresh token whatever the status code; "invalid_grant" only with a 400.
+CODEX_DEAD_CODES = ("refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated")
+# Codex processes that stay up for hours: the app-server of the ChatGPT / Codex desktop app (also as a daemon),
+# exec-server (mcp-server is not a subcommand of 0.160.1 / 0.163.0; kept for older and later versions). They are told
+# apart from jobs only for the process classifier's tests and the docs; both count the same way (codex_login_busy).
+CODEX_RESIDENT = ("app-server", "exec-server", "mcp-server", "code-mode-host")
+CODEX_JOB_WORDS = ("exec", "e", "resume")
+CODEX_LOGIN_WORDS = ("login", "logout")  # these write auth.json themselves, at any time
+# after a refusal, auth.json is read again after each of these pauses before the refresh token is called dead: Codex
+# may have renewed it meanwhile (its POST answered, its write still to come), and its in-place write can be caught
+# half done.
+CODEX_DEAD_RECHECK_PAUSES = (0.5, 2, 5)
+# Codex's top-level options that take a value (`-c key=value`, `--profile p`), skipped with it to find the subcommand.
+CODEX_VALUE_OPTIONS = ("-c", "--config", "-p", "--profile", "-C", "--cd", "-m", "--model", "--enable", "--disable",
+                       "-a", "--ask-for-approval", "-s", "--sandbox", "-i", "--image", "--add-dir", "--local-provider",
+                       "--remote", "--remote-auth-token-env")
+
+
+def jwt_claims(token):
+    """The payload of a JWT as a dict, or None. The signature is not checked; only `exp` and `email` are read."""
+    try:
+        part = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+        return claims if isinstance(claims, dict) else None
+    except Exception:
+        return None
+
+
+def codex_auth_file(acc):
+    return os.path.join(acc["dir"], "auth.json")
+
+
+def stored_codex_login(acc):
+    """(whole auth.json as a dict, its tokens) when it holds a ChatGPT login with an access token, else (None, None)."""
+    try:
+        with open(codex_auth_file(acc), encoding="utf-8") as f:
+            data = json.load(f)
+        tokens = data.get("tokens")
+        if isinstance(tokens, dict) and isinstance(tokens.get("access_token"), str) and tokens["access_token"]:
+            return data, tokens
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None, None
+
+
+def codex_expiry(data, tokens):
+    """When the stored access token expires (epoch), as Codex judges it: its `exp`, else last_refresh + eight days."""
+    exp = number((jwt_claims(tokens.get("access_token") or "") or {}).get("exp"))
+    if exp:
+        return exp
+    try:
+        last = iso_to_ts((data or {}).get("last_refresh"))
+    except (TypeError, ValueError, AttributeError):
+        last = None
+    return last + CODEX_FALLBACK_LIFE_SEC if last else None
+
+
+def codex_email(tokens):
+    claims = jwt_claims(tokens.get("id_token") or "") or {}
+    email = claims.get("email") or (claims.get("https://api.openai.com/profile") or {}).get("email")
+    return email if isinstance(email, str) and email else None
+
+
+def codex_renewal_blocker(data, tokens, c):
+    """Why this stored Codex login is not to be renewed: "none" (no refresh token, or not Codex's own ChatGPT login:
+    an API key, or tokens handed to Codex by a host), "dead" (that refresh token was refused before), or None."""
+    refresh = tokens.get("refresh_token")
+    if not isinstance(refresh, str) or not refresh:
+        return "none"
+    if data.get("auth_mode") not in (None, "chatgpt"):
+        return "none"
+    if c.get("refresh_dead") == fingerprint(refresh):
+        return "dead"
+    return None
+
+
+def classify_codex_process(cmd):
+    """'login' for codex login / logout, 'resident' for a long-running Codex server (CODEX_RESIDENT), 'job' for any
+    other Codex process (codex exec, an interactive session, a subcommand), None for anything else."""
+    argv = split_command_line(cmd)
+    if not argv:
+        return None
+    exe = program_name(argv[0])
+    if exe in SCRIPT_HOSTS:
+        script = next((i for i, word in enumerate(argv[1:], 1) if not word.startswith("-")), None)
+        exe = script_cli(argv[script]) if script else None
+        argv = argv[script:] if script else argv
+    if exe != "codex":
+        return None
+    # The subcommand comes after the top-level options. Options known to take a value are skipped with it; any other
+    # word that is not a known subcommand (the value of an option this list lacks, a prompt) is passed over, so that
+    # `codex --new-option x login` is still a login. Nothing after exec / resume is read: that is the prompt.
+    words = iter(argv[1:])
+    for word in words:
+        if word in CODEX_VALUE_OPTIONS:
+            next(words, None)
+        elif word in CODEX_LOGIN_WORDS:
+            return "login"
+        elif word in CODEX_JOB_WORDS:
+            return "job"
+        elif word in CODEX_RESIDENT:
+            return "resident"
+    return "job"
+
+
+def codex_login_busy(acc, expiry):
+    """True when a Codex process may renew this account's login meanwhile, and whenever that cannot be told.
+
+    `codex login` / `codex logout` on that CODEX_HOME always count. Any other Codex process (a job, a session, the
+    desktop app's app-server that runs all day on ~/.codex) counts from CODEX_HOT_SEC before the expiry on, and
+    after it: Codex renews on its own when the token expires within five minutes (so on every use once it has
+    expired), and otherwise only after a 401 from its backend or when the desktop app asks it to (getAuthStatus or
+    account/read with a refresh flag), all of which
+    re-read auth.json first and take over what was saved here. Fails closed: an unreadable process list, or a
+    counting Codex process whose CODEX_HOME cannot be told, counts as busy."""
+    procs = platform_compat.read_processes(run_local)
+    if procs is None:
+        return True
+    hot = expiry - now() < CODEX_HOT_SEC
+    mine = platform_compat.canonical(acc["dir"])
+    default = platform_compat.canonical(config.default_dir("codex"))
+    for pid, (_, cmd) in procs.items():
+        kind = classify_codex_process(cmd)
+        if not kind or (kind != "login" and not hot):
+            continue
+        env = platform_compat.process_environment(pid, cmd, run_local)
+        if env is not None:
+            found = re.findall(r"(?:^|\s)CODEX_HOME=(\S*)", env)
+            value = found[-1] if found else None
+        else:
+            value = platform_compat.directory_from_command_lines(pid, procs, "CODEX_HOME")
+            if value is None:
+                return True
+        if (platform_compat.canonical(value) if value else default) == mine:
+            return True
+    return False
+
+
+def renew_codex_login(acc):
+    if refresh_disabled("codex"):
+        return "off"
+    with deferred_alerts(), state_lock("refresh-" + acc["key"], timeout=0) as locked:
+        if not locked:
+            return finish_renewal(acc, "busy", text=CODEX_REFRESH_TEXT["running"], family="codex")
+        return renew_codex_locked(acc)
+
+
+def renew_codex_locked(acc):
+    """The part of renew_codex_login() that runs with the account's lock held."""
+    finish = lambda outcome, **kw: finish_renewal(acc, outcome, family="codex", **kw)
+    data, tokens = stored_codex_login(acc)
+    expiry = codex_expiry(data, tokens) if tokens else None
+    if expiry is None:
+        return finish("none")
+    if expiry - now() >= CODEX_REFRESH_BEFORE_SEC:
+        return finish("adopted")                                # renewed by Codex or someone else meanwhile
+    c = load("cache.json", {}).get(acc["key"], {})
+    blocker = codex_renewal_blocker(data, tokens, c)
+    if blocker:
+        return finish(blocker, dead=c.get("refresh_dead"))
+    if codex_login_busy(acc, expiry):
+        return finish("busy")
+    refresh = tokens["refresh_token"]
+    body = json.dumps({"client_id": CODEX_CLIENT_ID, "grant_type": "refresh_token", "refresh_token": refresh}).encode()
+    with interruption_shield():
+        try:
+            answer = post_token(body, "codex_token")
+        except urllib.error.HTTPError as e:
+            code = codex_error_code(e)
+            if e.code == 401 or code in CODEX_DEAD_CODES or (e.code == 400 and code == "invalid_grant"):
+                current = None
+                for pause in CODEX_DEAD_RECHECK_PAUSES:
+                    time.sleep(pause)
+                    current = stored_codex_login(acc)[1]
+                    if current is not None and current.get("refresh_token") != refresh:
+                        # Codex (or a new login) replaced it meanwhile; the refusal was for the old one.
+                        return finish("adopted")
+                if current is None:
+                    # the last read found no login: it may be mid-write; not called dead on that, tried again later.
+                    return finish("failed", error=e)
+                return finish("dead", error=e, dead=fingerprint(refresh))
+            return finish("failed", error=e)                   # 429 and 5xx included: never retried here
+        except Exception as e:
+            return finish("failed", error=e)
+        try:
+            fields, complete = renewed_codex_tokens(answer, refresh)
+        except ValueError as e:
+            return finish("failed", error=e)
+        written = write_codex_login(acc, refresh, fields)
+    if written != "renewed":
+        return finish(written, error=OSError(written))
+    if not complete:
+        return finish("failed", text=CODEX_REFRESH_TEXT["odd"])
+    return finish("renewed", old=tokens["access_token"], new=fields["access_token"])
+
+
+def codex_error_code(error):
+    """The error code of a refused Codex token request, lower case, read the way Codex reads it, or None. Never logged."""
+    try:
+        body = json.loads(error.read(65536) or b"{}")
+        value = body.get("error")
+        code = value.get("code") if isinstance(value, dict) else value
+        if not (isinstance(code, str) and code.strip()):
+            code = body.get("code")
+        return code.strip().lower() if isinstance(code, str) and code.strip() else None
+    except Exception:
+        return None
+
+
+def renewed_codex_tokens(answer, refresh):
+    """(the `tokens` fields a token answer changes, whether it is a complete renewal). A complete one has an access
+    token. An id_token is taken only when it is a readable JWT (Codex refuses to load an auth.json whose id_token is
+    not), else the stored one stays. An answer without an access token but with a new refresh token still yields that
+    token, since the one sent is dead by now. Raises ValueError when the answer holds nothing worth storing."""
+    if not isinstance(answer, dict):
+        raise ValueError("token answer is not an object")
+    fields = {}
+    rotated = answer.get("refresh_token")
+    if isinstance(rotated, str) and rotated and rotated != refresh:
+        fields["refresh_token"] = rotated
+    access = answer.get("access_token")
+    if isinstance(access, str) and access:
+        fields["access_token"] = access
+        identity = answer.get("id_token")
+        if isinstance(identity, str) and jwt_claims(identity) is not None:
+            fields["id_token"] = identity
+        return fields, True
+    if fields:
+        return fields, False
+    raise ValueError("token answer without a usable access token")
+
+
+def write_codex_login(acc, refresh, fields):
+    """Save `fields` into auth.json's tokens (and last_refresh = now), compare-and-set on the refresh token that was
+    sent. Up to three attempts, each re-reading the file first; a read-back confirms the write. Everything else in the
+    file is kept as it is. Returns "renewed", "unverified", "unsaved" or "conflict" (the file now holds a login this
+    renewal did not write: Codex renewed it meanwhile, or someone logged in again)."""
+    outcome = "unsaved"
+    for pause in REFRESH_WRITE_PAUSES:
+        time.sleep(pause)
+        data, current = stored_codex_login(acc)
+        if current is None:
+            continue                                         # unreadable this time (or mid-write by Codex)
+        if all(current.get(k) == v for k, v in fields.items()):
+            return "renewed"                                 # an earlier attempt landed after all
+        if current.get("refresh_token") != refresh:
+            return "conflict"
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        try:
+            save_codex_auth(codex_auth_file(acc), dict(data, tokens=dict(current, **fields), last_refresh=stamp))
+        except Exception as e:
+            log_error("login-refresh-save", e, acc["key"])
+            continue
+        back = None
+        for wait in REFRESH_READBACK_PAUSES:
+            time.sleep(wait)
+            back = stored_codex_login(acc)[1]
+            if back is not None:
+                break
+        if back is None:
+            outcome = "unverified"
+            break
+        if all(back.get(k) == v for k, v in fields.items()):
+            return "renewed"
+    return outcome
+
+
+def save_codex_auth(path, data):
+    """Replace auth.json as a whole: a temporary file next to it (mode 600, written and flushed to disk), renamed over
+    it. A symbolic link is followed, so the file it points to is the one replaced. It is never created where there
+    was none."""
+    target = os.path.realpath(path)
+    if not os.path.isfile(target):
+        raise FileNotFoundError(target)
+    tmp = os.path.join(os.path.dirname(target), f".auth.json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        platform_compat.replace(tmp, target)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 class BudgetTimeout(TimeoutError):
@@ -959,6 +1468,20 @@ def network_json(req):
         if left < 4:
             raise BudgetTimeout(t("error.budget")) from e
         raise
+
+
+# what a Codex reading adds to the account's notes, given where the renewal of its login stands.
+CODEX_RENEWAL_NOTES = {"started": "note.refresh_started", "dead": "err.codex_login_dead",
+                       "unsaved": "err.codex_refresh_unsaved"}
+
+
+def codex_reading_expiry(acc, access):
+    """The expiry of the access token a reading found: its `exp`, else Codex's eight days after last_refresh."""
+    exp = number((jwt_claims(access) or {}).get("exp"))
+    if exp:
+        return exp
+    data, tokens = stored_codex_login(acc)
+    return codex_expiry(data, tokens) if tokens else None
 
 
 def codex_identity(acc):
@@ -1064,6 +1587,15 @@ def cached_reading(family, acc, cache, force=False):
                           "refresh_failed", "refresh_retry_at", "refresh_dead"):
                 c.pop(field, None)
             c.update({identity_field: identity, "token_changed_at": changed_at})
+        if family == "codex":
+            # `codex login` again on the same account keeps account_sig; a new token, or a refresh token other than
+            # the refused one, ends what an earlier renewal found.
+            refresh = auth.get("refresh_token")
+            refresh = fingerprint(refresh) if isinstance(refresh, str) else None
+            if (sig and c.get("token_sig") and sig != c["token_sig"]) or (
+                    c.get("refresh_dead") and refresh and refresh != c["refresh_dead"]):
+                for field in ("refresh_failed", "refresh_retry_at", "refresh_dead"):
+                    c.pop(field, None)
         if sig:
             c["token_sig"] = sig
         fresh = getattr(cache, "fresh", {}).get(c.get("email"))
@@ -1087,6 +1619,9 @@ def cached_reading(family, acc, cache, force=False):
             save("cache.json", latest)
     if not query:
         cache[key] = c
+        # a Codex login that cannot be renewed keeps saying so between queries (a Claude one has it in "error").
+        if family == "codex" and c.get("refresh_failed") in ("dead", "unsaved"):
+            return dict(c, notes_extra=t(CODEX_RENEWAL_NOTES[c["refresh_failed"]]))
         return c
     before = copy.deepcopy(c)
     success = False
@@ -1095,6 +1630,10 @@ def cached_reading(family, acc, cache, force=False):
         if family == "claude" and tok and exp and exp - now() < REFRESH_MARGIN_SEC:
             # at most starts a background renewal; this reading goes on with the login as it is now.
             renewal = start_renewal(acc, c)
+        elif family == "codex" and tok and not refresh_disabled("codex"):
+            expiry = codex_reading_expiry(acc, tok)
+            if expiry is not None and expiry - now() < CODEX_REFRESH_BEFORE_SEC:
+                renewal = start_renewal(acc, c, "codex")
         if not tok or (exp and exp < now()):
             raise ValueError(t("error.no_credentials"))
         if family == "claude":
@@ -1179,6 +1718,8 @@ def cached_reading(family, acc, cache, force=False):
         # and is cleared together with it when a new login is noticed.
         failure = {k: c[k] for k in ("retry_at", "failures") if k in c} if not success else {}
         c = dict(before, **failure)
+    if family == "codex" and renewal in CODEX_RENEWAL_NOTES:
+        c["notes_extra"] = t("sep.semicolon").join(filter(None, [c.get("notes_extra"), t(CODEX_RENEWAL_NOTES[renewal])]))
     extra = c.pop("notes_extra", None)
     c = merge_cache(key, before, c, owner)
     # verified usage is saved first; a failed or timed-out profile query must not undo it.
@@ -2095,8 +2636,10 @@ LOG_DETAILS = re.compile("|".join((
     "kept the original account", "conversation location unknown", "named a directory that is not in the pool",
     "as specified", "as specified, although it is blocked", "dispatched with a warning",
     r"local log not updated for \d+\.\d h; probing once in the background",
-    # refresh (a Claude login renewed by quota-router), REFRESH_TEXT; a failure may name the HTTP status code
-    *(re.escape(text) for text in REFRESH_TEXT.values()), r"renewal failed, HTTP \d{3}",
+    # refresh (a login renewed by quota-router), REFRESH_TEXT / CODEX_REFRESH_TEXT; a failure may name the HTTP status
+    # code; the [notify] command's outcome, NOTIFY_TEXT
+    *(re.escape(text) for text in dict.fromkeys([*REFRESH_TEXT.values(), *CODEX_REFRESH_TEXT.values(),
+                                                 *NOTIFY_TEXT.values()])), r"renewal failed, HTTP \d{3}",
     # qr launch
     "launched with a warning", "on paid overage", "no account can take it", "no account could be read",
     "no account is set up for sessions")))
@@ -2438,7 +2981,7 @@ def status(force=False, bars=False):
     lead_key, assumed = detect_lead()
     for fam in managed_families():
         raw = read_family(fam, force, lead_key)
-        if fam == "claude" and force and RENEWALS and interactive():
+        if fam in ("claude", "codex") and force and RENEWALS and interactive():
             # a person asked for fresh numbers: wait for the logins this started renewing, then read again.
             print(t("status.renewal_wait", keys=t("sep.list").join(sorted({key for key, _ in RENEWALS})),
                     seconds=REFRESH_WAIT_SEC), file=sys.stderr, flush=True)
