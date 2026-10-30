@@ -221,6 +221,64 @@ def kimi_options(words):
     return printing, model
 
 
+# grok 1.0.46 options that take a value; -r / --resume and -w / --worktree take one only when the next word is no flag.
+GROK_VALUE_FLAGS = {"--agent", "--agents", "--allow", "--allowedTools", "--cwd", "--debug-file", "--deny",
+                    "--disallowed-tools", "--disallowedTools", "--json-schema", "--leader-socket", "-m", "--model",
+                    "--max-turns", "--output-format", "-p", "--single", "--permission-mode", "--prompt-file",
+                    "--prompt-json", "--reasoning-effort", "--effort", "--rules", "-s", "--session-id", "--sandbox",
+                    "--system-prompt-override", "--system-prompt", "--tools", "--worktree-ref", "--ref"}
+GROK_OPTIONAL_VALUE = {"-r", "--resume", "-w", "--worktree"}
+GROK_SINGLE = {"-p", "--single", "--prompt-file", "--prompt-json"}   # one-shot runs; everything else is a session
+GROK_SUBCOMMANDS = {"agent", "clone", "completions", "cursor-worker", "dashboard", "doctor", "du", "disk-usage",
+                    "export", "help", "inspect", "leader", "login", "logout", "mcp", "memory", "models", "plugin",
+                    "sessions", "setup", "trace", "update", "usage", "version", "v", "worktree", "wrap"}
+
+
+def grok_options(words):
+    """{printing, model, resume: None | {"continue"} | {"id": index into words} | {"id_in": index of `--resume=ID` / `-rID`}
+    | {"last"}} for the words after `grok`.
+    clap reads options anywhere, so every word is looked at; option values are skipped (they may look like flags),
+    and a first plain word that names a subcommand makes it no dispatch."""
+    out = {"printing": False, "model": False, "resume": None}
+    i, positional = 0, False
+    while i < len(words):
+        word = words[i]
+        if word == "--":
+            break
+        if word in ("--help", "-h", "--version", "-v", "-V"):
+            return dict(out, printing=False)
+        name, sep, _ = word.partition("=")
+        if not name.startswith("-") or name == "-":
+            if not positional and word in GROK_SUBCOMMANDS:
+                return dict(out, printing=False)
+            positional = True
+            i += 1
+            continue
+        short = not name.startswith("--") and len(name) > 2   # -mgrok-4, -phi, -rID: the value is attached
+        if name in GROK_SINGLE or (short and name[:2] == "-p"):
+            out["printing"] = True
+        if name in ("-m", "--model") or (short and name[:2] == "-m"):
+            out["model"] = True
+        if name in ("-c", "--continue"):
+            out["resume"] = {"continue": True}
+        if name in ("-r", "--resume") or (short and name[:2] == "-r"):
+            if sep or short:
+                out["resume"] = {"id_in": i}   # the words are masked: the id is cut from the original text
+            elif i + 1 < len(words) and not words[i + 1].startswith("-"):
+                out["resume"] = {"id": i + 1}
+                i += 2
+                continue
+            else:
+                out["resume"] = {"last": True}
+        if name in GROK_OPTIONAL_VALUE and not sep and not short and i + 1 < len(words) and not words[i + 1].startswith("-"):
+            i += 2
+        elif name in GROK_VALUE_FLAGS and not sep and not short:
+            i += 2
+        else:
+            i += 1
+    return out
+
+
 def agy_flag(word):
     """`--model=x` / `-model` / `--print` → ("model", "x") / ("model", None) / ("print", None); None when it is no flag."""
     if not word.startswith("-") or word in ("-", "--"):
@@ -249,6 +307,18 @@ def find_dispatches(cmd):
                 continue
             rest = words[idx + 1:]
             if any(x in ("--help", "-h", "--version", "-V") for x in rest):
+                continue
+            if base == "grok":
+                opts = grok_options(rest)
+                if opts["printing"]:
+                    res = opts["resume"]
+                    if res and "id" in res:
+                        res = {"id": raw_token(cmd, toks[idx + 1 + res["id"]])}
+                    elif res and "id_in" in res:
+                        word = raw_token(cmd, toks[idx + 1 + res["id_in"]])
+                        res = {"id": (word.partition("=")[2] if "=" in word else word[2:]).replace('"', "").replace("'", "")}
+                    found.append({"fam": "grok", "pos": p, "seg": (s, e), "resume": res, "word_end": p + len(t)})
+                    break
                 continue
             if base == "kimi":
                 if kimi_options(rest)[0]:
@@ -362,7 +432,8 @@ def explicit_account(cmd, fam, pos, seg, cleared=False):
     cleared=True reports a variable that was removed last as CLEARED / UNSET_BY_ENV instead of as the default account."""
     var = config.ENV_DIR[fam]
     before = visible_scope(opaque_substitutions(mask(cmd)), pos)
-    default = (qr.DEFAULT_KEY[fam] or "?", t("label.main_account") if fam == "claude" else ("~/.kimi-code" if fam == "kimi" else "~/.codex"))
+    default = (qr.DEFAULT_KEY[fam] or "?", t("label.main_account") if fam == "claude" else
+               "~/" + os.path.basename(config.default_dir(fam)))
     events = []
     exported_state = False
     for start, end in segments(before):
@@ -535,7 +606,7 @@ def dispatch_model(cmd, dispatch):
     """Option positions come from the masked words, values from the original; the prompt and heredocs are not options."""
     if dispatch["fam"] == "codex":
         return "other", True
-    if dispatch["fam"] == "kimi":
+    if dispatch["fam"] in ("kimi", "grok"):
         ts = tokens(opaque_substitutions(mask(cmd)), dispatch["pos"], dispatch["seg"][1])
         dispatch["model_dynamic"] = False
         # Skip redirection operands, so an explicit model after a redirect is still recognised.
@@ -548,6 +619,8 @@ def dispatch_model(cmd, dispatch):
                 skip = True
                 continue
             words.append(word)
+        if dispatch["fam"] == "grok":
+            return "other", grok_options(words)["model"]
         return "other", kimi_options(words)[1]
     if dispatch["fam"] == "agy":
         return agy_model(cmd, dispatch)
@@ -613,11 +686,11 @@ def resolved_explicit(cmd, dispatch):
     var = config.ENV_DIR[dispatch["fam"]]
     setting = policy_setting(cmd, dispatch["pos"], var, home=True)
     ex = explicit_account(cmd, dispatch["fam"], dispatch["pos"], dispatch["seg"], cleared=True)
-    if dispatch["fam"] == "kimi" and ex is None and setting is None and os.environ.get("KIMI_CODE_HOME"):
-        # An inherited Kimi home is already an account selection. In particular,
+    if dispatch["fam"] in ("kimi", "grok") and ex is None and setting is None and os.environ.get(var):
+        # An inherited Kimi / Grok home is already an account selection. In particular,
         # an unprefixed default dispatch must not accidentally run on that home.
-        value = os.environ["KIMI_CODE_HOME"]
-        return qr.account_key("kimi", value) or "?", value
+        value = os.environ[var]
+        return qr.account_key(dispatch["fam"], value) or "?", value
     if ex == UNSET_BY_ENV and dispatch["fam"] == "claude":
         return qr.DEFAULT_KEY["claude"] or "?", t("label.main_account")
     if ex in (CLEARED, UNSET_BY_ENV) or setting and setting[0] == "default":
@@ -671,7 +744,29 @@ def newest_mtime(files):
     return newest
 
 
+def grok_resume_account(res, cwd):
+    """Grok keeps each conversation in $GROK_HOME/sessions/<working directory, percent-encoded>/<session id>/.
+    An id names its account; `-c` / a bare `-r` mean the newest one for this directory. A title is not looked up."""
+    from urllib.parse import quote
+    session = res.get("id")
+    if session and not re.fullmatch(r"[0-9A-Fa-f-]{8,64}", session):
+        return None
+    best = None
+    for k, d in account_dirs("grok").items():
+        if session:
+            if bounded_files(os.path.join(d, "sessions"), "*/" + glob.escape(session)):
+                return k
+            continue
+        fs = bounded_files(os.path.join(d, "sessions", quote(os.path.abspath(cwd), safe="")), "*")
+        t = newest_mtime([f for f in fs if os.path.isdir(f)]) if fs else None
+        if t is not None and (not best or t > best[0]):
+            best = (t, k)
+    return best[1] if best and qr.remaining() > 0 else None
+
+
 def resume_account(fam, res, cwd):
+    if fam == "grok":
+        return grok_resume_account(res, cwd)
     session = glob.escape(res["id"]) if res.get("id") else None
     if fam == "claude":
         if session:
@@ -705,7 +800,7 @@ def resume_account(fam, res, cwd):
 def dir_prefix(fam, directory):
     """The environment prefix inserted before a dispatch. The directory comes from the config file, so it is quoted as
     one shell word (forward slashes on Windows, which Git Bash accepts): a space or a `;` in it stays part of the path."""
-    if fam == "kimi" and platform_compat.canonical(directory) == platform_compat.canonical(config.default_dir("kimi")):
+    if fam in ("kimi", "grok") and platform_compat.canonical(directory) == platform_compat.canonical(config.default_dir(fam)):
         return ""
     if fam == "claude" and directory is None:
         return "env -u CLAUDE_CONFIG_DIR "
@@ -878,6 +973,9 @@ def decide_prepared(cmd, ds, lead_key, session, rows_cache, resumes, explicit, l
         if fam == "kimi" and not d["model_written"] and qr.KIMI_MODEL:
             inserts.append((d["word_end"], f" -m {qr.KIMI_MODEL}"))
             notes.append(t("note.kimi_model_added", model=qr.KIMI_MODEL))
+        if fam == "grok" and not d["model_written"] and qr.GROK_MODEL:
+            inserts.append((d["word_end"], f" -m {qr.GROK_MODEL}"))
+            notes.append(t("note.grok_model_added", model=qr.GROK_MODEL))
         if fam == "claude" and not d["model_written"] and qr.SCARCE:
             notes.append(t("note.no_model", model=qr.SCARCE_LABEL) if not d["resume"] else t("note.resume_no_model", model=qr.SCARCE_LABEL))
         if d.get("model_dynamic") and qr.SCARCE:

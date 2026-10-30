@@ -14,9 +14,9 @@ from . import platform_compat
 from .i18n import t
 
 LANGUAGES = ("en", "zh-TW")
-FAMILIES = ("claude", "codex", "agy", "kimi")
+FAMILIES = ("claude", "codex", "agy", "kimi", "grok")
 # agy (Antigravity CLI) has no directory variable: it always uses its default location, so it holds one account.
-ENV_DIR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME", "kimi": "KIMI_CODE_HOME"}
+ENV_DIR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME", "kimi": "KIMI_CODE_HOME", "grok": "GROK_HOME"}
 
 # (section, key, default). Order is the order `qr config` prints; descriptions are i18n keys "setting.<section>.<key>".
 SETTINGS = [
@@ -47,6 +47,8 @@ SETTINGS = [
     ("families.agy", "default_model", ""),
     ("families.kimi", "default_model", "kimi-code/k3.1-pro-highspeed"),
     ("families.kimi", "refresh_logins", True),
+    ("families.grok", "default_model", ""),
+    ("families.grok", "refresh_logins", False),
     ("launch", "route_print", False),
     ("endpoints", "claude_usage", "https://api.anthropic.com/api/oauth/usage"),
     ("endpoints", "claude_profile", "https://api.anthropic.com/api/oauth/profile"),
@@ -56,6 +58,7 @@ SETTINGS = [
     ("endpoints", "kimi_profile", "https://api.kimi.com/coding/v1/me"),
     ("endpoints", "kimi_token", "https://auth.kimi.com/api/oauth/token"),
     ("endpoints", "kimi_token_fallback", "https://auth.kimi.ai/api/oauth/token"),
+    ("endpoints", "grok_billing", "https://cli-chat-proxy.grok.com/v1/billing?format=credits"),
 ]
 # Sections `qr init` writes commented out: a config file should not pin these unless its owner means to.
 OPTIONAL_SECTIONS = ("endpoints",)
@@ -113,6 +116,8 @@ def default_dir(family):
     """Where the CLI keeps its data when its directory variable is unset."""
     if family == "kimi":
         return os.path.join(platform_compat.home(), ".kimi-code")
+    if family == "grok":
+        return os.path.join(platform_compat.home(), ".grok")
     if family == "agy":
         return os.path.join(platform_compat.home(), ".gemini", "antigravity-cli")
     return os.path.join(platform_compat.home(), ".claude" if family == "claude" else ".codex")
@@ -154,7 +159,7 @@ def _accounts(raw, warnings=None):
         family, key = item["family"], item["key"]
         where = f'account "{key}"'
         if family not in FAMILIES:
-            raise ValueError(f'{where}: family must be "claude", "codex", "agy" or "kimi", got {family!r}')
+            raise ValueError(f'{where}: family must be "claude", "codex", "agy", "kimi" or "grok", got {family!r}')
         if not all(c.isalnum() or c in "-_." for c in key):
             raise ValueError(f"{where}: key may only contain letters, digits, '-', '_' and '.'")
         if key in keys:
@@ -210,6 +215,15 @@ def validate_kimi_endpoint(url, token=False):
     return url
 
 
+def validate_grok_endpoint(url):
+    """The Grok access token may only reach the CLI's own billing host over HTTPS; no proxy override."""
+    parsed = urlsplit(url)
+    if (parsed.scheme != "https" or parsed.hostname != "cli-chat-proxy.grok.com" or parsed.port not in (None, 443)
+            or parsed.username is not None or parsed.password is not None or parsed.fragment):
+        raise ValueError("Grok endpoints must use https://cli-chat-proxy.grok.com without userinfo or fragment")
+    return url
+
+
 def parse(data, path="<memory>"):
     """Validate an already-parsed TOML document and fill in defaults."""
     try:
@@ -251,9 +265,14 @@ def parse(data, path="<memory>"):
         values["families.kimi.default_model"] = values["families.kimi.default_model"].strip()
         if not re.fullmatch(r"[A-Za-z0-9._/-]*", values["families.kimi.default_model"]):
             raise ValueError("families.kimi.default_model may only contain letters, digits, '.', '_', '/', '-'")
+        values["families.grok.default_model"] = values["families.grok.default_model"].strip()
+        if not re.fullmatch(r"[A-Za-z0-9._/-]*", values["families.grok.default_model"]):
+            raise ValueError("families.grok.default_model may only contain letters, digits, '.', '_', '/', '-'")
         for name in DEFAULTS:
             if name.startswith("endpoints.kimi_"):
                 validate_kimi_endpoint(values[name], token="token" in name)
+            if name.startswith("endpoints.grok_"):
+                validate_grok_endpoint(values[name])
             # the login token is sent to these addresses, so nothing but a plain http(s) URL is accepted.
             if name.startswith("endpoints.") and not values[name].startswith(("https://", "http://")):
                 raise ValueError(f"{name} must be an http:// or https:// URL, got {values[name]!r}")
@@ -289,7 +308,8 @@ def load(path=None):
 # ---- qr init -----------------------------------------------------------------
 MARKERS = {"claude": (".claude.json", ".credentials.json", "settings.json", "projects"),
            "codex": ("auth.json", "config.toml", "sessions"),
-           "kimi": ("credentials/kimi-code.json", "config.toml", "sessions")}
+           "kimi": ("credentials/kimi-code.json", "config.toml", "sessions"),
+           "grok": ("auth.json", "config.toml", "sessions")}
 
 
 def detect_accounts(home=None):
@@ -315,7 +335,7 @@ def detect_accounts(home=None):
         keys.add(unique)
         found.append({"family": family, "key": unique, "dir": directory})
 
-    for family, stem in (("claude", ".claude"), ("codex", ".codex"), ("kimi", ".kimi-code")):
+    for family, stem in (("claude", ".claude"), ("codex", ".codex"), ("kimi", ".kimi-code"), ("grok", ".grok")):
         add(family, "claude-main" if family == "claude" else f"{family}-1", "")
         extra = 1
         for name in names:

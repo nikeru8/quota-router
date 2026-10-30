@@ -13,6 +13,21 @@ import os
 LANGUAGES = ("en", "zh-TW")
 
 EN = {
+    # ---- Grok Build ----
+    'setting.families.grok.default_model': 'the -m added to a grok -p / --single dispatch without -m / --model (empty = add nothing)',
+    'setting.families.grok.refresh_logins': 'true = when a Grok login has expired, run `grok models` in the background so the CLI renews it itself; QR_NO_REFRESH=1 disables this',
+    'setting.endpoints.grok_billing': 'Grok billing URL (https://cli-chat-proxy.grok.com only)',
+    'err.grok_no_login': 'no Grok login (auth.json) found; quota unknown',
+    'err.grok_expired': 'Grok login has expired; quota unknown',
+    'err.grok_usage': 'Grok usage query failed; quota unknown',
+    'err.grok_changed': 'Grok login changed during the query; quota unknown',
+    'note.grok_refresh_started': 'running `grok models` in the background to renew the Grok login; quota is temporarily unknown',
+    'note.grok_model_added': '[quota-router] This Grok dispatch named no model; added -m {model}.',
+    'note.grok_old': 'numbers are old: the last reading showed {left:.0f}% left',
+    'credit.grok_balance': 'on-demand / prepaid credits {credits:g}',
+    'credit.why_grok_spend': 'the period\'s credits are used up; on-demand / prepaid credits would be charged',
+    'status.grok_period': 'quota period: {period}',
+
     # ---- Kimi Code ----
     "report.kimi_no_start": "; cycle start not provided, so monthly pace is not estimated",
     'setting.families.kimi.default_model': 'the -m added to a kimi -p / --prompt dispatch without -m / --model (empty = add nothing)',
@@ -41,7 +56,7 @@ EN = {
     "help": """\
 quota-router: ask "which account should this subagent use right now?"
 
-  qr init [--force]         write an example config (pre-filled from ~/.claude*, ~/.codex* and ~/.kimi-code*)
+  qr init [--force]         write an example config (pre-filled from ~/.claude*, ~/.codex*, ~/.kimi-code*, ~/.grok*)
   qr config                 print the resolved settings and where each value came from
   qr install [--config-dir DIR] [--no-launcher]
                             add the hook to Claude Code's settings.json (default ~/.claude), with a backup,
@@ -54,6 +69,7 @@ quota-router: ask "which account should this subagent use right now?"
   qr pick claude            one line: account prefix  # reason (and reserve that account)
   qr pick codex             same, for a Codex account
   qr pick kimi              same, for a Kimi Code account (monthly + five-hour quota)
+  qr pick grok              same, for a Grok Build account (the credits of its current period)
   qr pick claude --env      print only the prefix, ready for $(...)
   qr pick claude --peek     look without reserving
   qr pick claude --model opus   score for that model
@@ -73,7 +89,10 @@ Login tokens are only sent to the vendor's own usage / profile endpoints. Claude
 an expired Claude login is renewed in the background with its refresh token, as
 Claude Code would, and saved back where Claude Code keeps it (QR_NO_REFRESH=1
 turns it off again). Kimi renewal is ON by default; it only uses Kimi HTTPS
-endpoints, saves credentials atomically, and also respects QR_NO_REFRESH=1.""",
+endpoints, saves credentials atomically, and also respects QR_NO_REFRESH=1.
+quota-router never renews a Grok login itself; with [families.grok]
+refresh_logins = true an expired one makes it run `grok models`, and the CLI
+renews it.""",
     # ---- cli / config ----
     "cli.no_config": 'quota-router: no config at {path}, run "qr init"',
     "cli.config_error": "quota-router: config error in {path}: {detail}",
@@ -98,11 +117,12 @@ endpoints, saves credentials atomically, and also respects QR_NO_REFRESH=1.""",
 # [events] and [families.*] is optional; what you see here are the defaults.
 # [endpoints] is for tests and proxies only and is left commented out; the login
 # tokens are sent to these URLs, and token endpoints receive refresh tokens.
-# Kimi endpoints only accept approved Kimi HTTPS hosts (no proxy override).
+# Kimi endpoints only accept approved Kimi HTTPS hosts (no proxy override); the
+# Grok endpoint only https://cli-chat-proxy.grok.com.
 # `qr config` prints the resolved values and where each one came from.""",
     "init.accounts": """\
-# One [[accounts]] table per login. family: claude | codex | agy | kimi. key: any unique name.
-# dir: the directory you pass as CLAUDE_CONFIG_DIR / CODEX_HOME / KIMI_CODE_HOME; "" = the CLI's default location.""",
+# One [[accounts]] table per login. family: claude | codex | agy | kimi | grok. key: any unique name.
+# dir: the directory you pass as CLAUDE_CONFIG_DIR / CODEX_HOME / KIMI_CODE_HOME / GROK_HOME; "" = the CLI's default location.""",
     "setting.general.language": "message language: en | zh-TW (QR_LANG overrides)",
     "setting.general.protect_threshold": "the lead's own account takes no subagents once its weekly window is below this %",
     "setting.general.protect_five_hour": "...nor once its five-hour window, after the jobs already running, is below this %",
@@ -335,7 +355,7 @@ endpoints, saves credentials atomically, and also respects QR_NO_REFRESH=1.""",
     "deny.no_context": "wrong account for resume",
     "deny.none": "no account available",
     "deny.other": "other",
-    "re.credits": r"will draw on purchased credits|credits might be charged|not spending purchased credits|purchased credits are not permitted",
+    "re.credits": r"will draw on purchased credits|credits might be charged|not spending purchased credits|purchased credits are not permitted|prepaid credits would be charged",
     "re.overage": r"will incur paid overage|paid overage is enabled",
     "re.lead": r"lead account.*reserved for the lead",
     "re.five_hour": r"five-hour window (?:has only|used up)",
@@ -486,6 +506,21 @@ endpoints, saves credentials atomically, and also respects QR_NO_REFRESH=1.""",
 }
 
 ZH_TW = {
+    # ---- Grok Build ----
+    'setting.families.grok.default_model': 'grok -p／--single 沒寫 -m／--model 時補上的模型（空字串表示不補）',
+    'setting.families.grok.refresh_logins': 'true 表示 Grok 登入過期時在背景跑 `grok models`，讓 CLI 自己續期；QR_NO_REFRESH=1 可關閉',
+    'setting.endpoints.grok_billing': 'Grok 計費網址（限 https://cli-chat-proxy.grok.com）',
+    'err.grok_no_login': '找不到 Grok 登入檔（auth.json），額度未知',
+    'err.grok_expired': 'Grok 登入已過期，額度未知',
+    'err.grok_usage': 'Grok 用量查詢失敗，額度未知',
+    'err.grok_changed': '查詢期間 Grok 登入已變更，額度未知',
+    'note.grok_refresh_started': '正在背景跑 `grok models` 讓 Grok 續期登入，額度暫時未知',
+    'note.grok_model_added': '[帳號分流] 這條 Grok 沒寫模型，已補上 -m {model}。',
+    'note.grok_old': '數字是舊的：上次讀到剩 {left:.0f}%',
+    'credit.grok_balance': '隨用隨付／預付餘額 {credits:g}',
+    'credit.why_grok_spend': '這期額度用完，會扣隨用隨付／預付餘額',
+    'status.grok_period': '額度週期：{period}',
+
     # ---- Kimi Code ----
     "report.kimi_no_start": "；未提供月窗起點，不推估消耗速度",
     'setting.families.kimi.default_model': 'kimi -p／--prompt 沒寫 -m／--model 時補上的模型（空字串表示不補）',
@@ -514,7 +549,7 @@ ZH_TW = {
 quota-router：派子代理前問「現在該用哪個帳號」。
 
 用法：
-  qr init [--force]         產生範例設定檔（依既有的 ~/.claude*、~/.codex*、~/.kimi-code* 目錄預填）
+  qr init [--force]         產生範例設定檔（依既有的 ~/.claude*、~/.codex*、~/.kimi-code*、~/.grok* 目錄預填）
   qr config                 印出解析後的設定與每個值的來源
   qr install [--config-dir 目錄] [--no-launcher]
                             把 hook 加進 Claude Code 的 settings.json（預設 ~/.claude），會先備份；
@@ -527,6 +562,7 @@ quota-router：派子代理前問「現在該用哪個帳號」。
   qr pick claude            回一行：帳號環境變數前綴  # 理由（並預約該帳號 30 分鐘，忙碌只計前 5 分鐘）
   qr pick codex             同上，Codex 帳號
   qr pick kimi              同上，Kimi Code 帳號（月額度與五小時窗）
+  qr pick grok              同上，Grok Build 帳號（目前這一期的額度）
   qr pick claude --env      只印前綴，方便 $(...) 直接接指令
   qr pick claude --peek     只看不預約
   qr pick claude --model opus  依模型挑選
@@ -544,7 +580,9 @@ quota-router：派子代理前問「現在該用哪個帳號」。
 登入憑證只送到原廠自己的用量／身分／續期網址；Codex 另讀本機紀錄檔。Claude 續期預設關閉：
 [families.claude] 設 refresh_logins = true 時，Claude 登入過期會像 Claude Code 一樣在背景用
 refresh token 更新，再存回 Claude Code 存放登入的地方。Kimi 續期預設開啟，只連 Kimi 自家
-HTTPS 網址並原子寫回憑證。設 QR_NO_REFRESH=1 可關閉兩家的續期。""",
+HTTPS 網址並原子寫回憑證。設 QR_NO_REFRESH=1 可關閉兩家的續期。
+quota-router 不自己續期 Grok 登入；[families.grok] 設 refresh_logins = true 時，
+登入過期會在背景跑 `grok models`，由 CLI 自己續期。""",
     "cli.no_config": "quota-router：找不到設定檔 {path}，請先執行 qr init",
     "cli.config_error": "quota-router：設定檔 {path} 有問題：{detail}",
     "cli.exists": "quota-router：{path} 已經存在；要覆寫請用 qr init --force",
@@ -567,11 +605,12 @@ HTTPS 網址並原子寫回憑證。設 QR_NO_REFRESH=1 可關閉兩家的續期
 # quota-router 設定檔。[general]、[hints]、[limits]、[timing]、[events]、[families.*]
 # 裡的值都可以不寫；這裡列的就是預設值。
 # [endpoints] 只供測試或代理環境使用，預設是註解掉的；登入 token 會送到這些網址，
-# token 續期端點還會收到 refresh token；Kimi 端點限 Kimi 自家 HTTPS 主機，不可改成代理。
+# token 續期端點還會收到 refresh token；Kimi 端點限 Kimi 自家 HTTPS 主機，不可改成代理；
+# Grok 端點限 https://cli-chat-proxy.grok.com。
 # qr config 會印出解析後的值與每個值的來源。""",
     "init.accounts": """\
-# 每個登入帳號一個 [[accounts]]。family：claude | codex | agy | kimi。key：任意不重複的名稱。
-# dir：你平常寫在 CLAUDE_CONFIG_DIR／CODEX_HOME 的目錄；"" 表示 CLI 的預設位置。""",
+# 每個登入帳號一個 [[accounts]]。family：claude | codex | agy | kimi | grok。key：任意不重複的名稱。
+# dir：你平常寫在 CLAUDE_CONFIG_DIR／CODEX_HOME／KIMI_CODE_HOME／GROK_HOME 的目錄；"" 表示 CLI 的預設位置。""",
     "setting.general.language": "訊息語言：en | zh-TW（QR_LANG 優先）",
     "setting.general.protect_threshold": "主管自己的帳號週剩低於這個 % 就不接子代理",
     "setting.general.protect_five_hour": "……五小時窗扣掉進行中任務後低於這個 % 也不接",
@@ -791,7 +830,7 @@ HTTPS 網址並原子寫回憑證。設 QR_NO_REFRESH=1 可關閉兩家的續期
     "deny.no_context": "找不到前文",
     "deny.none": "沒有可派",
     "deny.other": "其他拒派",
-    "re.credits": r"會改扣加購點數|可能扣點數|不花加購點數|點數未同意",
+    "re.credits": r"會改扣加購點數|可能扣點數|不花加購點數|點數未同意|會扣隨用隨付",
     "re.overage": r"會產生付費超額|付費超額已開",
     "re.lead": r"主管帳號.*保留給主管",
     "re.five_hour": r"五小時窗(?:只剩|用完)",

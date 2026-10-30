@@ -84,7 +84,7 @@ KEPT_NOTES = ["note.no_model", "note.resume_no_model", "note.model_dynamic", "no
               "note.resume_unknown", "note.resume_unknown_credits", "note.explicit_unknown", "note.near_credits",
               "note.resume_scarce_out", "suggest.none"]
 PATTERNS = {
-    "re.credits": ["note.will_charge_credits", "credit.why_codex_spend", "credit.why_risk", "blocked.low_no_credits",
+    "re.credits": ["note.will_charge_credits", "credit.why_codex_spend", "credit.why_grok_spend", "credit.why_risk", "blocked.low_no_credits",
                    "blocked.weekly_out_no_credits", "blocked.five_hour_out_no_credits"],
     "re.overage": ["note.will_incur_overage", "credit.why_claude_spend", "credit.overage_on"],
     "re.lead": ["blocked.lead_unknown", "blocked.lead_low"],

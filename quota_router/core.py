@@ -18,8 +18,12 @@ CODEX_ACCOUNTS = []
 KIMI_ACCOUNTS = []
 KIMI_MODEL = "kimi-code/k3.1-pro-highspeed"
 KIMI_REFRESH_LOGINS = True
+GROK_ACCOUNTS = []
+GROK_MODEL = ""                # -m added to a `grok -p` dispatch that names none ("" = leave it alone)
+GROK_REFRESH_LOGINS = False    # true: an expired Grok login is renewed by running `grok models` in the background
+GROK_PROGRAM = "grok"
 AGY_ACCOUNTS = []              # at most one: agy has no directory variable, so only its default location exists
-DEFAULT_KEY = {"claude": None, "codex": None, "agy": None, "kimi": None}   # the account of each family that uses the default location
+DEFAULT_KEY = {"claude": None, "codex": None, "agy": None, "kimi": None, "grok": None}   # the account of each family that uses the default location
 LAUNCH_OFF = set()             # Claude account keys with `launch = false` (no new sessions from `qr launch`)
 USAGE_CACHE_SEC = 180          # a usage reading is cached for 3 minutes
 PROFILE_CACHE_SEC = 86400      # the identity (email) is cached for a day; a changed token re-queries at once
@@ -47,8 +51,8 @@ SCARCE = "fable"               # the model with its own weekly bucket; None when
 SCARCE_LABEL = "Fable"
 AGY_MODEL = ""                 # --model added to an `agy -p` dispatch that names none ("" = leave it alone)
 AGY_PROGRAM = "agy"            # the Antigravity CLI that is asked for its quota (`agy -p /usage`)
-LABELS = {"claude": "Claude", "codex": "Codex", "agy": "agy", "kimi": "Kimi"}
-VERBS = {"claude": "claude -p", "codex": "codex exec", "agy": "agy -p", "kimi": "kimi -p"}
+LABELS = {"claude": "Claude", "codex": "Codex", "agy": "agy", "kimi": "Kimi", "grok": "Grok"}
+VERBS = {"claude": "claude -p", "codex": "codex exec", "agy": "agy -p", "kimi": "kimi -p", "grok": "grok -p"}
 REFRESH_LOGINS = False         # true: renew an expired Claude login with its refresh token, as Claude Code would (QR_NO_REFRESH=1: never)
 # where the login tokens are sent; the config file can point these elsewhere for tests or a proxy.
 ENDPOINTS = {name.split(".", 1)[1]: url for name, url in config.DEFAULTS.items() if name.startswith("endpoints.")}
@@ -73,6 +77,9 @@ def configure(cfg):
         KIMI_ACCOUNTS=[{"key": a["key"], "dir": a["dir"]} for a in cfg.family("kimi")],
         KIMI_MODEL=cfg["families.kimi.default_model"],
         KIMI_REFRESH_LOGINS=cfg["families.kimi.refresh_logins"],
+        GROK_ACCOUNTS=[{"key": a["key"], "dir": a["dir"]} for a in cfg.family("grok")],
+        GROK_MODEL=cfg["families.grok.default_model"],
+        GROK_REFRESH_LOGINS=cfg["families.grok.refresh_logins"],
         LAUNCH_OFF={a["key"] for a in cfg.family("claude") if not a["launch"]},
         DEFAULT_KEY={family: next((a["key"] for a in cfg.family(family) if a["default"]), None)
                      for family in config.FAMILIES},
@@ -103,7 +110,8 @@ def configure(cfg):
 
 
 def accounts(family):
-    return {"claude": CLAUDE_ACCOUNTS, "codex": CODEX_ACCOUNTS, "agy": AGY_ACCOUNTS, "kimi": KIMI_ACCOUNTS}.get(family, [])
+    return {"claude": CLAUDE_ACCOUNTS, "codex": CODEX_ACCOUNTS, "agy": AGY_ACCOUNTS, "kimi": KIMI_ACCOUNTS,
+            "grok": GROK_ACCOUNTS}.get(family, [])
 
 
 def managed_families():
@@ -211,7 +219,7 @@ def error_location(error):
     return found
 
 
-def log_error(operation, error=None, subject=None):
+def log_error(operation, error=None, subject=None, trace=True):
     """One structured line in hook-errors.log: time | operation | exception class | code location | subject.
 
     Nothing else is ever written there. In particular not the exception's message and not a traceback: both
@@ -219,7 +227,8 @@ def log_error(operation, error=None, subject=None):
     code of an HTTP error answer, appended to its class (`HTTPError-403`): a number, and without it a refusal
     could not be told from an outage. `operation` is a fixed name from the code and `subject` a state file, lock
     or account key, hashed when it has unusual characters.
-    QR_DEBUG=1 additionally appends the full traceback to debug.log, which may therefore hold sensitive text."""
+    QR_DEBUG=1 additionally appends the full traceback to debug.log, which may therefore hold sensitive text;
+    trace=False leaves it out for errors whose message may quote a credential."""
     try:
         kind = log_token(type(error).__name__) if error is not None else "-"
         status = getattr(error, "code", None) if isinstance(error, urllib.error.HTTPError) else None
@@ -230,7 +239,7 @@ def log_error(operation, error=None, subject=None):
                     f"{error_location(error)} | {log_token(subject)}\n")
     except Exception:
         pass
-    if error is not None and os.environ.get("QR_DEBUG") == "1":
+    if trace and error is not None and os.environ.get("QR_DEBUG") == "1":
         try:
             detail = "".join(traceback.format_exception(type(error), error, error.__traceback__))
             with open(os.path.join(STATE, "debug.log"), "a", encoding="utf-8") as f:
@@ -1539,10 +1548,22 @@ def kimi_reading(acc, cache=None, force=False):
     return reading(acc, cache, force)
 
 
+def parse_grok_usage(payload):
+    from .grok import parse_usage
+    return parse_usage(payload)
+
+
+def grok_reading(acc, cache=None, force=False):
+    from .grok import reading
+    return reading(acc, cache, force)
+
+
 def family_reading(family, acc, cache, force=False):
     """One account's reading, whatever its family."""
     if family == "claude":
         return claude_reading(acc, cache, force)
+    if family == "grok":
+        return grok_reading(acc, cache, force)
     if family == "kimi":
         return kimi_reading(acc, cache, force)
     if family == "agy":
@@ -1624,6 +1645,9 @@ def classify_proc(cmd):
     if exe == "kimi":
         from .hook import kimi_options
         return "kimi" if kimi_options(argv[1:])[0] else None
+    if exe == "grok":
+        from .hook import grok_options
+        return "grok" if grok_options(argv[1:])["printing"] else None
     if exe in ("agy", "antigravity") and "/usage" not in argv[1:] and any(
             a.startswith("-") and a.lstrip("-").partition("=")[0] in ("p", "print", "prompt") for a in argv[1:]):
         return "agy"
@@ -1812,7 +1836,8 @@ def not_logged_in(row):
 
 def credit_state(row):
     u = row.get("usage") or {}
-    row["paid"] = ((row.get("credits") or 0) > 0 if row["family"] == "codex"
+    # Grok: credits is what is left under the on-demand cap plus the prepaid balance, spent once the period is used up.
+    row["paid"] = ((row.get("credits") or 0) > 0 if row["family"] in ("codex", "grok")
                    else bool((u.get("extra_usage") or {}).get("is_enabled")))
     # Codex says through its live flags whether the subscription still covers a dispatch. A reading without them
     # (the local fallback) cannot tell, so any window at 0% with a credit balance counts as "would charge".
@@ -1824,10 +1849,15 @@ def credit_state(row):
         wins.append(u[row["model"]])
     row["pay_risk"] = row["paid"] and (not u.get("seven_day") or any(
         w and 100 - w["used"] < SUB_FLOOR and (w.get("reset") is None or w["reset"] > now()) for w in wins))
+    if row["family"] == "grok" and row["paid"] and not row.get("live"):
+        # old numbers: the period may have run out since, and then the money is charged. Held without consent;
+        # with it, weighted down and marked as spending.
+        row["pay_risk"] = True
+        row["will_spend"] = row["will_spend"] or bool(row.get("allow_credits"))
 
 
 def spend_note(family):
-    return t("note.will_charge_credits") if family == "codex" else t("note.will_incur_overage")
+    return t("note.will_charge_credits") if family in ("codex", "grok") else t("note.will_incur_overage")
 
 
 def credit_block(row):
@@ -1909,6 +1939,11 @@ def score_rows(family, raw, model=None, allow_credits=None):
         if (row.get("retry_at") or 0) > now():
             row["notes"].append(t("note.cooldown", seconds=math.ceil(row["retry_at"] - now())))
         if wk and wk.get("reset") and wk["reset"] <= now():
+            wk = None
+            unknown = True
+        if family == "grok" and wk and not row.get("live"):
+            # expired login or failed query: the last numbers are shown as old, the quota counts as unknown.
+            row["notes"].append(t("note.grok_old", left=max(0.0, 100 - wk["used"])))
             wk = None
             unknown = True
         fb = u.get(category) if category != "other" else None
@@ -2012,7 +2047,7 @@ def prefix(family, row):
     if family == "claude":
         return ("env -u CLAUDE_CONFIG_DIR" if row["dir"] is None
                 else "CLAUDE_CONFIG_DIR=" + platform_compat.shell_quote(row["dir"]))
-    if family == "kimi" and platform_compat.canonical(row["dir"]) == platform_compat.canonical(config.default_dir("kimi")):
+    if family in ("kimi", "grok") and platform_compat.canonical(row["dir"]) == platform_compat.canonical(config.default_dir(family)):
         return ""
     return config.ENV_DIR[family] + "=" + platform_compat.shell_quote(row["dir"])
 
@@ -2145,8 +2180,10 @@ def __getattr__(name):
 
 def credit_line(row):
     """One line per account: why it would cost money, the balance, any reset vouchers."""
-    balance = t("credit.balance", credits=row.get("credits") or 0) if row["family"] == "codex" else t("credit.overage_on")
-    why = (t("credit.why_codex_spend") if row["family"] == "codex" else t("credit.why_claude_spend")) if row["will_spend"] else t("credit.why_risk")
+    balance = (t("credit.balance", credits=row.get("credits") or 0) if row["family"] == "codex" else
+               t("credit.grok_balance", credits=row.get("credits") or 0) if row["family"] == "grok" else t("credit.overage_on"))
+    why = ((t("credit.why_codex_spend") if row["family"] == "codex" else t("credit.why_grok_spend") if row["family"] == "grok"
+            else t("credit.why_claude_spend")) if row["will_spend"] else t("credit.why_risk"))
     line = t("credit.line", key=row["key"], why=why, balance=balance)
     if row["family"] == "codex" and row.get("reset_credits"):
         line += t("credit.vouchers", count=row["reset_credits"])
@@ -2345,7 +2382,7 @@ def account_key(family, value):
     for a in accs:
         if value == a["key"]:
             return a["key"]
-    if family in ("codex", "agy", "kimi") and value.isdigit():  # 1, 2, …: the n-th account of the family in the config file
+    if family in ("codex", "agy", "kimi", "grok") and value.isdigit():  # 1, 2, …: the n-th account of the family in the config file
         return accs[int(value) - 1]["key"] if 0 < int(value) <= len(accs) else None
     if family == "claude":
         return dir_key(value.replace("${HOME}", HOME))
@@ -2444,6 +2481,10 @@ def status(force=False, bars=False):
                 partner = (r.get("usage") or {}).get("partner_seven_day")
                 if partner:
                     extra = t("sep.semicolon").join(filter(None, [extra, t("status.agy_partner", left=max(0, 100 - partner["used"]))]))
+            if fam == "grok":
+                period = ((r.get("usage") or {}).get("seven_day") or {}).get("period")
+                if period and period != "weekly":
+                    extra = t("sep.semicolon").join(filter(None, [extra, t("status.grok_period", period=period)]))
             if fam == "kimi":
                 code = (r.get("usage") or {}).get("month_code")
                 if code:
@@ -2864,7 +2905,7 @@ def event_timing(event):
 def window_label(event):
     if event["family"] == "kimi" and event["window"] == "seven_day":
         return t("window.monthly")
-    return t("window.codex_weekly") if event["family"] == "codex" and event["window"] == "seven_day" else window_name(event["window"])
+    return t("window.codex_weekly") if event["family"] in ("codex", "grok") and event["window"] == "seven_day" else window_name(event["window"])
 
 
 def notice_text(event):
@@ -2882,7 +2923,7 @@ def notice_text(event):
             continue  # this account has no such window (Codex has no five-hour window, say) or it was not read this time
         label = window_label(dict(event, window=name))
         text += t("notice.other_window", window=label, left=100 - win["used"])
-    if event["family"] == "kimi":
+    if event["family"] in ("kimi", "grok"):
         text += t("notice.tail_weekly_plain")
     elif event["family"] == "codex":
         text += t("notice.tail_codex")
@@ -3071,13 +3112,16 @@ def report(days=7):
                         + t("report.kimi_no_start")) if win and reading_fresh(row, "kimi") else t("report.no_data")
                 print(t("report.row", who=who(row), window=label, text=text))
                 continue
-            hours = (now() - (win["reset"] - 7 * 86400)) / 3600 if win and win.get("reset") else 0
-            if not reading_fresh(row, row["family"]) or not 24 <= hours <= 168 or win["reset"] <= now():
+            # Grok reports its period's start; a period that is not seven days long keeps its own length.
+            start = win and win.get("reset") and (win.get("start") or win["reset"] - 7 * 86400)
+            period = (win["reset"] - start) / 3600 if start and win["reset"] > start else 168
+            hours = (now() - start) / 3600 if start else 0
+            if not reading_fresh(row, row["family"]) or not 24 <= hours <= period or win["reset"] <= now():
                 text = t("report.no_data")
             else:
-                projected = win["used"] / hours * 168
+                projected = win["used"] / hours * period
                 left = 100 - min(100, projected)
-                text = t("report.pace_line", elapsed=hours / 168 * 100, used=win["used"], left=left)
+                text = t("report.pace_line", elapsed=hours / period * 100, used=win["used"], left=left)
                 if projected >= 100:
                     days_left = (100 - win["used"]) / (win["used"] / hours) / 24 if win["used"] > 0 else 0
                     text += t("report.runs_out", days=days_left)

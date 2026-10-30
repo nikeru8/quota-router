@@ -2,7 +2,7 @@
 
 [繁體中文](README.zh-TW.md)
 
-quota-router is a Claude Code hook that spreads subagent jobs over your subscription accounts. When your session is about to run `claude -p "summarize the diff" --model opus`, the hook checks the quota of every account you listed and runs `env CLAUDE_CONFIG_DIR=/home/you/.claude-b claude -p "summarize the diff" --model opus` instead, on the account with the most room; when no account fits, or the job would spend paid credits, it blocks the command and says why. Inside a session it acts on `claude -p`, `codex exec`, `agy -p` and `kimi -p` commands run through the Bash tool. `qr install` also writes a `claude` launcher, so a session typed in a terminal starts on the Claude account with the most quota left. One session = one account: a session is never moved while it runs, and subagents started with the built-in Agent/Task tool or a workflow stay on its account.
+quota-router is a Claude Code hook that spreads subagent jobs over your subscription accounts. When your session is about to run `claude -p "summarize the diff" --model opus`, the hook checks the quota of every account you listed and runs `env CLAUDE_CONFIG_DIR=/home/you/.claude-b claude -p "summarize the diff" --model opus` instead, on the account with the most room; when no account fits, or the job would spend paid credits, it blocks the command and says why. Inside a session it acts on `claude -p`, `codex exec`, `agy -p`, `kimi -p` and `grok -p` commands run through the Bash tool. `qr install` also writes a `claude` launcher, so a session typed in a terminal starts on the Claude account with the most quota left. One session = one account: a session is never moved while it runs, and subagents started with the built-in Agent/Task tool or a workflow stay on its account.
 
 The session sees a note like this on each routed command:
 
@@ -13,8 +13,8 @@ The session sees a note like this on each routed command:
 Three terms used throughout:
 
 - **lead**: the Claude Code session that issues the command. "The lead's account" is the account it runs on.
-- **dispatch**: a `claude -p …`, `codex exec …`, `agy -p …` or `kimi -p …` command that the hook sees in a Bash command.
-- **family**: Claude, Codex, agy (Antigravity), or Kimi Code. A dispatch is only ever routed to another account of the same family.
+- **dispatch**: a `claude -p …`, `codex exec …`, `agy -p …`, `kimi -p …` or `grok -p …` command that the hook sees in a Bash command.
+- **family**: Claude, Codex, agy (Antigravity), Kimi Code, or Grok Build. A dispatch is only ever routed to another account of the same family.
 
 ## Requirements
 
@@ -108,6 +108,27 @@ Kimi's long window is **monthly, not weekly**. `limit_month_total` supplies it; 
 
 Kimi's short-lived login is renewed by default from `<dir>/credentials/kimi-code.json`. A hook starts a background renewal; ordinary CLI reads renew in place. A failed renewal shows unknown quota and remains eligible for dispatch. Missing credentials block dispatch. Set `[families.kimi] refresh_logins = false` or `QR_NO_REFRESH=1` to disable renewal. Only approved Kimi HTTPS hosts receive these tokens; redirects are refused. New credentials preserve existing fields and are atomically replaced with mode 600. The CLI's OAuth lock is honoured on macOS/Linux. `~/.kimi-code/config.toml` is never changed. See [the reference](docs/REFERENCE.md#kimi-code-family) for endpoint and locking details.
 
+## Grok Build (fifth family)
+
+Add your logged-in Grok Build CLI account to the config:
+
+```toml
+[[accounts]]
+family = "grok"
+key = "grok-1"
+dir = ""
+
+[families.grok]
+default_model = ""        # e.g. "grok-4.7"; empty adds nothing
+refresh_logins = false
+```
+
+Use `grok -p "summarize the diff"` (also `--single`, `--prompt-file`, `--prompt-json`). With `default_model` set, the hook adds `-m <model>` only when neither `-m` nor `--model` is present. It never adds `--always-approve`. `grok -r <session id> -p …`, `grok -r -p …` and `grok -c -p …` stay on the account that holds the conversation. Interactive `grok` (with or without an initial prompt) and subcommands such as `grok models` are left alone.
+
+`dir = ""` means `~/.grok`, with no prefix; additional accounts use their own directories, selected with `GROK_HOME`. `qr init` pre-fills the default and detected `~/.grok-*` directories. Try `qr status`, `qr pick grok --peek`, and `qr check grok grok-1 --peek`.
+
+Grok's quota is the credit usage of its current period (weekly today), read from the endpoint the CLI itself uses. On-demand credits or a prepaid balance count as paid: a used-up period with either is blocked unless the user agrees to `QR_ALLOW_CREDITS=1` for that dispatch. The access token lasts about six hours and quota-router never renews it; an expired login, a failed query or a missing login shows unknown quota with the last numbers marked old, and stays dispatchable. With `refresh_logins = true` an expired login makes quota-router run `grok models` in the background, which lets the CLI renew it under its own lock. Details in [the reference](docs/REFERENCE.md#grok-build-family).
+
 ## How it decides
 
 - **Same family only.** You choose the family; the hook chooses the account. The other family's quota is shown as a suggestion.
@@ -136,9 +157,9 @@ The full rules, with every exception: [REFERENCE.md › How it decides](docs/REF
 - It reads each account's login token and sends it only to that vendor's own endpoints. It sends no telemetry.
 - Only with `refresh_logins = true` under `[families.claude]` (off by default): when a Claude account's login has expired (the account sat idle) and no Claude Code process runs on that directory, a background quota-router process renews the login with its refresh token, as Claude Code itself would, and writes it back to the keychain item or `.credentials.json` it came from. Otherwise an idle account could not be read and would never be picked. Kimi renewal is separately enabled by default, as described above. The renewed login normally reaches `security` on stdin; a login stored next to several MCP logins is too long for that and goes on its command line, as Claude Code does it, where other local users can see it while it runs. A login Windows keeps in the Credential Manager is not handled. `refresh_logins = false` under `[families.claude]` or `QR_NO_REFRESH=1` turns this off; details in [REFERENCE.md › Renewing an expired Claude login](docs/REFERENCE.md#renewing-an-expired-claude-login).
 - When a live Codex query fails and the local numbers are over two hours old, it starts one small `codex exec` in the background on that account to refresh them. `QR_NO_PROBE=1` turns that off.
-- The hook runs before every Bash command and can rewrite it. It inserts an account prefix, adds a configured agy/Kimi model when omitted, or blocks the command. Read `qr decisions` after your first few dispatches.
+- The hook runs before every Bash command and can rewrite it. It inserts an account prefix, adds a configured agy/Kimi/Grok model when omitted, or blocks the command. Read `qr decisions` after your first few dispatches.
 - Outside its state directory apart from the configured login renewals it writes only the hook entry in each `settings.json` you install into and the `claude` launcher file.
-- Anyone who can edit the config file can redirect Claude/Codex tokens (Kimi hosts are restricted), so protect it like `settings.json`.
+- Anyone who can edit the config file can redirect Claude/Codex tokens (Kimi and Grok hosts are restricted), so protect it like `settings.json`.
 
 ## Limits that bite in practice
 

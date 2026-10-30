@@ -31,7 +31,8 @@ def test_init_writes_a_loadable_config_prefilled_from_home(home, capsys):
     assert cfg.path == str(path) and cfg.values == config.DEFAULTS
     assert [(a["key"], a["dir"]) for a in cfg.accounts] == [
         ("claude-main", None), ("claude-b", str(home / ".claude-b")),
-        ("codex-1", str(home / ".codex")), ("codex-2", str(home / ".codex-b")), ("kimi-1", str(home / ".kimi-code"))]
+        ("codex-1", str(home / ".codex")), ("codex-2", str(home / ".codex-b")), ("kimi-1", str(home / ".kimi-code")),
+        ("grok-1", str(home / ".grok"))]
 
 
 def test_init_does_not_overwrite_without_force(write_config, capsys):

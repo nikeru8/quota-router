@@ -114,6 +114,11 @@ def main(argv=None):
         core.configure(load_or_exit())
         from .kimi import refresh_main
         raise SystemExit(refresh_main(argv[1:]))
+    if command == "refresh-grok":
+        # the background `grok models` login renewal a reading started; not a user command (see grok.refresh_main).
+        core.configure(load_or_exit())
+        from .grok import refresh_main
+        raise SystemExit(refresh_main(argv[1:]))
     if command == "refresh-agy":
         # the background agy usage query a reading started; not a user command (see core.agy_refresh_main).
         core.configure(load_or_exit())

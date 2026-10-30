@@ -39,7 +39,7 @@ dir = "~/.codex-b"
 
 | Field | Default | Meaning |
 |---|---|---|
-| `family` | required | `claude`, `codex`, `agy` (Antigravity CLI), or `kimi` (Kimi Code CLI). |
+| `family` | required | `claude`, `codex`, `agy` (Antigravity CLI), `kimi` (Kimi Code CLI), or `grok` (Grok Build CLI). |
 | `key` | required | A unique name of your choosing (letters, digits, `-`, `_`, `.`). It appears in messages and logs. |
 | `dir` | `""` | The directory you would pass as `CLAUDE_CONFIG_DIR` / `CODEX_HOME`. `~` and `$HOME` are expanded. Empty, or equal to `~/.claude` / `~/.codex`, means the CLI's default location; one account per family may use it. Exception, Claude on macOS: `dir = "~/.claude"` written out is a second, separate account (see [macOS: two logins in `~/.claude`](#macos-two-logins-in-claude)). |
 | `launch` | `true` | Claude accounts only. `false`: [`qr launch`](#sessions-and-the-claude-launcher) never starts a new session here. Even with `true`, a session only starts here once the hook is in this directory's `settings.json`. Dispatches from the hook still go to the account either way, and a conversation that lives there is still resumed there. |
@@ -92,13 +92,15 @@ On macOS Claude Code keeps each login in the keychain under an item named after 
 | `families.claude.refresh_logins` | `false` | `true`: renew an expired Claude login with its refresh token, in a background process, and save it where Claude Code keeps it, so an idle account keeps live numbers. `false` (or `QR_NO_REFRESH=1`): never; an idle account then shows "login token expired" until Claude Code is used there. See [Renewing an expired Claude login](#renewing-an-expired-claude-login). |
 | `families.kimi.default_model` | `"kimi-code/k3.1-pro-highspeed"` | Model added to `kimi -p` / `--prompt` when `-m` / `--model` is absent; empty disables injection. |
 | `families.kimi.refresh_logins` | `true` | Renew expiring Kimi credentials; `QR_NO_REFRESH=1` disables this. |
+| `families.grok.default_model` | `""` | Model added to `grok -p` / `--single` when `-m` / `--model` is absent, e.g. `"grok-4.7"`; empty adds nothing. |
+| `families.grok.refresh_logins` | `false` | `true`: when a Grok login has expired, run `grok models` in the background so the CLI renews it itself; `QR_NO_REFRESH=1` disables this. See [Grok Build family](#grok-build-family). |
 | `launch.route_print` | `false` | `true`: the [launcher](#sessions-and-the-claude-launcher) also chooses the account for `claude -p …` started outside Claude Code. By default those run as written. |
 | `endpoints.claude_usage` | `"https://api.anthropic.com/api/oauth/usage"` | Where Claude usage is queried. |
 | `endpoints.claude_profile` | `"https://api.anthropic.com/api/oauth/profile"` | Where a Claude account's email is queried. |
 | `endpoints.claude_token` | `"https://platform.claude.com/v1/oauth/token"` | Where an expired Claude login is renewed. The refresh token is sent here. |
 | `endpoints.codex_usage` | `"https://chatgpt.com/backend-api/wham/usage"` | Where Codex usage is queried. |
 
-Kimi endpoint overrides are an exception: only approved Kimi HTTPS hosts are accepted, never arbitrary proxies. See [Kimi Code family](#kimi-code-family).
+Kimi endpoint overrides are an exception: only approved Kimi HTTPS hosts are accepted, never arbitrary proxies. See [Kimi Code family](#kimi-code-family). So is `endpoints.grok_billing`: only `https://cli-chat-proxy.grok.com`. See [Grok Build family](#grok-build-family).
 
 `[endpoints]` exists for tests and for networks that reach the vendors through a proxy. **Your login token, and for `claude_token` the refresh token, is sent to whatever these point at**; keep the defaults unless you need one of those two cases. `qr init` writes them commented out, so that a later change of the default addresses is not pinned by old config files.
 
@@ -112,7 +114,7 @@ Kimi endpoint overrides are an exception: only approved Kimi HTTPS hosts are acc
 | `launch` on a Codex account | Warning; it only applies to Claude accounts and is ignored. |
 | `general.language` other than `en` / `zh-TW` | Error. |
 | `endpoints.*` not starting with `http://` or `https://` | Error. |
-| No `[[accounts]]`, an account without `family` or `key`, `family` other than `claude` / `codex` / `agy` / `kimi`, a key with characters outside letters, digits, `-`, `_`, `.`, a duplicate key | Error. |
+| No `[[accounts]]`, an account without `family` or `key`, `family` other than `claude` / `codex` / `agy` / `kimi` / `grok`, a key with characters outside letters, digits, `-`, `_`, `.`, a duplicate key | Error. |
 | `dir` that is not absolute after expansion | Error. |
 | Two accounts of one family at the default location (`dir = ""`, or a `dir` that resolves to `~/.claude` / `~/.codex`; on macOS a Claude `dir = "~/.claude"` is a separate account instead) | Error. |
 | Two accounts of one family with the same directory | Error. |
@@ -201,7 +203,7 @@ eval "env $account codex exec \"\$prompt\""
 
 ### `qr init`
 
-Lists the default location of each family first, whether or not anything exists there, then every `~/.claude-*`, `~/.codex-*`, and `~/.kimi-code-*` directory that contains one of these marker files or directories: `.claude.json`, `.credentials.json`, `settings.json`, `projects` (Claude); `auth.json`, `config.toml`, `sessions` (Codex); `credentials/kimi-code.json`, `config.toml`, `sessions` (Kimi). It checks that they exist and reads none of them. Keys: the directory name without the dot for Claude (`.claude-b` → `claude-b`), `codex-2`, `codex-3`, … for Codex, `kimi-2`, `kimi-3`, … for Kimi; a key that would collide or hold an invalid character is adjusted (`claude-main-2`). `[endpoints]` is written commented out.
+Lists the default location of each family first, whether or not anything exists there, then every `~/.claude-*`, `~/.codex-*`, `~/.kimi-code-*`, and `~/.grok-*` directory that contains one of these marker files or directories: `.claude.json`, `.credentials.json`, `settings.json`, `projects` (Claude); `auth.json`, `config.toml`, `sessions` (Codex); `credentials/kimi-code.json`, `config.toml`, `sessions` (Kimi); `auth.json`, `config.toml`, `sessions` (Grok). It checks that they exist and reads none of them. Keys: the directory name without the dot for Claude (`.claude-b` → `claude-b`), `codex-2`, `codex-3`, … for Codex, `kimi-2`, `kimi-3`, … for Kimi, `grok-2`, … for Grok; a key that would collide or hold an invalid character is adjusted (`claude-main-2`). `[endpoints]` is written commented out.
 
 ### `qr install` and ownership of the hook entry
 
@@ -685,7 +687,7 @@ One line per decision, nine fields separated by ` | `:
 | source | `hook`, `qr pick`, `qr check`, `probe`, `qr launch` or `refresh` |
 | `lead=` | key of the account the dispatching session runs on, with ` (assumed)` when it was not detected; `?` when unknown; `-` for `qr launch`, which starts a session and has no lead |
 | `sess=` | first 8 characters of Claude Code's session id; a hash when the id has an unusual shape; `-` when there is none |
-| family | `claude`, `codex`, `agy`, `kimi` or `?` |
+| family | `claude`, `codex`, `agy`, `kimi`, `grok` or `?` |
 | kind | `auto` (routed), `explicit` (account named in the command), `explicit-unknown` (named directory not in the config), `resume`, `resume-unknown`, `deny`, `fail`, `pick`, `check`, `probe`; for `qr launch`: `launch` (a new session routed), `launch-resume` (a resumed conversation kept on its account), `launch-default` (started on the default account; `pick=` is the key of the account at the default location, or `-`), `fail`; for `refresh` (an expired Claude login, `pick=` the account): `refresh-started` (a background renewal was started), `refresh` (renewed and saved), `refresh-adopted` (someone else had renewed it meanwhile), `refresh-busy` (Claude Code uses the directory or holds its lock), `refresh-none` (nothing to renew with), `refresh-failed`, `refresh-dead` (the refresh token was refused or has expired), `refresh-on-hold`, `refresh-unsaved` (renewed, but the write failed), `refresh-unverified` (written, but could not be read back). A pass-through (`--help`, a subcommand, `CLAUDE_CONFIG_DIR` already set, inside a session) is not logged. |
 | `pick=` | account key; `-` when there is none |
 | detail | `; `-separated: a fixed phrase, the numbers behind the choice (`weekly N% left`, `five-hour N% left`, `N running, N reserved`), `model <class>`, `credits allowed`. The phrases `qr launch` adds: `launched with a warning`, `on paid overage`, `no account can take it`, `no account could be read`, `no account is set up for sessions`, and `conversation location unknown` / `kept the original account` as for the hook. For `refresh`: `renewal started in the background`, `login renewed`, `already renewed elsewhere`, `Claude Code may be using that directory`, `Claude Code holds its lock`, `another renewal is running`, `nothing to renew with`, `renewal failed` (with `, HTTP <code>` after an error answer), `odd answer; new refresh token kept`, `refresh token refused; run claude login there`, `account on hold`, `renewed but could not be saved`, `renewed and saved; read-back failed`. For `deny` only the category: `blocked: credits`, `paid overage`, `lead protection`, `five-hour window`, `weekly quota`, `wrong account for resume`, `no account available`, `other`. For `fail` the exception class name. |
@@ -807,3 +809,25 @@ Usage/profile tokens can only go to exact `api.kimi.com` or `api.kimi.ai` HTTPS 
 The installed Kimi Code 2.3.0 bundle uses a proper-lockfile directory `<dir>/oauth/kimi-code.lock` around refresh, with a five-second stale limit. On macOS/Linux the router takes the same lock, updates its timestamp every second, and releases it only if it still owns it. It also holds its own lock per credential path. On Windows Kimi disables its cross-process OAuth lock, so the router only has its own lock and credential comparisons; the CLI can still race it in the final comparison/replacement interval. Forced process termination and programs that ignore the lock cannot be made fully safe.
 
 The hook and time-budgeted reports start `refresh-kimi <key> <owner>` detached when renewal is required; their current reading is unknown and can still be dispatched. Normal manual queries perform renewal directly. A worker's result is accepted only while it owns the cache claim; repeated callers do not start duplicates. Failure enters a cooldown, clears quota to unknown, and leaves an existing login eligible for selection. A directory with neither access nor refresh token is not eligible. `QR_NO_REFRESH=1` or `refresh_logins = false` prevents refresh. `~/.kimi-code/config.toml` is never touched.
+
+## Grok Build family
+
+The fifth family is `grok`. `dir = ""` resolves to `~/.grok`; other directories are selected with `GROK_HOME` (Grok's documented home override). The default location adds no prefix, and an inherited `GROK_HOME` counts as an explicit account selection, as for Kimi. `grok`, `grok.exe` and `grok.cmd` are recognised, including paths. A dispatch is a run with `-p` / `--single`, `--prompt-file` or `--prompt-json` (clap reads options anywhere, so every word is looked at; option values are skipped). `grok` without these, `grok "initial prompt"`, `--help` / `-v`, and a first plain word that is a subcommand (`models`, `login`, `agent`, `sessions`, …) are not dispatches. `-m` / `--model` / `-m<model>` is kept; otherwise `families.grok.default_model` is added after the program name when it is not empty.
+
+Resumed conversations: Grok keeps each one in `$GROK_HOME/sessions/<working directory, percent-encoded>/<session id>/`. `-r <id>` / `--resume=<id>` is looked up by id in every Grok account; `-c`, `--continue` and a bare `-r` take the account with the newest conversation for the working directory. A title (`-r "my title"`) is not looked up: the dispatch runs as written, with the usual "conversation location unknown" note.
+
+Usage comes from `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` with the headers the CLI sends (`Authorization: Bearer`, `x-grok-client-identifier: grok-shell`, `x-grok-client-version`). This endpoint is not documented by xAI; it is the one Grok Build 1.0.46 uses. `config.creditUsagePercent` (else the `GrokBuild` entry of `productUsage`) is the used %, `currentPeriod.end` the reset and `currentPeriod.start` the start; the type (`USAGE_PERIOD_TYPE_WEEKLY` today) is shown in `qr status` when it is not weekly. Internally the period uses the common `seven_day` key, and `qr report` paces it over its real length. There is no five-hour window. Readings follow `usage_cache_seconds` and the hook's time budget; when the budget is too short the cached reading is used.
+
+| Setting | Default |
+|---|---|
+| `families.grok.default_model` | `""` (add nothing) |
+| `families.grok.refresh_logins` | `false` |
+| `endpoints.grok_billing` | `https://cli-chat-proxy.grok.com/v1/billing?format=credits` |
+
+The access token is only sent to `https://cli-chat-proxy.grok.com` (port 443, no URL credentials or fragment, no redirects). Only a fingerprint of the account's `user_id` is cached; the token, refresh token and email are never stored, logged or printed. Errors go to `hook-errors.log` as a class name and HTTP status only.
+
+Money: what is left under `onDemandCap` (minus `onDemandUsed`) plus `prepaidBalance` counts as paid credits. Once the period is used up such an account would be charged, so it is blocked unless the dispatch carries `QR_ALLOW_CREDITS=1`; with neither, a used-up period is simply "weekly quota used up".
+
+Unknown quota: a login file that is missing or unreadable (also: Grok not installed, or a login only through `XAI_API_KEY`), an `expires_at` in the past, a non-200 answer, a timeout or an answer of another shape all leave the account dispatchable with unknown quota. The last numbers are kept and shown as "numbers are old: the last reading showed N% left"; a failure cools down like the other families.
+
+Login renewal: quota-router never uses the refresh token, because a rotated refresh token written by another program could sign the CLI out. The CLI renews an expired login itself before its next request, under `auth.json.lock`, including for `grok models`, which costs no tokens. With `[families.grok] refresh_logins = true` an expired login makes a reading start `refresh-grok <key> <owner>` detached (output in `refresh-<key>.log`): it runs `grok models` with that account's `GROK_HOME` and then reads the quota once. `QR_NO_REFRESH=1` turns it off as well.

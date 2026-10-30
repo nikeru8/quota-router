@@ -15,8 +15,8 @@ quota-router 是一個 Claude Code hook，幫你把子代理的工作分到不�
 本文用到的三個詞：
 
 - **主 session**（lead）：下指令的那個 Claude Code session。「主 session 的帳號」就是它自己跑在上面的帳號。
-- **派工**（dispatch）：hook 在 Bash 指令裡看到的一條 `claude -p …`、`codex exec …`、`agy -p …` 或 `kimi -p …`。
-- **同一家**（family）：Claude、Codex、agy（Antigravity）或 Kimi Code。派工只會換到同一家的另一個帳號。
+- **派工**（dispatch）：hook 在 Bash 指令裡看到的一條 `claude -p …`、`codex exec …`、`agy -p …`、`kimi -p …` 或 `grok -p …`。
+- **同一家**（family）：Claude、Codex、agy（Antigravity）、Kimi Code 或 Grok Build。派工只會換到同一家的另一個帳號。
 
 ## 需求
 
@@ -110,6 +110,27 @@ Kimi 的長窗是**月額度，不是週額度**。`limit_month_total` 對應月
 
 Kimi 的短效登入預設自動續期，讀寫 `<dir>/credentials/kimi-code.json`。hook 交給背景程序續期，手動查詢則直接完成；續期失敗顯示額度未知，仍可派工，沒有登入憑證則不派。可用 `[families.kimi] refresh_logins = false` 或 `QR_NO_REFRESH=1` 關閉。token 只送 Kimi 自家 HTTPS 主機、不跟隨轉址；保留憑證欄位，以權限 600 的暫存檔原子替換。macOS／Linux 配合 CLI 的 OAuth 鎖。完全不修改 `~/.kimi-code/config.toml`。端點與鎖定細節見[參考文件](docs/REFERENCE.md#kimi-code-family)。
 
+## Grok Build（第五家族）
+
+把已登入的 Grok Build CLI 帳號加入設定檔：
+
+```toml
+[[accounts]]
+family = "grok"
+key = "grok-1"
+dir = ""
+
+[families.grok]
+default_model = ""        # 例如 "grok-4.7"；空字串表示不補
+refresh_logins = false
+```
+
+派工使用 `grok -p "整理這次修改"`（也支援 `--single`、`--prompt-file`、`--prompt-json`）。設了 `default_model` 時，沒有 `-m` 或 `--model` 的派工才補上 `-m <模型>`。不會加 `--always-approve`。`grok -r <session id> -p …`、`grok -r -p …`、`grok -c -p …` 會留在存有那段對話的帳號。互動模式的 `grok`（不論有沒有帶開場提示）與 `grok models` 等子指令不分流。
+
+`dir = ""` 是 `~/.grok`，預設位置不加前綴；其他帳號各用一個目錄，以 `GROK_HOME` 選擇。`qr init` 會預填預設位置與偵測到的 `~/.grok-*` 目錄。可以用 `qr status`、`qr pick grok --peek`、`qr check grok grok-1 --peek` 檢查。
+
+Grok 的額度是目前這一期（目前是週）的點數用量，從 CLI 自己用的端點讀取。有隨用隨付額度或預付餘額時視為付費：這期額度用完就擋下，要使用者同意後在那條派工前加 `QR_ALLOW_CREDITS=1` 才放行。access token 效期約六小時，quota-router 不自己續期；登入過期、查詢失敗或沒有登入檔時顯示額度未知，保留上次數字並標「數字是舊的」，照樣可派。設 `refresh_logins = true` 時，登入過期會在背景跑 `grok models`，讓 CLI 在自己的鎖底下續期。細節見[參考文件](docs/REFERENCE.md#grok-build-family)。
+
 ## 怎麼挑帳號
 
 - **只在同一家裡挑。** 用哪一家由你決定，hook 只決定用哪個帳號。另一家的額度只當建議附上。
@@ -138,9 +159,9 @@ Kimi 的短效登入預設自動續期，讀寫 `<dir>/credentials/kimi-code.jso
 - 它會讀每個帳號的登入 token，只送到該廠商自己的端點，也不送任何遙測資料。
 - 只有在 `[families.claude]` 設 `refresh_logins = true` 時（預設關閉）：Claude 帳號的登入過期了（帳號一直閒置）、而且那個目錄沒有在跑的 Claude Code 程序時，quota-router 會在背景另開一個程序，像 Claude Code 自己那樣用 refresh token 更新登入，再寫回原本讀出來的鑰匙圈項目或 `.credentials.json`。不這樣做的話，閒置帳號讀不到額度，就永遠不會被選到。Kimi 的續期則獨立設定、預設開啟，見上節。更新後的登入平常經由 stdin 交給 `security`；如果登入旁邊還存了好幾個 MCP 登入、長度超過上限，就會跟 Claude Code 一樣改放在命令列上，執行的那一下本機其他使用者看得到。Windows 存在認證管理員（Credential Manager）裡的登入不在處理範圍。在 `[families.claude]` 設 `refresh_logins = false`，或設 `QR_NO_REFRESH=1` 可以關掉；細節見 [REFERENCE.md › Renewing an expired Claude login](docs/REFERENCE.md#renewing-an-expired-claude-login)。
 - 即時查 Codex 失敗、而且本機數字已經超過兩小時，它會在背景用那個帳號跑一次很小的 `codex exec` 來更新數字。設 `QR_NO_PROBE=1` 可以關掉。
-- hook 在每條 Bash 指令執行前都會跑，而且可以改寫指令。它會加上帳號前綴、補上省略的 agy／Kimi 預設模型，或擋下整條指令。前幾次派工之後，請看一下 `qr decisions`。
+- hook 在每條 Bash 指令執行前都會跑，而且可以改寫指令。它會加上帳號前綴、補上省略的 agy／Kimi／Grok 預設模型，或擋下整條指令。前幾次派工之後，請看一下 `qr decisions`。
 - 在它自己的狀態目錄之外，除了設定允許的登入續期，它還會寫入：你安裝進去的每個 `settings.json` 裡的 hook 設定，和 `claude` 啟動器檔案。
-- 能改設定檔的人就能把 Claude／Codex token 導去別的地方（Kimi 限自家主機），所以請像保護 `settings.json` 一樣保護它。
+- 能改設定檔的人就能把 Claude／Codex token 導去別的地方（Kimi、Grok 限自家主機），所以請像保護 `settings.json` 一樣保護它。
 
 ## 實際最容易踩到的限制
 

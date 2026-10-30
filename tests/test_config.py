@@ -50,6 +50,10 @@ default_model = "gemini-4-argon-high"
 default_model = "kimi-code/k3.1-pro-highspeed"
 refresh_logins = true
 
+[families.grok]
+default_model = "grok-4.7"
+refresh_logins = true
+
 [launch]
 route_print = true
 
@@ -62,6 +66,7 @@ kimi_usage = "https://api.kimi.com/coding/v1/usages"
 kimi_profile = "https://api.kimi.com/coding/v1/me"
 kimi_token = "https://auth.kimi.com/api/oauth/token"
 kimi_token_fallback = "https://auth.kimi.ai/api/oauth/token"
+grok_billing = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 """ + CONFIG
 
 
@@ -109,7 +114,7 @@ def test_missing_file(home, monkeypatch):
     ('accounts = "claude"\n', "no accounts"),
     ('[[accounts]]\nkey = "a"\ndir = ""\n', 'accounts #1 is missing "family"'),
     ('[[accounts]]\nfamily = "claude"\ndir = ""\n', 'accounts #1 is missing "key"'),
-    ('[[accounts]]\nfamily = "gemini"\nkey = "a"\n', 'family must be "claude", "codex", "agy" or "kimi"'),
+    ('[[accounts]]\nfamily = "gemini"\nkey = "a"\n', 'family must be "claude", "codex", "agy", "kimi" or "grok"'),
     ('[[accounts]]\nfamily = "claude"\nkey = "a b"\n', "key may only contain"),
     ('[[accounts]]\nfamily = "claude"\nkey = "a"\ndir = 3\n', "dir must be a string"),
     ('[[accounts]]\nfamily = "claude"\nkey = "a"\ndir = "relative/path"\n', "dir must be absolute"),
@@ -198,6 +203,7 @@ def test_detect_accounts_prefills_from_existing_directories(home):
         {"family": "codex", "key": "codex-2", "dir": "~/.codex-b"},
         {"family": "codex", "key": "codex-3", "dir": "~/.codex-c"},
         {"family": "kimi", "key": "kimi-1", "dir": ""},
+        {"family": "grok", "key": "grok-1", "dir": ""},
     ]
 
 
@@ -207,7 +213,8 @@ def test_example_file_round_trips(home):
     cfg = config.parse_text(config.example())
     assert cfg.values == config.DEFAULTS
     assert [(a["family"], a["key"], a["raw_dir"]) for a in cfg.accounts] == [
-        ("claude", "claude-main", ""), ("claude", "claude-b", "~/.claude-b"), ("codex", "codex-1", ""), ("kimi", "kimi-1", "")]
+        ("claude", "claude-main", ""), ("claude", "claude-b", "~/.claude-b"), ("codex", "codex-1", ""), ("kimi", "kimi-1", ""),
+        ("grok", "grok-1", "")]
     assert cfg.warnings == []
 
 
@@ -225,7 +232,7 @@ def test_configure_applies_settings_to_the_router(write_config, home, monkeypatc
         assert (core.SCARCE, core.SCARCE_LABEL) == ("opus", "Opus")
         assert core.CLAUDE_ACCOUNTS == [{"key": "claude-main", "dir": None}, {"key": "claude-b", "dir": str(home / ".claude-b")}]
         assert core.CODEX_ACCOUNTS == [{"key": "codex-1", "dir": str(home / ".codex")}, {"key": "codex-2", "dir": str(home / ".codex-b")}]
-        assert core.DEFAULT_KEY == {"claude": "claude-main", "codex": "codex-1", "agy": None, "kimi": None}
+        assert core.DEFAULT_KEY == {"claude": "claude-main", "codex": "codex-1", "agy": None, "kimi": None, "grok": None}
         assert core.STATE == str(home / "state") and os.path.isdir(core.STATE)
         assert i18n.language() == "zh-TW"
         assert core.model_class(None) == "opus" and core.model_class("claude-opus-5") == "opus"
@@ -273,7 +280,8 @@ def test_endpoints_default_to_the_vendors_and_can_be_overridden(write_config):
                                   "kimi_usage": "https://api.kimi.com/coding/v1/usages",
                                   "kimi_profile": "https://api.kimi.com/coding/v1/me",
                                   "kimi_token": "https://auth.kimi.com/api/oauth/token",
-                                  "kimi_token_fallback": "https://auth.kimi.ai/api/oauth/token"}
+                                  "kimi_token_fallback": "https://auth.kimi.ai/api/oauth/token",
+                                  "grok_billing": "https://cli-chat-proxy.grok.com/v1/billing?format=credits"}
     finally:
         core.ENDPOINTS = previous
 
