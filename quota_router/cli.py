@@ -112,8 +112,8 @@ def main(argv=None):
         raise SystemExit(core.renewal_main(argv[1:]))
     if command == "model":
         core.configure(load_or_exit())
-        from . import codex_models
-        raise SystemExit(codex_models.main(argv[1:]))
+        from . import models
+        raise SystemExit(models.main(argv[1:]))
     if command == "refresh-kimi":
         core.configure(load_or_exit())
         from .kimi import refresh_main

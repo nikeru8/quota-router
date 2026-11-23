@@ -117,6 +117,12 @@ def configure(cfg):
         NOTIFY_FAILED_ATTEMPTS=cfg["notify.failed_attempts"],
         ENDPOINTS={name: cfg["endpoints." + name] for name in ENDPOINTS},
         SCARCE=scarce, SCARCE_LABEL=scarce.capitalize() if scarce else "")
+    # A default written as a line (`gemini-*-argon-high`, `kimi-code/k*-pro`, `grok-*`) means its newest listed
+    # model; when nothing is listed, nothing is added rather than a pattern the CLI would reject.
+    from . import models
+    for name, family in (("AGY_MODEL", "agy"), ("KIMI_MODEL", "kimi"), ("GROK_MODEL", "grok")):
+        if models.is_pattern(family, globals()[name]):
+            globals()[name] = models.resolve(family, globals()[name]) or ""
 
 
 def accounts(family):

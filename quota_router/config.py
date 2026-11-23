@@ -266,17 +266,17 @@ def parse(data, path="<memory>"):
             raise ValueError(f"general.language must be one of {', '.join(LANGUAGES)}, got {values['general.language']!r}")
         values["families.claude.scarce_model"] = values["families.claude.scarce_model"].strip().lower()
         values["families.agy.default_model"] = values["families.agy.default_model"].strip()
-        if not re.fullmatch(r"[A-Za-z0-9._-]*", values["families.agy.default_model"]):
+        if not re.fullmatch(r"[A-Za-z0-9._*-]*", values["families.agy.default_model"]):
             raise ValueError(f"families.agy.default_model may only contain letters, digits, '.', '_' and '-', "
                              f"got {values['families.agy.default_model']!r}")
         values["families.codex.default_model"] = values["families.codex.default_model"].strip()
-        if not re.fullmatch(r"[A-Za-z0-9._-]*", values["families.codex.default_model"]):
+        if not re.fullmatch(r"[A-Za-z0-9._*-]*", values["families.codex.default_model"]):
             raise ValueError("families.codex.default_model may only contain letters, digits, '.', '_' and '-'")
         values["families.kimi.default_model"] = values["families.kimi.default_model"].strip()
-        if not re.fullmatch(r"[A-Za-z0-9._/-]*", values["families.kimi.default_model"]):
+        if not re.fullmatch(r"[A-Za-z0-9._/*-]*", values["families.kimi.default_model"]):
             raise ValueError("families.kimi.default_model may only contain letters, digits, '.', '_', '/', '-'")
         values["families.grok.default_model"] = values["families.grok.default_model"].strip()
-        if not re.fullmatch(r"[A-Za-z0-9._/-]*", values["families.grok.default_model"]):
+        if not re.fullmatch(r"[A-Za-z0-9._/*-]*", values["families.grok.default_model"]):
             raise ValueError("families.grok.default_model may only contain letters, digits, '.', '_', '/', '-'")
         for name in DEFAULTS:
             if name.startswith("endpoints.kimi_"):
