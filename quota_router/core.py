@@ -17,6 +17,7 @@ CLAUDE_ACCOUNTS = []           # {"key", "dir"}; dir=None is the default locatio
 CODEX_ACCOUNTS = []
 KIMI_ACCOUNTS = []
 KIMI_MODEL = "kimi-code/k3.1-pro-highspeed"
+CODEX_MODEL = ""               # -m added to a `codex exec` that names none; sol/astra/terra/luna = newest of that line
 KIMI_REFRESH_LOGINS = True
 GROK_ACCOUNTS = []
 GROK_MODEL = ""                # -m added to a `grok -p` dispatch that names none ("" = leave it alone)
@@ -80,6 +81,7 @@ def configure(cfg):
         AGY_MODEL=cfg["families.agy.default_model"],
         KIMI_ACCOUNTS=[{"key": a["key"], "dir": a["dir"]} for a in cfg.family("kimi")],
         KIMI_MODEL=cfg["families.kimi.default_model"],
+        CODEX_MODEL=cfg["families.codex.default_model"],
         KIMI_REFRESH_LOGINS=cfg["families.kimi.refresh_logins"],
         GROK_ACCOUNTS=[{"key": a["key"], "dir": a["dir"]} for a in cfg.family("grok")],
         GROK_MODEL=cfg["families.grok.default_model"],

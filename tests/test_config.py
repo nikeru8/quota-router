@@ -46,6 +46,7 @@ refresh_logins = false
 [families.codex]
 refresh_logins = true
 refresh_before_hours = 24
+default_model = "astra"
 
 [families.agy]
 default_model = "gemini-4-argon-high"

@@ -10,7 +10,7 @@ Rules:
 """
 import glob, json, os, re, sys, time, shlex, threading
 
-from . import config, core as qr, platform_compat
+from . import codex_models, config, core as qr, platform_compat
 from .i18n import t
 
 
@@ -368,7 +368,9 @@ def find_dispatches(cmd):
                         res = {"last": True}
                     elif after:
                         res = {"id": raw_token(cmd, toks[idx + 1 + k + 2 + rest[k + 2:].index(after[0])])}
-                found.append({"fam": "codex", "pos": p, "seg": (s, e), "resume": res})
+                exec_tok = toks[idx + 1 + k]
+                found.append({"fam": "codex", "pos": p, "seg": (s, e), "resume": res,
+                              "word_end": exec_tok[0] + len(exec_tok[1])})
                 break
     unique = {}
     for dispatch in found:
@@ -655,6 +657,55 @@ def dispatch_model(cmd, dispatch):
     return (qr.model_class(None) if dynamic else qr.model_class(value)), written
 
 
+def codex_model(cmd, dispatch):
+    """(written, (start, end, value) | None) for the model of a `codex exec` dispatch, before or after `exec`.
+    `-c model=…` also counts as written; only a plain `-m`/`--model` value comes back with its span."""
+    ts = [tok for tok in tokens(opaque_substitutions(mask(cmd)), dispatch["pos"], dispatch["seg"][1])[1:]
+          if tok[0] + len(tok[1]) != dispatch["word_end"]]       # the `exec` word itself
+    written, span = False, None
+    i = 0
+    while i < len(ts):
+        p, word = ts[i]
+        if word == "--":
+            break
+        if word in ("-m", "--model") and i + 1 < len(ts):
+            q, value = ts[i + 1]
+            written, span = True, (q, q + len(value), cmd[q:q + len(value)])
+            i += 2
+            continue
+        if word.startswith("--model="):
+            q = p + len("--model=")
+            written, span = True, (q, p + len(word), cmd[q:p + len(word)])
+        elif word in ("-c", "--config") and i + 1 < len(ts) and re.match(r"""['"]?model\s*=""",
+                                                                         raw_token(cmd, ts[i + 1])):
+            written, span = True, None
+            i += 2
+            continue
+        elif word.startswith("-") and word in VALUE_FLAGS:
+            i += 2
+            continue
+        i += 1
+    return written, span
+
+
+# Adding a second model makes Codex exit with status 2, so a model is added only when nothing in the whole command
+# looks like one (or like a resume): `$(codex exec -m x)`, `2>&1 -m x`, `-mx`, `-cmodel=x`, arrays, `--config=model=x`.
+# Missing an addition is harmless; the account's own default (kept current by `qr model --sync`) applies.
+CODEX_MODEL_HINT = re.compile(r"""(?<![\w-])(?:-m|--model)(?![\w-])|(?<![\w-])-m\S|--model=|model\s*=|\bresume\b""")
+
+
+def codex_plain(cmd, dispatch, dispatches):
+    """True when this is the only Codex dispatch, its `exec` word is literal and stands alone, and no `--` comes before
+    it: only then do positions in the command text match what Bash will run."""
+    if sum(d["fam"] == "codex" for d in dispatches) != 1:
+        return False
+    end = dispatch["word_end"]
+    word = re.search(r"(\S+)$", cmd[:end])
+    if not word or word.group(1) not in ("exec", "e") or cmd[end:end + 1] not in ("", " ", "\t", "\n"):
+        return False
+    return not re.search(r"(?<!\S)--(?!\S)", cmd[dispatch["pos"]:end])
+
+
 def agy_model(cmd, dispatch):
     """(bucket, written) for an `agy -p` dispatch. dispatch["model_value"] keeps the model named, for the notes."""
     scan = opaque_substitutions(mask(cmd))
@@ -912,7 +963,7 @@ def prepare_decision(cmd, cwd, lead_key, session):
 
 def decide_prepared(cmd, ds, lead_key, session, rows_cache, resumes, explicit, leases, records):
     """Pure decision logic under the lease lock; on a deny none of this command's reservations are saved."""
-    notes, inserts, pending = [], [], []
+    notes, inserts, pending, removals = [], [], [], []
     selected = None
     primary = ds[0]
 
@@ -970,6 +1021,21 @@ def decide_prepared(cmd, ds, lead_key, session, rows_cache, resumes, explicit, l
         fam = d["fam"]
         label = qr.LABELS[fam]
         ex = explicit[d["pos"]]
+        if fam == "codex" and not d["resume"]:
+            written, span = codex_model(cmd, d)
+            plain = codex_plain(cmd, d, ds)
+            if span and span[2] in codex_models.ALIASES and plain and "<<" not in cmd and \
+                    "\\" not in cmd[d["pos"]:span[1]]:
+                slug = codex_models.resolve(span[2])
+                if slug != span[2]:
+                    inserts.append((span[0], slug))
+                    removals.append((span[0], span[1]))
+                    notes.append(t("note.codex_model_resolved", alias=span[2], model=slug))
+            elif not written and qr.CODEX_MODEL and plain and not CODEX_MODEL_HINT.search(cmd):
+                slug = codex_models.resolve(qr.CODEX_MODEL)
+                if slug not in codex_models.ALIASES:
+                    inserts.append((d["word_end"], f" -m {slug}"))
+                    notes.append(t("note.codex_model_added", model=slug))
         if fam == "kimi" and not d["model_written"] and qr.KIMI_MODEL:
             inserts.append((d["word_end"], f" -m {qr.KIMI_MODEL}"))
             notes.append(t("note.kimi_model_added", model=qr.KIMI_MODEL))
@@ -1066,8 +1132,11 @@ def decide_prepared(cmd, ds, lead_key, session, rows_cache, resumes, explicit, l
         records.append((fam, "auto", best, "dispatched with a warning" if warn else "", d["model"]))
     notes.extend(context())
     new = cmd
+    for start, end in removals:          # an alias replaced in place: drop its text, the slug is inserted at start
+        new = new[:start] + "\0" * (end - start) + new[end:]
     for pos, text in sorted(inserts, reverse=True):
         new = new[:pos] + text + new[pos:]
+    new = new.replace("\0", "")
     return {"command": new if new != cmd else None, "notes": notes}
 
 

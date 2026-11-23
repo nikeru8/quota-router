@@ -31,6 +31,7 @@ EN = {
     # ---- Kimi Code ----
     "report.kimi_no_start": "; cycle start not provided, so monthly pace is not estimated",
     'setting.families.kimi.default_model': 'the -m added to a kimi -p / --prompt dispatch without -m / --model (empty = add nothing)',
+    'setting.families.codex.default_model': 'the -m added to a codex exec without a model; sol / astra / terra / luna mean the newest of that line (empty = add nothing)',
     'setting.families.kimi.refresh_logins': 'renew expiring Kimi logins and atomically save the CLI credentials; QR_NO_REFRESH=1 disables this',
     'setting.endpoints.kimi_usage': 'Kimi usage URL (approved Kimi HTTPS hosts only)',
     'setting.endpoints.kimi_profile': 'Kimi profile URL (approved Kimi HTTPS hosts only)',
@@ -41,6 +42,8 @@ EN = {
     'err.kimi_changed': 'Kimi login changed during the query; quota unknown',
     'note.kimi_refresh_started': 'Kimi login renewal is running in the background; quota is temporarily unknown',
     'note.kimi_model_added': '[quota-router] This Kimi dispatch named no model; added -m {model}.',
+    'note.codex_model_added': '[quota-router] This Codex dispatch named no model; added -m {model} (newest of the configured line).',
+    'note.codex_model_resolved': '[quota-router] -m {alias} means the newest {alias}: {model}.',
     'reason.monthly': 'monthly {left:.0f}% left (resets {when})',
     'blocked.monthly_out': 'monthly quota used up',
     'blocked.monthly_below_floor': 'Only {left:.0f}% of monthly quota remains, below the {floor}% minimum',
@@ -535,6 +538,7 @@ ZH_TW = {
     # ---- Kimi Code ----
     "report.kimi_no_start": "；未提供月窗起點，不推估消耗速度",
     'setting.families.kimi.default_model': 'kimi -p／--prompt 沒寫 -m／--model 時補上的模型（空字串表示不補）',
+    'setting.families.codex.default_model': 'codex exec 沒寫模型時補上的 -m；寫 sol／astra／terra／luna 代表該系列最新版（空字串表示不補）',
     'setting.families.kimi.refresh_logins': '續期即將到期的 Kimi 登入並原子寫回 CLI 憑證；QR_NO_REFRESH=1 可關閉',
     'setting.endpoints.kimi_usage': 'Kimi 用量網址（限 Kimi 自家 HTTPS 主機）',
     'setting.endpoints.kimi_profile': 'Kimi 帳號資料網址（限 Kimi 自家 HTTPS 主機）',
@@ -545,6 +549,8 @@ ZH_TW = {
     'err.kimi_changed': '查詢期間 Kimi 登入已變更，額度未知',
     'note.kimi_refresh_started': 'Kimi 正在背景續期登入，額度暫時未知',
     'note.kimi_model_added': '[帳號分流] 這條 Kimi 沒寫模型，已補上 -m {model}。',
+    'note.codex_model_added': '[帳號分流] 這條 Codex 沒寫模型，已補上最新版 -m {model}。',
+    'note.codex_model_resolved': '[帳號分流] -m {alias} 換成最新版 {model}。',
     'reason.monthly': '月剩 {left:.0f}%（{when}重置）',
     'blocked.monthly_out': '月額度用完',
     'blocked.monthly_below_floor': '月剩只剩 {left:.0f}%，低於 {floor}% 底線不派',

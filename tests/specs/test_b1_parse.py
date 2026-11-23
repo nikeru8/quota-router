@@ -37,7 +37,7 @@ negative = [
 ] + [f'claude {sub} -p x' for sub in h.CLAUDE_SUBCOMMANDS]
 for cmd in positive:
     ds = h.find_dispatches(cmd)
-    check('認得派工 ' + cmd, len(ds) == 1 and set(ds[0]) == {'fam', 'pos', 'seg', 'resume'}, ds)
+    check('認得派工 ' + cmd, len(ds) == 1 and set(ds[0]) - {'word_end'} == {'fam', 'pos', 'seg', 'resume'}, ds)
 for cmd in negative:
     check('不把參數當派工 ' + cmd, not h.find_dispatches(cmd))
 

@@ -46,6 +46,7 @@ SETTINGS = [
     ("families.claude", "refresh_logins", False),
     ("families.codex", "refresh_logins", False),
     ("families.codex", "refresh_before_hours", 72),
+    ("families.codex", "default_model", ""),
     ("families.agy", "default_model", ""),
     ("families.kimi", "default_model", "kimi-code/k3.1-pro-highspeed"),
     ("families.kimi", "refresh_logins", True),
@@ -268,6 +269,9 @@ def parse(data, path="<memory>"):
         if not re.fullmatch(r"[A-Za-z0-9._-]*", values["families.agy.default_model"]):
             raise ValueError(f"families.agy.default_model may only contain letters, digits, '.', '_' and '-', "
                              f"got {values['families.agy.default_model']!r}")
+        values["families.codex.default_model"] = values["families.codex.default_model"].strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]*", values["families.codex.default_model"]):
+            raise ValueError("families.codex.default_model may only contain letters, digits, '.', '_' and '-'")
         values["families.kimi.default_model"] = values["families.kimi.default_model"].strip()
         if not re.fullmatch(r"[A-Za-z0-9._/-]*", values["families.kimi.default_model"]):
             raise ValueError("families.kimi.default_model may only contain letters, digits, '.', '_', '/', '-'")

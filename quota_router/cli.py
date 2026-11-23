@@ -110,6 +110,10 @@ def main(argv=None):
         # the background login renewal a reading started; not a user command (see core.renewal_main).
         core.configure(load_or_exit())
         raise SystemExit(core.renewal_main(argv[1:]))
+    if command == "model":
+        core.configure(load_or_exit())
+        from . import codex_models
+        raise SystemExit(codex_models.main(argv[1:]))
     if command == "refresh-kimi":
         core.configure(load_or_exit())
         from .kimi import refresh_main
