@@ -19,7 +19,7 @@ import tempfile
 
 FAMILIES = ("codex", "grok", "kimi", "agy")
 CODEX_ALIASES = ("sol", "astra", "terra", "luna")
-VERSION = r"(\d+(?:\.\d+)*)"
+VERSION = r"(\d+(?:[.-]\d+)*)"          # 6.2, 4, and agy's Claude style 5-5
 AGY_LIST = "agy-models.txt"
 
 
@@ -34,14 +34,14 @@ def is_pattern(family, value):
 
 def pattern_of(slug):
     """`gpt-6.1-sol` → `gpt-*-sol`, `kimi-code/k3.1-pro` → `kimi-code/k*-pro`; None when it has no version."""
-    m = re.search(r"(?<![\d.])\d+(?:\.\d+)*(?![\d.])", slug or "")
+    m = re.search(r"(?<![\d.])\d+(?:\.\d+)*(?:-\d+(?![a-z]))*(?![\d.])", slug or "")
     return slug[:m.start()] + "*" + slug[m.end():] if m else None
 
 
 def _version(pat, slug):
     regex = re.escape(pat).replace(r"\*", VERSION, 1)
     m = re.fullmatch(regex, slug)
-    return tuple(int(x) for x in m.group(1).split(".")) if m else None
+    return tuple(int(x) for x in re.split(r"[.-]", m.group(1))) if m else None
 
 
 def homes(family):

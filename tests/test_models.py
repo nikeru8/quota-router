@@ -48,6 +48,16 @@ def test_pattern_of_replaces_the_version_only():
     assert models.pattern_of("gemini-4-argon-high") == "gemini-*-argon-high"
     assert models.pattern_of("grok-4.7") == "grok-*"
     assert models.pattern_of("gpt-reserve") is None
+    assert models.pattern_of("claude-opus-5-5-high") == "claude-opus-*-high"
+
+
+def test_agy_claude_versions_with_dashes(router, write_config):
+    router.core.configure(config.load(write_config(GROK_KIMI_AGY)))
+    models.refresh_agy(fake_agy(AGY_OUTPUT + "claude-opus-5-10-high\tx\nclaude-opus-6-high\tx\nclaude-opus-6-low\tx\n"))
+    assert models.latest("agy", "claude-opus-*-high") == "claude-opus-6-high"
+    models.refresh_agy(fake_agy(AGY_OUTPUT + "claude-opus-5-10-high\tx\n"))
+    assert models.latest("agy", "claude-opus-*-high") == "claude-opus-5-10-high"
+    assert models.latest("agy", "gemini-*-argon-high") == "gemini-4-argon-high"
 
 
 def test_grok_line_ignores_variants(tmp_path):
