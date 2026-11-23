@@ -526,3 +526,20 @@ def test_doctor_runs_a_hand_written_entry_too(home, quiet_machine, capsys):
     lines = doctor_lines(capsys)
     assert f"OK    hook present in {path} as a hand-written `qr hook` entry" in lines
     assert f"OK    hook command in {path} starts and answers" in lines
+
+
+def test_doctor_does_not_call_an_agy_login_in_the_keyring_missing(home, write_config, quiet_machine, monkeypatch, capsys):
+    """agy keeps the login in the OS keyring and writes its token file only as a fallback (2026-11-18)."""
+    from quota_router import install
+    from conftest import CONFIG
+    monkeypatch.setattr(install, "check_lock", lambda state: (True, ""))
+    monkeypatch.setenv("QR_STATE", str(home / "state"))
+    write_config(CONFIG + '\n[[accounts]]\nfamily = "agy"\nkey = "agy-1"\ndir = ""\n')
+    folder = home / ".gemini" / "antigravity-cli"
+    assert any(line.startswith("WARN  agy agy-1: directory ") for line in doctor_lines(capsys))      # agy never ran here
+    folder.mkdir(parents=True)
+    token = folder / "antigravity-oauth-token"
+    assert (f"OK    agy agy-1: no login file at {token}; agy normally keeps the login in the system keyring "
+            "(not checked)") in doctor_lines(capsys)
+    token.write_text("SECRET-CONTENT")
+    assert f"OK    agy agy-1: login file present at {token}" in doctor_lines(capsys)

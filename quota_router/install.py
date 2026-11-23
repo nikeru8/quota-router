@@ -760,8 +760,13 @@ def doctor(argv):
         else:
             credentials = os.path.join(directory, "antigravity-oauth-token" if account["family"] == "agy" else
                                        "credentials/kimi-code.json" if account["family"] == "kimi" else "auth.json")
-            line(os.path.isfile(credentials), t("doctor.login_file", account=label, path=credentials)
-                 if os.path.isfile(credentials) else t("doctor.login_missing", account=label, path=credentials))
+            if os.path.isfile(credentials):
+                line(True, t("doctor.login_file", account=label, path=credentials))
+            elif account["family"] == "agy":
+                # agy keeps the login in the OS keyring where there is one; the token file is only its fallback.
+                line(True, t("doctor.login_keyring", account=label, path=credentials))
+            else:
+                line(False, t("doctor.login_missing", account=label, path=credentials))
     for directory in hook_dirs:
         status, hook = installed_state(directory)
         target = settings_path(directory)

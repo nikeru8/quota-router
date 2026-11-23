@@ -1519,30 +1519,43 @@ def cooldown(c, error):
     c.update(failures=failures, retry_at=now() + delay)
 
 
+# a claim on the one query that may run for an account: until when, whose, and (agy) the login it started with.
+INFLIGHT_FIELDS = ("inflight_until", "inflight_owner", "inflight_sig")
+
+
 def fetched(reading):
     """A missing or corrupt timestamp counts as oldest, so the next query repairs it."""
     value = reading.get("fetched")
     return value if isinstance(value, (int, float)) and math.isfinite(value) else 0
 
 
-def merge_cache(key, before, reading, owner=None, strict=False):
+def merge_cache(key, before, reading, owner=None, strict=False, report=None):
     """Merge only what this call changed; older usage never overwrites newer, unknown fields are kept as they are.
-    `strict`: only while `owner` still holds the claim (a released claim counts as lost), and only under the lock."""
+    `strict`: only while `owner` still holds the claim (a released claim counts as lost), and only under the lock.
+    `report`, a dict, gets "result": what became of the reading, decided here under the lock and not guessed from
+    the entry that comes back: "stored", "claim" (another call holds, took or released the claim), "lock", "login"
+    (the entry belongs to another login by now), "newer" (the entry already has later numbers) or "unsaved"."""
+    def told(result):
+        if report is not None:
+            report["result"] = result
     with state_lock("cache", timeout=10 if strict else 2) as locked:
         latest = load("cache.json", {})
         current = latest.get(key, {})
         if owner and current.get("inflight_owner") not in ((owner,) if strict else (None, owner)):
+            told("claim")
             return current
         if strict and not locked:
+            told("lock")
             return current
         if any(current.get(field) and before.get(field) and current[field] != before[field]
                for field in ("token_sig", "account_sig")):
             if owner and current.get("inflight_owner") == owner:
                 # this call's claim is released all the same, so the new login is read at once.
-                current.pop("inflight_until", None)
-                current.pop("inflight_owner", None)
+                for field in INFLIGHT_FIELDS:
+                    current.pop(field, None)
                 latest[key] = current
                 save("cache.json", latest)
+            told("login")
             return current
         patch = {k: v for k, v in reading.items() if k not in before or before[k] != v}
         older = fetched(reading) < fetched(current)
@@ -1554,10 +1567,10 @@ def merge_cache(key, before, reading, owner=None, strict=False):
             if not older and k in before and k not in reading and current.get(k) == before[k]:
                 current.pop(k, None)
         if owner:
-            current.pop("inflight_until", None)
-            current.pop("inflight_owner", None)
+            for field in INFLIGHT_FIELDS:
+                current.pop(field, None)
         latest[key] = current
-        save("cache.json", latest)
+        told("stored" if save("cache.json", latest) and not older else "newer" if older else "unsaved")
     return current
 
 
@@ -1971,7 +1984,7 @@ def agy_reading(acc, cache=None, force=False):
         sig = agy_identity(acc)
         if sig and sig != c.get("account_sig"):
             for field in ("usage", "fetched", "live", "error", "no_login", "retry_at", "failures",
-                          "inflight_until", "inflight_owner", "reset_checked"):
+                          *INFLIGHT_FIELDS, "reset_checked"):
                 c.pop(field, None)
             c.update(account_sig=sig, token_changed_at=now())
         cooling = c.get("retry_at", 0) > now()
@@ -1982,7 +1995,9 @@ def agy_reading(acc, cache=None, force=False):
         # A passed reset needs no marker of its own: a reading taken after it is not due any more, a failed one cools down.
         start = locked and (force or stale or due) and not (cooling or flying)
         if start:
-            c.update(inflight_until=now() + AGY_QUERY_SEC + 15, inflight_owner=owner)
+            # inflight_sig: the token file as it is now, None included. account_sig is not that: without a file
+            # it keeps describing the login of an earlier reading.
+            c.update(inflight_until=now() + AGY_QUERY_SEC + 15, inflight_owner=owner, inflight_sig=sig)
         if locked and (start or c != latest.get(key)):
             latest[key] = c
             save("cache.json", latest)
@@ -1994,8 +2009,8 @@ def agy_reading(acc, cache=None, force=False):
             with state_lock("cache") as released:   # release the claim so the next reading can try again
                 latest = load("cache.json", {})
                 if released and latest.get(key, {}).get("inflight_owner") == owner:
-                    latest[key].pop("inflight_until", None)
-                    latest[key].pop("inflight_owner", None)
+                    for field in INFLIGHT_FIELDS:
+                        latest[key].pop(field, None)
                     save("cache.json", latest)
         c = copy.deepcopy(load("cache.json", {}).get(key, c))
         if "fetched" in c:
@@ -2018,7 +2033,7 @@ def agy_refresh_main(argv):
     if acc is None or len(argv) < 2:
         return 2
     try:
-        outcome = "ok" if agy_query(acc, argv[1]).get("live") else "failed"
+        outcome = agy_query_outcome(acc, argv[1])[1]
     except BaseException as e:            # anything at all: one structured line, never a traceback
         log_error("usage-query", e, acc["key"])
         outcome = "failed"
@@ -2029,14 +2044,26 @@ def agy_refresh_main(argv):
 def agy_query(acc, owner):
     """Run `agy -p /usage` once for the claim `owner` holds and merge the result into the cache. A claim another
     process took over in the meantime wins: this result is then dropped (merge_cache)."""
+    return agy_query_outcome(acc, owner)[0]
+
+
+def agy_query_outcome(acc, owner):
+    """agy_query() and what became of the result, for refresh-<key>.log: "ok" (new numbers stored), "failed" (agy
+    gave none; said also when that failure itself could not be stored), "unsaved" (the state file could not be
+    written) or "dropped-" + why the numbers were kept out: "login" (the login changed meanwhile; it comes before
+    "failed", a failure under a changing login says nothing about either), "claim" (another query holds or took the
+    claim), "lock", "newer". Decided by merge_cache(), never by the cache still holding an older live reading."""
     key = acc["key"]
     with state_lock("cache", timeout=10) as locked:
         c = copy.deepcopy(load("cache.json", {}).get(key, {}))
     if "fetched" in c:
         c["fetched"] = fetched(c)
     if not locked or c.get("inflight_owner") != owner:
-        return c
-    sig = c.get("account_sig")
+        return c, "dropped-claim" if locked else "dropped-lock"
+    # the login the claim started with. A claim made before inflight_sig existed (a query under way during the
+    # upgrade) does not say: the cached fingerprint is an earlier reading's, so it proves nothing about the start.
+    unknown_start = "inflight_sig" not in c
+    sig = c.get("inflight_sig")
     before = copy.deepcopy(c)
     c.pop("no_login", None)   # a failure decides afresh whether this is a login problem
     success = False
@@ -2069,14 +2096,28 @@ def agy_query(acc, owner):
         else:
             cooldown(c, e)
     # the login changed during the query: the result belongs to the old login and is not stored under the new one.
-    if agy_identity(acc) != sig:
+    # A token file that is gone at the end is "cannot tell", not another login: agy keeps the login in the OS
+    # keyring where there is one and writes the file only as a fallback. So a change is a fingerprint that is there
+    # at the end and differs from the one the claim started with; a file that appears meanwhile is one too, and so
+    # is any file when the start is not known (kept out once, the next query is claimed with its start recorded).
+    after = agy_identity(acc)
+    login_changed = after is not None and (unknown_start or after != sig)
+    if login_changed:
         failure = {k: c[k] for k in ("retry_at", "failures") if k in c} if not success else {}
-        c, success = dict(before, **failure), False
+        c, queried = dict(before, **failure), False
+    else:
+        queried = success
     # strict: a query whose claim expired and was taken over (or already released) must not overwrite the newer one.
-    c = merge_cache(key, before, c, owner, strict=True)
-    if success:
+    report = {}
+    c = merge_cache(key, before, c, owner, strict=True, report=report)
+    result = report.get("result", "unsaved")
+    if queried and result == "stored":
         quiet_call(observe_reading, "agy", key, c)
-    return c
+    if login_changed or result == "login":
+        return c, "dropped-login"
+    if not success:
+        return c, "failed"
+    return c, {"stored": "ok", "unsaved": "unsaved"}.get(result, "dropped-" + result)
 
 
 def parse_kimi_usage(payload):

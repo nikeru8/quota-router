@@ -398,3 +398,135 @@ def test_without_agy_or_a_login_a_passed_reset_is_not_queried_on_every_reading(r
     for _ in range(3):
         core.agy_reading(core.AGY_ACCOUNTS[0], {})
     assert len(runs) == 1
+
+
+# ---- 2026-11-18: agy keeps its login in the OS keyring; the token file is only its fallback ----
+def test_a_login_kept_outside_the_token_file_still_stores_the_reading(router, write_config, monkeypatch):
+    """The cache holds the fingerprint of a token file that is gone since agy moved the login to the OS keyring.
+    No file is "cannot tell", not "another login": for five days every reading was dropped as the old login's."""
+    core = configured(router, write_config)
+    monkeypatch.setattr(core.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, USAGE_TEXT, ""))
+    seed(core, "agy-1", dict(reading_with(core, 72, age=5 * 86400), live=True, account_sig=core.fingerprint("token-a")))
+    reading = core.agy_reading(core.AGY_ACCOUNTS[0], {})
+    assert reading["usage"]["seven_day"]["used"] == 27 and core.now() - reading["fetched"] < 60
+    assert "inflight_owner" not in core.load("cache.json", {})["agy-1"]
+
+
+def test_a_token_file_that_goes_away_during_the_query_does_not_drop_the_result(router, write_config, monkeypatch):
+    core = configured(router, write_config)
+    login(router.home, "token-a")
+
+    def run(argv, **kw):
+        (router.home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").unlink()   # moved to the keyring
+        return subprocess.CompletedProcess(argv, 0, USAGE_TEXT, "")
+    monkeypatch.setattr(core.subprocess, "run", run)
+    assert core.agy_reading(core.AGY_ACCOUNTS[0], {})["usage"]["seven_day"]["used"] == 27
+
+
+def test_a_token_file_that_appears_during_the_query_still_keeps_the_result_out(router, write_config, monkeypatch):
+    core = configured(router, write_config)
+
+    def run(argv, **kw):
+        login(router.home, "token-b")                    # no file when the query started: whose numbers are these?
+        return subprocess.CompletedProcess(argv, 0, USAGE_TEXT, "")
+    monkeypatch.setattr(core.subprocess, "run", run)
+    assert not core.agy_reading(core.AGY_ACCOUNTS[0], {}).get("usage")
+
+
+def refresh_line(core, capsys):
+    capsys.readouterr()
+    assert core.agy_refresh_main(["agy-1", "me"]) == 0
+    return capsys.readouterr().out.rstrip().rsplit(" ", 1)[-1]
+
+
+def test_the_refresh_log_says_dropped_when_nothing_was_stored(router, write_config, monkeypatch, capsys):
+    """It said "ok" whenever the cache still held an older live reading, so 268 dropped queries looked like successes."""
+    core = configured(router, write_config)
+    monkeypatch.setattr(core.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, USAGE_TEXT, ""))
+    old = dict(reading_with(core, 89, age=3600), live=True)
+    seed(core, "agy-1", dict(old, inflight_owner="someone-else", inflight_until=core.now() + 60))
+    assert refresh_line(core, capsys) == "dropped-claim"
+
+    login(router.home, "token-a")
+    seed(core, "agy-1", dict(old, account_sig=core.fingerprint("token-a"), inflight_owner="me", inflight_until=core.now() + 60))
+
+    def run(argv, **kw):
+        login(router.home, "token-b")
+        return subprocess.CompletedProcess(argv, 0, USAGE_TEXT, "")
+    monkeypatch.setattr(core.subprocess, "run", run)
+    assert refresh_line(core, capsys) == "dropped-login"
+    assert core.load("cache.json", {})["agy-1"]["usage"]["seven_day"]["used"] == 11
+
+
+def test_the_refresh_log_says_failed_when_agy_prints_no_quota(router, write_config, monkeypatch, capsys):
+    core = configured(router, write_config)
+    monkeypatch.setattr(core.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "nothing useful", ""))
+    seed(core, "agy-1", dict(reading_with(core, 89, age=3600), live=True, inflight_owner="me", inflight_until=core.now() + 60))
+    assert refresh_line(core, capsys) == "failed"
+
+
+# ---- findings of the red-team review of that fix ----
+def test_a_file_that_comes_back_matching_the_old_fingerprint_is_still_a_change(router, write_config, monkeypatch):
+    """The fingerprint in the cache describes an earlier reading. The login this query started with had no file, so
+    a file that appears while it runs is a change, also when it happens to match that old fingerprint."""
+    core = configured(router, write_config)
+    seed(core, "agy-1", dict(reading_with(core, 89, age=3600), live=True, account_sig=core.fingerprint("token-a")))
+
+    def run(argv, **kw):
+        login(router.home, "token-a")
+        return subprocess.CompletedProcess(argv, 0, USAGE_TEXT, "")
+    monkeypatch.setattr(core.subprocess, "run", run)
+    assert core.agy_reading(core.AGY_ACCOUNTS[0], {})["usage"]["seven_day"]["used"] == 11       # kept out
+    again = core.agy_reading(core.AGY_ACCOUNTS[0], {}, force=True)      # now the query starts and ends with the file
+    assert again["usage"]["seven_day"]["used"] == 27
+    assert not {"inflight_owner", "inflight_until", "inflight_sig"} & set(core.load("cache.json", {})["agy-1"])
+
+
+def test_the_refresh_log_is_not_fooled_by_equal_numbers_or_a_write_that_failed(router, write_config, monkeypatch, capsys):
+    core = configured(router, write_config)
+    old = dict(reading_with(core, 89, age=3600), live=True)
+    observed = []
+    monkeypatch.setattr(core, "observe_reading", lambda *args: observed.append(args))
+    frozen = core.now()
+    monkeypatch.setattr(core, "now", lambda: frozen)
+
+    def taken_over(argv, **kw):       # another query stores the very same numbers at the same moment and releases
+        seed(core, "agy-1", {"usage": core.parse_agy_usage(USAGE_TEXT), "fetched": frozen, "live": True})
+        return subprocess.CompletedProcess(argv, 0, USAGE_TEXT, "")
+    seed(core, "agy-1", dict(old, inflight_owner="me", inflight_until=frozen + 60))
+    monkeypatch.setattr(core.subprocess, "run", taken_over)
+    assert refresh_line(core, capsys) == "dropped-claim" and not observed
+
+    def disk_full(argv, **kw):
+        monkeypatch.setattr(core, "save", lambda name, data: False)
+        return subprocess.CompletedProcess(argv, 0, USAGE_TEXT, "")
+    seed(core, "agy-1", dict(old, inflight_owner="me", inflight_until=frozen + 60))
+    monkeypatch.setattr(core.subprocess, "run", disk_full)
+    assert refresh_line(core, capsys) == "unsaved" and not observed
+    assert core.load("cache.json", {})["agy-1"]["usage"]["seven_day"]["used"] == 11
+
+
+def test_a_stored_reading_is_observed_once(router, write_config, monkeypatch, capsys):
+    core = configured(router, write_config)
+    observed = []
+    monkeypatch.setattr(core, "observe_reading", lambda *args: observed.append(args[:2]))
+    monkeypatch.setattr(core.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, USAGE_TEXT, ""))
+    seed(core, "agy-1", {"inflight_owner": "me", "inflight_until": core.now() + 60})
+    assert refresh_line(core, capsys) == "ok" and observed == [("agy", "agy-1")]
+
+
+# ---- finding of the second review ----
+def test_a_claim_from_before_the_upgrade_proves_nothing_about_its_start(router, write_config, monkeypatch, capsys):
+    """A claim without inflight_sig was made by the previous version. Was there a token file when it started? The
+    cached fingerprint cannot say, so a file at the end keeps the result out once; without one it is stored."""
+    core = configured(router, write_config)
+    monkeypatch.setattr(core.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, USAGE_TEXT, ""))
+    old = dict(reading_with(core, 89, age=3600), live=True, account_sig=core.fingerprint("token-a"))
+    claim = dict(old, inflight_owner="me", inflight_until=core.now() + 60)
+    seed(core, "agy-1", claim)
+    assert refresh_line(core, capsys) == "ok"                       # no file at the end: cannot tell, stored
+    login(router.home, "token-a")
+    seed(core, "agy-1", claim)
+    assert refresh_line(core, capsys) == "dropped-login"            # the same fingerprint as the cache, and still out
+    assert core.load("cache.json", {})["agy-1"]["usage"]["seven_day"]["used"] == 11
+    assert core.agy_reading(core.AGY_ACCOUNTS[0], {}, force=True)["usage"]["seven_day"]["used"] == 27   # the next one
