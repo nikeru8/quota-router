@@ -783,7 +783,7 @@ quota-router：派子代理前問「現在該用哪個帳號」。
     "hint.why_busy": "已有 {busy} 個任務",
     "hint.why_unknown": "週額度未知",
     "hint.why_low": "只剩 {left:.0f}%",
-    "hint.cross_idle": "💡 {them} 滿血閒置（{who} {left:.0f}%、跑 0），而 {me} 這邊選到的 {mine_who} {why}。家族中立任務（審核、掃描、對照、摘要）可改寫 {verb} 派過去。",
+    "hint.cross_idle": "💡 {them} 滿血閒置（{who} {left:.0f}%、跑 0），而 {me} 這邊選到的 {mine_who} {why}。這件事若沒有品質上非用這家不可，建議改寫 {verb} 派過去。",
     "hint.expiring": "💡 {who}{label} 預定 {hours:.1f} 小時後重置，還剩 {left:g}%，不用就作廢。{task}",
     "hint.expiring_scarce_label": " {model} 專屬週窗",
     "hint.expiring_task_scarce": "要用 {model} 的派工可以改派過去。",

@@ -2856,6 +2856,10 @@ def cross_hint(family, rows, force=False, best=None, orows=None):
     in between: a weekly window of the other family expires within 24 hours with at least 30% left;
     2. any account of the other family has weekly ≥ CROSS_IDLE_OTHER with nothing running or just sent, while the one picked here has ≥ CROSS_BUSY_MINE jobs or at most half that quota."""
     ok = [r for r in rows if not r["blocked"] and r["wk_left"] is not None]
+    if LEAD_LAST_RESORT:
+        # the lead only takes a dispatch when nobody else can, so its quota is not what this dispatch will land on:
+        # counting it made "this family's best" look roomy while the accounts that do the work were nearly out.
+        ok = [r for r in ok if not r.get("is_lead")] or ok
     mine_row = best if best is not None else (max(ok, key=lambda r: r["wk_left"]) if ok else None)
     mine = max((r["wk_left"] for r in ok), default=0)
     if orows is None:

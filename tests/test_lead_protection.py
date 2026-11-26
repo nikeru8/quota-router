@@ -97,3 +97,36 @@ def test_other_blocks_are_not_overwritten_by_refresh(router):
     assert weekly_out
     router.core.refresh_busy(rows, [])
     assert b["blocked"] == weekly_out
+
+
+def test_cross_family_hint_ignores_a_roomy_lead_that_is_only_the_last_resort(router, write_config):
+    """2026-11-26: the lead sat at 63% and was the last resort, the two accounts taking the work had 27% and 16%, and
+    Codex sat at 89%. The hint compared 63% with the 30% threshold and stayed silent for a whole day."""
+    from quota_router import config
+    core = router.core
+    write_config("[general]\nlead_last_resort = true\n" + CONFIG)
+    core.configure(config.load())
+    router.usage["claude-main"].update(reading(weekly=63, five_hour=100))
+    router.usage["claude-b"].update(reading(weekly=27, five_hour=100))
+    rows = rows_for(router)
+    best, _, _ = core.choose("claude", rows)
+    assert best["key"] == "claude-b"
+    other = [{"family": "codex", "key": "codex-1", "blocked": None, "wk_left": 89, "busy": 0, "jobs": 0, "n_lease": 0,
+              "notes": [], "email": None}]
+    hint = core.cross_hint("claude", rows, best=best, orows=other)
+    assert hint and "27%" in hint and "89%" in hint and "63%" not in hint
+
+    router.usage["claude-b"].update(reading(weekly=0, five_hour=100))        # nobody but the lead can take it now
+    rows = rows_for(router)
+    best, _, _ = core.choose("claude", rows)
+    assert best["key"] == "claude-main"
+    assert core.cross_hint("claude", rows, best=best, orows=other) is None    # 63% really is what is left
+
+
+def test_cross_family_hint_still_counts_the_lead_when_it_is_a_normal_candidate(router):
+    router.usage["claude-main"].update(reading(weekly=63, five_hour=100))
+    router.usage["claude-b"].update(reading(weekly=27, five_hour=100))
+    rows = rows_for(router)
+    other = [{"family": "codex", "key": "codex-1", "blocked": None, "wk_left": 89, "busy": 0, "jobs": 0, "n_lease": 0,
+              "notes": [], "email": None}]
+    assert router.core.cross_hint("claude", rows, best=rows[0], orows=other) is None
